@@ -10,6 +10,9 @@ mod minio;
 mod tools;
 mod gitlab;
 mod prometheus;
+mod cli;
+use cli::{Cli, Command};
+use clap::Parser;
 
 
 
@@ -18,23 +21,40 @@ mod prometheus;
 
 //#[tokio::main]
 fn main() -> std::result::Result<(), Box<dyn Error>> {
+    let args = Cli::parse();
     let instance_k3_name = "k3s";
-    println!("Installation Alpine");
-    alpine::import_alpine(instance_k3_name).expect("Erreur installation Alpine K3S");
-    println!("Installation K3S");    
-    k3s::install_k3s(instance_k3_name).expect("Erreur installation K3S");
-    println!("Installation Helm");
-    helm::install_helm(instance_k3_name).expect("Erreur installation helm");
-    //println!("Installation prometheus");
-    //prometheus::deploy_prometheus(instance_k3_name).expect("Erreur installation vcluster");
-    //println!("Installation vcluster");
-    //vcluster::install_vcluster(instance_k3_name).expect("Erreur installation vcluster");
-    //println!("Deploy vcluster");
-    //vcluster::deploy_vclusters(instance_k3_name).expect("Erreur déploiement vcluster");
-    //minio::deploy_minio(instance_k3_name).expect("Erreur installation minio");
-    //gitlab::deploy_gitlab(instance_k3_name).expect("Erreur déploiement gitlab");
-    //vcluster::export_kubeconfig_vcluster(instance_k3_name).expect("Erreur export kubeconfig");
-    //service::update_minio(instance_name).expect("Erreur update");
+
+    match args.command {
+        Command::Install => {
+            println!("Installation Alpine");
+            alpine::import_alpine(instance_k3_name)?;
+            println!("Installation K3S");
+            k3s::install_k3s(instance_k3_name)?;
+            println!("Installation Helm");
+            helm::install_helm(instance_k3_name)?;
+        }
+        Command::Helm => {
+            helm::install_helm(instance_k3_name)?;
+        }
+        Command::Minio => {
+            minio::deploy_minio(instance_k3_name)?;
+        }
+        Command::Gitlab => {
+            gitlab::deploy_gitlab(instance_k3_name)?;
+        }
+        Command::Prometheus => {
+            prometheus::deploy_prometheus(instance_k3_name)?;
+        }
+        Command::AddCluster => {
+            vcluster::deploy_vclusters(instance_k3_name)?;
+        }
+        Command::Uninstall => {
+            println!("Uninstall not implemented");
+        }
+        Command::Update => {
+            println!("Update not implemented");
+        }
+    }
 
     Ok(())
 }
