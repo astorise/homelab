@@ -1,23 +1,16 @@
-
 use std::error::Error;
 
-
 mod alpine;
-mod k3s;
-mod helm;
-mod vcluster;
-mod minio;
-mod tools;
-mod gitlab;
-mod prometheus;
 mod cli;
-use cli::{Cli, Command};
+mod gitlab;
+mod helm;
+mod k3s;
+mod minio;
+mod prometheus;
+mod tools;
+mod vcluster;
 use clap::Parser;
-
-
-
-
-
+use cli::{Cli, Command};
 
 //#[tokio::main]
 fn main() -> std::result::Result<(), Box<dyn Error>> {
@@ -48,8 +41,21 @@ fn main() -> std::result::Result<(), Box<dyn Error>> {
         Command::AddCluster => {
             vcluster::deploy_vclusters(instance_k3_name)?;
         }
-        Command::Uninstall => {
-            println!("Uninstall not implemented");
+        Command::Uninstall {
+            k3s,
+            helm,
+            namespace,
+        } => {
+            if k3s {
+                k3s::uninstall_k3s(instance_k3_name)?;
+            }
+            if helm {
+                helm::uninstall_helm(instance_k3_name)?;
+            }
+            for ns in namespace {
+                k3s::delete_namespace(instance_k3_name, &ns)?;
+            }
+            alpine::unregister(instance_k3_name)?;
         }
         Command::Update => {
             println!("Update not implemented");

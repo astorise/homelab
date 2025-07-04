@@ -1,11 +1,12 @@
 use reqwest::blocking::Client;
 use serde_yaml::Value;
-use std::{fs, path::Path, process::Command};
 use std::error::Error;
 use std::io::Write;
+use std::{fs, path::Path, process::Command};
 
 pub fn import_alpine(instance_name: &str) -> Result<(), Box<dyn Error>> {
-    let yaml_url = "https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/x86_64/latest-releases.yaml";
+    let yaml_url =
+        "https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/x86_64/latest-releases.yaml";
 
     // Téléchargez le fichier YAML de manière synchrone
     let client = Client::new();
@@ -28,10 +29,13 @@ pub fn import_alpine(instance_name: &str) -> Result<(), Box<dyn Error>> {
     if file_name.is_empty() {
         return Err("Alpine minirootfs file not found".into());
     }
-println!("Alpine: {}",file_name);
- let alpine_url = format!("https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/x86_64/{}", file_name);
- 
- //let alpine_url =  "https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/x86_64/alpine-netboot-3.20.0-x86_64.tar.gz";
+    println!("Alpine: {}", file_name);
+    let alpine_url = format!(
+        "https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/x86_64/{}",
+        file_name
+    );
+
+    //let alpine_url =  "https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/x86_64/alpine-netboot-3.20.0-x86_64.tar.gz";
     let folder = format!("C:\\wsldistros\\{}", instance_name);
     let download_folder = Path::new(&folder);
     if !download_folder.exists() {
@@ -46,11 +50,7 @@ println!("Alpine: {}",file_name);
     }
 
     // Exécutez les commandes WSL
-    Command::new("wsl")
-        .arg("--unregister")
-        .arg(instance_name)
-        .output()
-        .expect("Échec de l'exécution de la commande WSL --unregister"); 
+    unregister(instance_name)?;
 
     Command::new("wsl")
         .arg("--import")
@@ -61,5 +61,13 @@ println!("Alpine: {}",file_name);
         .output()
         .expect("Échec de l'exécution de la commande WSL --import");
 
+    Ok(())
+}
+
+pub fn unregister(instance_name: &str) -> Result<(), Box<dyn Error>> {
+    Command::new("wsl")
+        .arg("--unregister")
+        .arg(instance_name)
+        .status()?;
     Ok(())
 }
