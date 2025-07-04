@@ -32,6 +32,7 @@ cargo run -- <COMMAND>
 - `check-wsl` - compare installed WSL version with the latest available on GitHub
   - `--pre` - include pre-release versions when checking
 
+
 ### Examples
 
 ```bash
