@@ -8,6 +8,7 @@ mod k3s;
 mod minio;
 mod prometheus;
 mod tools;
+mod update;
 mod vcluster;
 use clap::Parser;
 use cli::{Cli, Command};
@@ -29,7 +30,10 @@ fn main() -> std::result::Result<(), Box<dyn Error>> {
         Command::Helm => {
             helm::install_helm(instance_k3_name)?;
         }
-        Command::Minio { create_bucket, delete_bucket } => {
+        Command::Minio {
+            create_bucket,
+            delete_bucket,
+        } => {
             if create_bucket.is_none() && delete_bucket.is_none() {
                 minio::deploy_minio(instance_k3_name)?;
             }
@@ -66,7 +70,7 @@ fn main() -> std::result::Result<(), Box<dyn Error>> {
             alpine::unregister(instance_k3_name)?;
         }
         Command::Update => {
-            println!("Update not implemented");
+            update::update_components(instance_k3_name)?;
         }
     }
 
