@@ -104,4 +104,18 @@ tenant:
 
    
     Ok(())
-  }
+}
+
+pub(crate) fn create_bucket(instance: &str, bucket: &str) -> std::result::Result<(), Box<dyn Error>> {
+    Command::new("wsl")
+        .args(&["-d", instance, "--", "sh", "-c", &format!("mc mb {}", bucket)])
+        .status()?;
+    Ok(())
+}
+
+pub(crate) fn delete_bucket(instance: &str, bucket: &str) -> std::result::Result<(), Box<dyn Error>> {
+    Command::new("wsl")
+        .args(&["-d", instance, "--", "sh", "-c", &format!("mc rb {}", bucket)])
+        .status()?;
+    Ok(())
+}
