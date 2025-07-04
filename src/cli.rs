@@ -42,4 +42,6 @@ pub enum Command {
     AddCluster,
     /// Update components
     Update,
+    /// Install CUDA support for NVIDIA GPUs
+    Cuda,
 }
