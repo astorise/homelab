@@ -2,6 +2,7 @@ use std::error::Error;
 
 mod alpine;
 mod cli;
+mod cuda;
 mod gitlab;
 mod helm;
 mod k3s;
@@ -10,6 +11,7 @@ mod prometheus;
 mod tools;
 mod update;
 mod vcluster;
+mod wsl;
 use clap::Parser;
 use cli::{Cli, Command};
 
@@ -71,6 +73,12 @@ fn main() -> std::result::Result<(), Box<dyn Error>> {
         }
         Command::Update => {
             update::update_components(instance_k3_name)?;
+        }
+        Command::Cuda => {
+            cuda::install_cuda(instance_k3_name)?;
+        }
+        Command::CheckWsl { pre } => {
+            wsl::check_wsl_update(pre)?;
         }
     }
 

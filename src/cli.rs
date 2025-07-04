@@ -42,4 +42,12 @@ pub enum Command {
     AddCluster,
     /// Update components
     Update,
+    /// Install CUDA support for NVIDIA GPUs
+    Cuda,
+    /// Check if a newer WSL version is available
+    CheckWsl {
+        /// Include pre-release versions
+        #[arg(long)]
+        pre: bool,
+    },
 }
