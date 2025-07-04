@@ -13,7 +13,7 @@ cargo run -- <COMMAND>
 ### Commands
 
 - `install` - install Alpine, K3S and Helm
-- `uninstall` - remove installed components (not implemented)
+- `uninstall` - uninstall the WSL distro and optionally clean k3s, Helm and namespaces
 - `helm` - install only Helm
 - `minio` - deploy Minio
 - `gitlab` - deploy Gitlab

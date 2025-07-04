@@ -11,8 +11,18 @@ pub struct Cli {
 pub enum Command {
     /// Install Alpine, K3S and Helm
     Install,
-    /// Placeholder for uninstall logic
-    Uninstall,
+    /// Remove installed components
+    Uninstall {
+        /// Uninstall k3s cluster
+        #[arg(long)]
+        k3s: bool,
+        /// Uninstall all Helm releases
+        #[arg(long)]
+        helm: bool,
+        /// Namespaces to delete (comma separated)
+        #[arg(long, value_delimiter = ',')]
+        namespace: Vec<String>,
+    },
     /// Install Helm only
     Helm,
     /// Deploy Minio
