@@ -1,0 +1,106 @@
+controller:
+  kind: Deployment
+  replicaCount: 1
+  service:
+    type: LoadBalancer
+    image:
+    repository: haproxytech/kubernetes-ingress
+    tag: "3.0.1"
+    tcpPorts: 
+      - name: k3s
+        port: 6443
+        targetPort: 6443
+  tolerations:
+    - key: "node-role.kubernetes.io/master"
+      operator: "Exists"
+      effect: "NoSchedule"
+    - key: "node-role.kubernetes.io/control-plane"
+      operator: "Exists"
+      effect: "NoSchedule"
+  nodeSelector: {}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  securityContext:
+    runAsUser: 0
+    runAsGroup: 0
+    allowPrivilegeEscalation: true
+    capabilities:
+      drop:
+      - ALL
+      add:
+      - NET_BIND_SERVICE
+  config:
+    ssl-passthrough: "true"
+    ssl-passthrough-port: "6443"
+    backend-check-interval: 10s
+    backend-check-https-path: /healthz
+    backend-check-https-verify: none
+    logging: |
+      log stdout format raw daemon debug
+  extraArgs:
+    - --v=9
+    - --log-level=trace
+    - --healthz-bind-port=1042
+    - --log-ingress-changes
+    - --enable-ssl-passthrough
+    - --maps-dir=/tmp/haproxy
+  startupProbe:
+    failureThreshold: 60
+    periodSeconds: 10
+    timeoutSeconds: 5
+    httpGet:
+      path: /healthz
+      port: 1042
+  livenessProbe:
+    failureThreshold: 3
+    initialDelaySeconds: 10
+    periodSeconds: 10
+    successThreshold: 1
+    timeoutSeconds: 1
+    httpGet:
+      path: /healthz
+      port: 1042
+      scheme: HTTP
+  readinessProbe:
+    failureThreshold: 3
+    initialDelaySeconds: 10
+    periodSeconds: 10
+    successThreshold: 1
+    timeoutSeconds: 1
+    httpGet:
+      path: /healthz
+      port: 1042
+      scheme: HTTP
+  resources:
+    limits:
+      cpu: 100m
+      memory: 200Mi
+    requests:
+      cpu: 50m
+      memory: 100Mi
+
+ingressClass: haproxy
+
+defaultBackend:
+  enabled: false
+
+metrics:
+  enabled: true
+
+serviceMonitor:
+  enabled: true
+  labels:
+    release: prometheus
+
+extraVolumeMounts:
+  - name: custom-haproxy-config
+    mountPath: /etc/haproxy/haproxy.cfg
+    subPath: haproxy.cfg
+
+extraVolumes:
+  - name: custom-haproxy-config
+    configMap:
+      name: custom-haproxy-config

@@ -1,0 +1,74 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ingress-config
+  namespace: {{ .Release.Namespace }}
+  annotations:
+    "helm.sh/hook": pre-install
+    "helm.sh/hook-weight": "0"
+    "helm.sh/hook-delete-policy": hook-succeeded
+data:
+  ingress.yaml: |
+    apiVersion: networking.k8s.io/v1
+    kind: Ingress
+    metadata:
+      name: hote-k3s-ingress
+      namespace: default
+      annotations:
+        haproxy.org/logging: "true"
+        haproxy.org/log-format: 'timestamp=%Ts.%ms\ client=%ci\ method=%HM\ path=%HP\ status=%ST\ bytes=%B\ duration=%Tt'
+        ingress.kubernetes.io/ssl-passthrough: "true"
+        haproxy.org/ssl-passthrough: "true"
+        haproxy.org/backend-check-path: "/healthz"
+        haproxy.org/backend-check-interval: "10s"
+        haproxy.org/backend-check-type: "https"
+        haproxy.org/backend-check-ssl-verify: "none"
+    spec:
+      ingressClassName: haproxy
+      rules:
+      - host: k3s.wsl
+        http:
+          paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: kubernetes
+                port:
+                  number: 443
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sni-map-config
+  namespace: ingress
+  annotations:
+    "helm.sh/hook": pre-install
+    "helm.sh/hook-weight": "0"
+data:
+  sni_6443.map: |
+    k3s.wsl                 default_kubernetes_https
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: haproxy-auxiliary-configmap
+  namespace: ingress
+  annotations:
+    "helm.sh/hook": pre-install
+    "helm.sh/hook-weight": "0"
+data:
+  haproxy-auxiliary.cfg: |
+    frontend ssl_6443
+      mode tcp
+      bind 0.0.0.0:6443 name v4
+      bind [::]:6443 name v6 v4v6
+      log stdout format raw local0
+      log-format "%ci:%cp [%t] %ft %b/%s %Tw/%Tc/%Tt %B %ts %ac/%fc/%bc/%sc/%rc %sq/%bq %hr %hs SNI: %[var(sess.sni)] Backend: %[var(txn.sni_match),field(1,.)]"
+      tcp-request content reject if !{ req_ssl_hello_type 1 }
+      tcp-request inspect-delay 5000
+      tcp-request content set-var(sess.sni) req_ssl_sni
+      tcp-request content set-var(txn.sni_match) req_ssl_sni,map(/etc/haproxy/maps/sni_6443.map)
+      tcp-request content set-var(txn.sni_match) req_ssl_sni,regsub(^[^.]*,,),map(/etc/haproxy/maps/sni_6443.map)
+      option tcplog
+      use_backend %[var(txn.sni_match),field(1,.)]

@@ -1,0 +1,133 @@
+use serde::Deserialize;
+use std::{error::Error,  process::Command, thread, time::Duration};
+
+#[derive(Deserialize)]
+struct Asset {
+    name: String,
+    browser_download_url: String,
+}
+
+#[derive(Deserialize)]
+struct Release {
+    assets: Vec<Asset>,
+}
+
+pub(crate) fn install_k3s(instance_name: &str)->std::result::Result<(), Box<dyn Error>>  {
+    Command::new("wsl")
+    .arg("-d")
+    .arg(instance_name)
+    .args(["sh", "-c", "apk update && apk upgrade"])
+    .output()
+    .expect("Échec de l'exécution de la commande");
+  
+  let url_k3s = "https://api.github.com/repos/k3s-io/k3s/releases/latest";
+  let client = reqwest::blocking::Client::new();
+  let response = client.get(url_k3s).header("User-Agent", "request").send()?;
+  
+  // Vérifier le statut de la réponse
+  if !response.status().is_success() {
+    println!("Échec de la requête : {}", response.status());
+    return Ok(());
+  }
+  
+  // Imprimer la réponse brute
+  let response_text = response.text()?;
+  //println!("Réponse brute : {}", response_text);
+  
+  // Désérialiser la réponse JSON
+  let release: Release = serde_json::from_str(&response_text)?;
+  let k3s_url = release
+    .assets
+    .into_iter()
+    .find(|asset| asset.name == "k3s")
+    .map(|asset| asset.browser_download_url)
+    .ok_or("k3s asset not found")?;
+  
+  
+  println!("Start download:{}",k3s_url);
+    let  output =Command::new("wsl")
+    .arg("-d")
+    .arg(instance_name)
+    .args([
+        "sh",
+        "-c",
+        format!(
+            "wget  -P  /usr/local/bin {} && chmod +x /usr/local/bin/k3s",
+            k3s_url
+        )
+        .as_str(),
+    ])
+    .output()
+      .expect("Échec de l'exécution de la commande");
+    println!("log:{}, err:{}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));
+
+  // Copier le script dans WSL et le rendre exécutable, puis l'exécuter
+  let commands = vec![
+  r#"echo '
+  IP_ETH0=\$(ip -4 a show dev eth0 | grep -oE "inet ([0-9]{1,3}\.){3}[0-9]{1,3}"| grep -oE "([0-9]{1,3}\.){3}[0-9]{1,3}")
+  sed -i "/k3s\.wsl\|devops\.k3s\.wsl\|staging\.k3s\.wsl\|prod\.k3s\.wsl/d" /etc/hosts
+  echo "
+\$IP_ETH0 k3s.wsl
+\$IP_ETH0 devops.k3s.wsl
+\$IP_ETH0 staging.k3s.wsl
+\$IP_ETH0 prod.k3s.wsl" >> /etc/hosts
+  while ! nc -z -w 1 google.com 80 >/dev/null 2>&1; do
+  sleep 5
+  done
+  nohup /usr/local/bin/k3s server --disable traefik --kube-apiserver-arg=bind-address=0.0.0.0 --server k3s.wsl --https-listen-port 6444 --service-node-port-range=1-65535 --cluster-domain k3s.wsl --node-external-ip=\$IP_ETH0 --tls-san k3s.wsl --write-kubeconfig-mode 600 > /var/log/k3s 2>&1 &
+  sleep 5
+  cp /etc/rancher/k3s/k3s.yaml ~/.kube/config
+  export KUBECONFIG=/etc/rancher/k3s/k3s.yaml' > /etc/init.d/k3s"#.to_string(),
+  "echo 'export KUBECONFIG=/etc/rancher/k3s/k3s.yaml'>> ~/.ashrc".to_string(),
+  "echo '. ~/.ashrc' >> ~/.profile".to_string(),
+  "chmod +x /etc/init.d/k3s".to_string(),
+  ". /etc/init.d/k3s".to_string(),
+  r#"printf '
+  [network]
+  generateHosts = false
+  generateResolvConf = true
+  # Add/Edit the [boot] command and save the file
+  [boot]
+  command = "sh /etc/init.d/k3s"' > /etc/wsl.conf"#.to_string(),
+  "echo 'exec k3s kubectl $''@' > /usr/local/bin/kubectl".to_string(),
+  "chmod +x /usr/local/bin/kubectl".to_string()
+  ];
+  
+  for command in commands {
+    Command::new("wsl")
+        .args(&["-d", instance_name, "--", "sh", "-c", &command])
+        .status()?;
+  }
+  Command::new("wsl")
+  .args(&["--terminate", instance_name])
+  .status()?;
+wait_k3s(instance_name);
+  Ok(())
+  }
+  
+  fn wait_k3s(instance_name: &str){
+
+  let mut nodes_ready = false;
+  while !nodes_ready {
+      // Exécuter la commande dans WSL
+      let output = Command::new("wsl")
+      .args(&["-d", instance_name, "--", "sh", "-c","kubectl get nodes -o jsonpath='{.items[*].status.conditions[?(@.type==\"Ready\")].status}'"])
+          .output()
+          .expect("failed to execute process");
+
+          let status = String::from_utf8_lossy(&output.stdout);
+          if status.contains("True") {
+              println!("Tous les nœuds sont prêts !");
+              nodes_ready = true;
+          } else {
+              println!("Les nœuds ne sont pas encore prêts. Statut: {}", status.trim());
+          }
+  
+          if !nodes_ready {
+              // Attendre quelques secondes avant de réessayer
+              thread::sleep(Duration::from_secs(5));
+          }
+  }
+
+
+  }

@@ -1,0 +1,49 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: haproxy-debug-sidecar
+  namespace: ingress
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: haproxy-debug-sidecar
+  template:
+    metadata:
+      labels:
+        app: haproxy-debug-sidecar
+    spec:
+      containers:
+      - name: debug-sidecar
+        image: busybox
+        command: 
+        - sh
+        - -c
+        - |
+          while true; do
+            echo "Debug sidecar running at $(date)"
+            echo "Contents of /etc/haproxy/maps:"
+            ls -la /etc/haproxy/maps
+            echo "Maps content:"
+            for file in /etc/haproxy/maps/*; do
+              echo "File: $file"
+              cat $file
+              echo "---"
+            done
+            echo "HAProxy configuration:"
+            cat /etc/haproxy/haproxy.cfg
+            echo "Sleeping for 30 seconds..."
+            sleep 30
+          done
+        volumeMounts:
+        - name: haproxy-config
+          mountPath: /etc/haproxy
+        - name: debug-logs
+          mountPath: /debug-logs
+      volumes:
+      - name: haproxy-config
+        emptyDir: {}
+      - name: debug-logs
+        hostPath:
+          path: /tmp/haproxy-debug-logs
+          type: DirectoryOrCreate

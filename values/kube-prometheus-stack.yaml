@@ -1,0 +1,88 @@
+nameOverride: prometheus
+namespaceOverride: prometheus
+nodeExporter:
+  enabled: false
+prometheus-node-exporter:
+  enabled: false
+kubelet:
+  enabled: true
+  serviceMonitor:
+    https: true
+kubeStateMetrics:
+  enabled: true
+prometheus:
+  prometheusSpec:
+    ruleSelectorNilUsesHelmValues: false
+    serviceMonitorSelectorNilUsesHelmValues: false
+    podMonitorSelectorNilUsesHelmValues: false
+    additionalScrapeConfigs:
+      - job_name: 'kubelet'
+        scheme: https
+        tls_config:
+          ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+          insecure_skip_verify: true
+        bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+        kubernetes_sd_configs:
+          - role: node
+        relabel_configs:
+          - action: labelmap
+            regex: __meta_kubernetes_node_label_(.+)
+          - target_label: __address__
+            replacement: kubernetes.default.svc:443
+          - source_labels: [__meta_kubernetes_node_name]
+            regex: (.+)
+            target_label: __metrics_path__
+            replacement: /api/v1/nodes/\${1}/proxy/metrics
+      - job_name: 'kubelet/cadvisor'
+        scheme: https
+        tls_config:
+          ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+          insecure_skip_verify: true
+        bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+        kubernetes_sd_configs:
+          - role: node
+        relabel_configs:
+          - action: labelmap
+            regex: __meta_kubernetes_node_label_(.+)
+          - target_label: __address__
+            replacement: kubernetes.default.svc:443
+          - source_labels: [__meta_kubernetes_node_name]
+            regex: (.+)
+            target_label: __metrics_path__
+            replacement: /api/v1/nodes/\${1}/proxy/metrics/cadvisor
+    retention: 15d
+    resources:
+      requests:
+        cpu: 100m
+        memory: 100Mi
+      limits:
+        cpu: 500m
+        memory: 500Mi
+grafana:
+  enabled: false
+alertmanager:
+  enabled: true
+  alertmanagerSpec:
+    retention: 120h
+    resources:
+      requests:
+        cpu: 25m
+        memory: 25Mi
+      limits:
+        cpu: 100m
+        memory: 100Mi
+prometheusOperator:
+  resources:
+    requests:
+      cpu: 50m
+      memory: 50Mi
+    limits:
+      cpu: 200m
+      memory: 200Mi
+extraManifests: 
+  - apiVersion: v1
+    kind: Namespace
+    metadata:
+      name: prometheus
+      annotations:
+        "helm.sh/hook": pre-install

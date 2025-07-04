@@ -1,0 +1,12 @@
+dependencies:
+- name: kube-prometheus-stack
+  repository: https://prometheus-community.github.io/helm-charts
+  version: 61.7.0
+- name: kubernetes-ingress
+  repository: file://../../github/haproxy/helm-charts-haproxy/kubernetes-ingress
+  version: 1.40.1
+- name: vcluster
+  repository: file://../../github/vcluster/chart
+  version: 0.0.1
+digest: sha256:859520b4a2ad41f1648694a9123f618284457461b4e311044569304b91442126
+generated: "2024-08-07T19:25:02.413290173Z"
