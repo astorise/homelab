@@ -19,7 +19,7 @@ cargo run -- <COMMAND>
 - `gitlab` - deploy Gitlab
 - `prometheus` - deploy Prometheus
 - `add-cluster` - deploy additional clusters
-- `update` - update components (not implemented)
+- `update` - update K3S and Helm binaries inside the WSL distro
 
 ### Examples
 
