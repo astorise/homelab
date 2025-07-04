@@ -26,7 +26,14 @@ pub enum Command {
     /// Install Helm only
     Helm,
     /// Deploy Minio
-    Minio,
+    Minio {
+        /// Create bucket in Minio
+        #[arg(long)]
+        create_bucket: Option<String>,
+        /// Delete bucket from Minio
+        #[arg(long)]
+        delete_bucket: Option<String>,
+    },
     /// Deploy Gitlab
     Gitlab,
     /// Deploy Prometheus

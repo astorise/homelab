@@ -29,8 +29,16 @@ fn main() -> std::result::Result<(), Box<dyn Error>> {
         Command::Helm => {
             helm::install_helm(instance_k3_name)?;
         }
-        Command::Minio => {
-            minio::deploy_minio(instance_k3_name)?;
+        Command::Minio { create_bucket, delete_bucket } => {
+            if create_bucket.is_none() && delete_bucket.is_none() {
+                minio::deploy_minio(instance_k3_name)?;
+            }
+            if let Some(b) = create_bucket {
+                minio::create_bucket(instance_k3_name, &b)?;
+            }
+            if let Some(b) = delete_bucket {
+                minio::delete_bucket(instance_k3_name, &b)?;
+            }
         }
         Command::Gitlab => {
             gitlab::deploy_gitlab(instance_k3_name)?;
