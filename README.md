@@ -41,6 +41,25 @@ cargo run -- <COMMAND>
 - `add-cluster` - deploy additional clusters
 - `update` - update the K3S and Helm binaries inside the WSL distro
 - `cuda` - install CUDA support in the WSL distro when an NVIDIA GPU is detected
+- `check-wsl` - compare installed WSL version with the latest available on GitHub
+  - `--pre` - include pre-release versions when checking
+
+
+### Pre-built WSL image
+
+You can import a ready-to-use WSL distro instead of building it from scratch. Go
+to the repository's **Actions** tab on GitHub and download the `env-dev-image.tar`
+artifact from the latest successful workflow. When available, the Linux image is
+published as `env-dev-image-linux.tar` and the Windows image as
+`env-dev-image-windows.tar`.
+
+Set the `WSL_IMAGE_ARCHIVE` environment variable to the downloaded archive
+before running commands, for example:
+
+```bash
+export WSL_IMAGE_ARCHIVE=/path/to/env-dev-image.tar
+cargo run -- install
+```
 
 ### Examples
 
@@ -62,4 +81,7 @@ cargo run -- minio --create-bucket my-bucket
 cargo run -- minio --delete-bucket my-bucket
 # Install CUDA support
 cargo run -- cuda
+# Check if a newer WSL version is available
+cargo run -- check-wsl
+cargo run -- check-wsl --pre
 ```
