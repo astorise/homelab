@@ -3,6 +3,10 @@
 Command line interface to bootstrap and manage a local Kubernetes lab using Windows Subsystem for Linux (WSL).
 It installs a minimal Alpine distribution, a k3s cluster and common services such as Helm, MinIO, GitLab and Prometheus.
 
+The repository also provides a `Dockerfile` for running the compiled `env-dev`
+binary. The runtime image is based on **Alpine Linux 3.20** and installs the
+k3s binary using the official installation script (`curl -sfL https://get.k3s.io | sh -`).
+
 ## Requirements
 
 - Windows machine with **WSL2** enabled
