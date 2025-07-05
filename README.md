@@ -2,10 +2,18 @@
 
 Command line interface to bootstrap and manage a local Kubernetes lab using Windows Subsystem for Linux (WSL).
 It installs a minimal Alpine distribution, a k3s cluster and common services such as Helm, MinIO, GitLab and Prometheus.
+The Docker image archive used for the WSL distro is generated during the GitHub Action build and embedded in the binary, allowing installation to run completely offline.
+
+CI builds produce both Linux and Windows (x86_64) binaries. The Windows executable is available as `env-dev.exe`.
 
 The repository also provides a `Dockerfile` for running the compiled `env-dev`
-binary. The runtime image is based on **Alpine Linux 3.20** and installs the
-k3s binary using the official installation script (`curl -sfL https://get.k3s.io | sh -`).
+binary. The runtime image is based on **Alpine Linux 3.20**, installs `openrc` so
+the k3s install script can run, and downloads the k3s binary using
+`INSTALL_K3S_SKIP_START=true INSTALL_K3S_SKIP_ENABLE=true curl -sfL https://get.k3s.io | sh -`.
+
+When compiling the project, set the `WSL_IMAGE_ARCHIVE` environment variable to
+the Docker image tarball produced by the CI workflow so the archive can be
+embedded into the binary.
 
 ## Requirements
 

@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  build:
+  build-linux:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -13,14 +13,38 @@ jobs:
         with:
           toolchain: stable
           override: true
-      - run: cargo build --release
+      - run: docker build -t env-dev-image -f docker/Dockerfile .
+      - run: docker save env-dev-image -o env-dev-image.tar
+      - run: WSL_IMAGE_ARCHIVE=env-dev-image.tar cargo build --release
       - uses: actions/upload-artifact@v4
         with:
           name: env-dev
           path: target/release/env-dev
-      - run: docker build -t env-dev:latest -f docker/Dockerfile .
-      - run: docker save env-dev:latest -o env-dev.tar
       - uses: actions/upload-artifact@v4
         with:
-          name: env-dev-image
-          path: env-dev.tar
+          name: wsl-image
+          path: env-dev-image.tar
+
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          override: true
+      - run: docker build -t env-dev-image -f docker/Dockerfile .
+        shell: bash
+      - run: docker save env-dev-image -o env-dev-image.tar
+        shell: bash
+      - run: WSL_IMAGE_ARCHIVE=env-dev-image.tar cargo build --release
+        shell: bash
+      - uses: actions/upload-artifact@v4
+        with:
+          name: env-dev.exe
+          path: target/release/env-dev.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wsl-image-windows
+          path: env-dev-image.tar
+
