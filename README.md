@@ -33,6 +33,9 @@ cargo run -- <COMMAND>
 - `add-cluster` - deploy additional clusters
 - `update` - update the K3S and Helm binaries inside the WSL distro
 - `cuda` - install CUDA support in the WSL distro when an NVIDIA GPU is detected
+- `check-wsl` - compare installed WSL version with the latest available on GitHub
+  - `--pre` - include pre-release versions when checking
+
 
 ### Pre-built WSL image
 
@@ -70,4 +73,7 @@ cargo run -- minio --create-bucket my-bucket
 cargo run -- minio --delete-bucket my-bucket
 # Install CUDA support
 cargo run -- cuda
+# Check if a newer WSL version is available
+cargo run -- check-wsl
+cargo run -- check-wsl --pre
 ```
