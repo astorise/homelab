@@ -85,3 +85,7 @@ cargo run -- cuda
 cargo run -- check-wsl
 cargo run -- check-wsl --pre
 ```
+
+## License
+This project is licensed under the [MIT License](LICENSE).
+
