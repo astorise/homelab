@@ -47,14 +47,18 @@ cargo run -- <COMMAND>
 
 ### Pre-built WSL image
 
-You can import a ready-to-use WSL distro instead of building it from scratch. Go
-to the repository's **Actions** tab on GitHub and download the `env-dev-image.tar`
-artifact from the latest successful workflow. When available, the Linux image is
-published as `env-dev-image-linux.tar` and the Windows image as
-`env-dev-image-windows.tar`.
+You can import a ready-to-use WSL distro instead of building it from scratch.
+To do so:
 
-Set the `WSL_IMAGE_ARCHIVE` environment variable to the downloaded archive
-before running commands, for example:
+1. Navigate to the repository's **Actions** tab on GitHub.
+2. Open the latest successful workflow run and expand the **Artifacts** section.
+3. Download the WSL image archive. On Linux, the file is published as
+   `env-dev-image-linux.tar`, while on Windows the file is named
+   `env-dev-image-windows.tar`.  Both contain the same `env-dev-image.tar`
+   archive.
+
+After downloading the archive, set the `WSL_IMAGE_ARCHIVE` environment variable
+to its path before running commands. For example:
 
 ```bash
 export WSL_IMAGE_ARCHIVE=/path/to/env-dev-image.tar
