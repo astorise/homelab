@@ -9,7 +9,7 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Command {
-    /// Install Alpine, K3S and Helm
+    /// Import the k3s image and install Helm
     Install,
     /// Remove installed components
     Uninstall {

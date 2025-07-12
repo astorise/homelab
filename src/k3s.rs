@@ -1,16 +1,4 @@
-use serde::Deserialize;
 use std::{error::Error, process::Command, thread, time::Duration};
-
-#[derive(Deserialize)]
-struct Asset {
-    name: String,
-    browser_download_url: String,
-}
-
-#[derive(Deserialize)]
-struct Release {
-    assets: Vec<Asset>,
-}
 
 pub(crate) fn install_k3s(instance_name: &str) -> std::result::Result<(), Box<dyn Error>> {
     Command::new("wsl")
@@ -20,49 +8,16 @@ pub(crate) fn install_k3s(instance_name: &str) -> std::result::Result<(), Box<dy
         .output()
         .expect("Échec de l'exécution de la commande");
 
-    let url_k3s = "https://api.github.com/repos/k3s-io/k3s/releases/latest";
-    let client = reqwest::blocking::Client::new();
-    let response = client.get(url_k3s).header("User-Agent", "request").send()?;
-
-    // Vérifier le statut de la réponse
-    if !response.status().is_success() {
-        println!("Échec de la requête : {}", response.status());
-        return Ok(());
-    }
-
-    // Imprimer la réponse brute
-    let response_text = response.text()?;
-    //println!("Réponse brute : {}", response_text);
-
-    // Désérialiser la réponse JSON
-    let release: Release = serde_json::from_str(&response_text)?;
-    let k3s_url = release
-        .assets
-        .into_iter()
-        .find(|asset| asset.name == "k3s")
-        .map(|asset| asset.browser_download_url)
-        .ok_or("k3s asset not found")?;
-
-    println!("Start download:{}", k3s_url);
-    let output = Command::new("wsl")
+    // Ensure the k3s binary from the base image is available under /usr/local/bin
+    Command::new("wsl")
         .arg("-d")
         .arg(instance_name)
         .args([
             "sh",
             "-c",
-            format!(
-                "wget  -P  /usr/local/bin {} && chmod +x /usr/local/bin/k3s",
-                k3s_url
-            )
-            .as_str(),
+            "[ -f /usr/local/bin/k3s ] || ln -s /bin/k3s /usr/local/bin/k3s",
         ])
-        .output()
-        .expect("Échec de l'exécution de la commande");
-    println!(
-        "log:{}, err:{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
+        .status()?;
 
     // Copier le script dans WSL et le rendre exécutable, puis l'exécuter
     let commands = vec![
