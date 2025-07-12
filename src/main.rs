@@ -22,9 +22,9 @@ fn main() -> std::result::Result<(), Box<dyn Error>> {
 
     match args.command {
         Command::Install => {
-            println!("Installation Alpine");
+            println!("Importing k3s WSL image");
             alpine::import_alpine(instance_k3_name)?;
-            println!("Installation K3S");
+            println!("Configuring K3S");
             k3s::install_k3s(instance_k3_name)?;
             println!("Installation Helm");
             helm::install_helm(instance_k3_name)?;
