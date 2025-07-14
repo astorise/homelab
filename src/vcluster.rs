@@ -663,7 +663,6 @@ fn create_certificate(instance_name: &str,vcluster_name: &str){
    
          "| kubectl apply -f -"###,vcluster_name,vcluster_name,vcluster_name,vcluster_name,vcluster_name,vcluster_name),
           ];
-    
          for command in commands {
         //  println!("commande:{}",command);
         let  output =Command::new("wsl")
