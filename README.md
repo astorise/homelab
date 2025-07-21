@@ -4,7 +4,7 @@ Command line interface to bootstrap and manage a local Kubernetes lab using Wind
 It imports a WSL distribution built from the official `rancher/k3s` image and includes common services such as Helm, MinIO, GitLab and Prometheus.
 The Docker image archive used for this WSL distro is generated during the GitHub Action build and embedded in the binary, allowing installation to run completely offline.
 
-CI builds produce both Linux and Windows (x86_64) binaries. The Windows executable is available as `env-dev.exe`.
+The CI workflow includes separate jobs that build Linux and Windows (x86_64) binaries. The Windows executable is available as `env-dev.exe`.
 
 The repository also provides a `Dockerfile` used to build this image. It simply extends
 `rancher/k3s:latest` so the resulting tarball already contains the k3s binaries.
