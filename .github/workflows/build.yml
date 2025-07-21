@@ -25,5 +25,27 @@ jobs:
           name: wsl-image
           path: env-dev-image.tar
 
+  build-windows:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          target: x86_64-pc-windows-gnu
+          override: true
+      - run: cargo install cross
+      - run: docker build -t env-dev-image -f docker/Dockerfile .
+      - run: docker save env-dev-image -o env-dev-image.tar
+      - run: WSL_IMAGE_ARCHIVE=env-dev-image.tar cross build --release --target x86_64-pc-windows-gnu
+      - uses: actions/upload-artifact@v4
+        with:
+          name: env-dev.exe
+          path: target/x86_64-pc-windows-gnu/release/env-dev.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: env-dev-image.tar
+          path: env-dev-image.tar
+
 
 
