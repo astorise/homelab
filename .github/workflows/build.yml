@@ -20,10 +20,11 @@ jobs:
         with:
           name: env-dev
           path: target/release/env-dev
+      - run: mv env-dev-image.tar env-dev-image-linux.tar
       - uses: actions/upload-artifact@v4
         with:
-          name: wsl-image
-          path: env-dev-image.tar
+          name: env-dev-image-linux.tar
+          path: env-dev-image-linux.tar
 
   build-windows:
     runs-on: ubuntu-latest
@@ -42,10 +43,11 @@ jobs:
         with:
           name: env-dev.exe
           path: target/x86_64-pc-windows-gnu/release/env-dev.exe
+      - run: mv env-dev-image.tar env-dev-image-windows.tar
       - uses: actions/upload-artifact@v4
         with:
-          name: env-dev-image.tar
-          path: env-dev-image.tar
+          name: env-dev-image-windows.tar
+          path: env-dev-image-windows.tar
 
 
 
