@@ -9,9 +9,11 @@ The CI workflow includes separate jobs that build Linux and Windows (x86_64) bin
 The repository also provides a `Dockerfile` used to build this image. It simply extends
 `rancher/k3s:latest` so the resulting tarball already contains the k3s binaries.
 
-When compiling the project, set the `WSL_IMAGE_ARCHIVE` environment variable to
-the Docker image tarball produced by the CI workflow so the archive can be
-embedded into the binary. Compilation will fail if this variable is not set.
+When compiling the project **from source**, set the `WSL_IMAGE_ARCHIVE` environment
+variable to the Docker image tarball produced by the CI workflow so the archive
+can be embedded into the binary. Compilation will fail if this variable is not
+set. The `env-dev.exe` binary produced by the CI workflow already contains the
+image and therefore does not require this variable.
 
 ## Requirements
 
@@ -55,9 +57,11 @@ To do so:
    `env-dev-image-windows.tar`.  Both contain the same `env-dev-image.tar`
    archive.
 
-After downloading the archive, set the `WSL_IMAGE_ARCHIVE` environment variable
-to its path before running commands. This variable is required at build time
-and the build will error if it is missing. For example:
+If you plan to compile the project yourself, set the `WSL_IMAGE_ARCHIVE`
+environment variable to the archive's path before running commands so the image
+can be embedded into the binary. This variable is only required when compiling
+from source; the `env-dev.exe` produced by the CI workflow already includes the
+WSL image. For example:
 
 ```bash
 export WSL_IMAGE_ARCHIVE=/path/to/env-dev-image.tar
