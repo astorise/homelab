@@ -23,7 +23,8 @@ pub fn import_alpine(instance_name: &str) -> Result<(), Box<dyn Error>> {
         .arg(instance_name)
         .arg(download_folder.to_str().unwrap())
         .arg(tar_file.to_str().unwrap())
-        .arg("--version 2")
+        .arg("--version")
+        .arg("2")
         .output()
         .expect("Échec de l'exécution de la commande WSL --import");
 
