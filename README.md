@@ -11,7 +11,7 @@ The repository also provides a `Dockerfile` used to build this image. It simply 
 
 When compiling the project, set the `WSL_IMAGE_ARCHIVE` environment variable to
 the Docker image tarball produced by the CI workflow so the archive can be
-embedded into the binary.
+embedded into the binary. Compilation will fail if this variable is not set.
 
 ## Requirements
 
@@ -56,7 +56,8 @@ To do so:
    archive.
 
 After downloading the archive, set the `WSL_IMAGE_ARCHIVE` environment variable
-to its path before running commands. For example:
+to its path before running commands. This variable is required at build time
+and the build will error if it is missing. For example:
 
 ```bash
 export WSL_IMAGE_ARCHIVE=/path/to/env-dev-image.tar
