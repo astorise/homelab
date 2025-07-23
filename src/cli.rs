@@ -1,8 +1,14 @@
 use clap::{Parser, Subcommand};
+use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(name = "homelab")]
 pub struct Cli {
+    /// Base directory where the WSL distro will be stored
+    /// Can also be set with the `HOMELAB_DISTRO_PATH` environment variable.
+    /// Providing the flag without a value defaults to the system temp directory.
+    #[arg(long, env = "HOMELAB_DISTRO_PATH", num_args = 0..=1, value_name = "PATH", default_missing_value = "")]
+    pub distro_path: Option<String>,
     #[command(subcommand)]
     pub command: Command,
 }

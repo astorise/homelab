@@ -28,6 +28,10 @@ Run the CLI with cargo followed by one of the available commands:
 cargo run -- <COMMAND>
 ```
 
+Use `--distro-path [PATH]` or the `HOMELAB_DISTRO_PATH` environment variable to
+change where the WSL distribution is stored. Providing the option without a
+value stores the files in the system temporary directory.
+
 ### Commands
 
 - `install` - import the k3s WSL image and install Helm

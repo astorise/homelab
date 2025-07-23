@@ -19,11 +19,16 @@ use cli::{Cli, Command};
 fn main() -> std::result::Result<(), Box<dyn Error>> {
     let args = Cli::parse();
     let instance_k3_name = "k3s";
+    let base_dir = match args.distro_path.as_deref() {
+        Some("") => std::env::temp_dir(),
+        Some(path) => std::path::PathBuf::from(path),
+        None => std::path::PathBuf::from("C:\\wsldistros"),
+    };
 
     match args.command {
         Command::Install => {
             println!("Importing k3s WSL image");
-            alpine::import_alpine(instance_k3_name)?;
+            alpine::import_alpine(instance_k3_name, &base_dir)?;
             println!("Configuring K3S");
             k3s::install_k3s(instance_k3_name)?;
             println!("Installation Helm");
