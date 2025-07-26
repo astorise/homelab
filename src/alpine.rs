@@ -17,7 +17,7 @@ pub fn import_alpine(instance_name: &str, base_dir: &Path) -> Result<(), Box<dyn
     // Exécutez les commandes WSL
     unregister(instance_name)?;
 
-    Command::new("wsl")
+    let output = Command::new("wsl")
         .arg("--import")
         .arg(instance_name)
         .arg(download_folder.to_str().unwrap())
@@ -26,6 +26,21 @@ pub fn import_alpine(instance_name: &str, base_dir: &Path) -> Result<(), Box<dyn
         .arg("2")
         .output()
         .expect("Échec de l'exécution de la commande WSL --import");
+
+    println!(
+        "WSL import stdout: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    println!(
+        "WSL import stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    if !output.status.success() {
+        println!(
+            "La commande WSL --import s'est terminée avec le code {:?}",
+            output.status.code()
+        );
+    }
 
     Ok(())
 }
