@@ -14,6 +14,9 @@ pub fn import_alpine(instance_name: &str, base_dir: &Path) -> Result<(), Box<dyn
         file_alpine.write_all(bytes)?;
     }
 
+    println!("Extracting image to {}", tar_file.display());
+    println!("Importing distro into {}", download_folder.display());
+
     // Exécutez les commandes WSL
     unregister(instance_name)?;
 
