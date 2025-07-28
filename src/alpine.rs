@@ -8,7 +8,12 @@ pub fn import_alpine(instance_name: &str, base_dir: &Path) -> Result<(), Box<dyn
     }
     let tar_file = download_folder.join("wsl-image.tar");
 
-    if !tar_file.exists() {
+    if !tar_file.exists() || tar_file.metadata()?.len() == 0 {
+        if tar_file.exists() {
+            println!(
+                "Existing tar file was empty, overwriting with embedded image"
+            );
+        }
         let bytes = include_bytes!(env!("WSL_IMAGE_PATH"));
         let mut file_alpine = fs::File::create(&tar_file)?;
         file_alpine.write_all(bytes)?;
