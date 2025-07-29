@@ -2,7 +2,7 @@
 
 Command line interface to bootstrap and manage a local Kubernetes lab using Windows Subsystem for Linux (WSL).
 It imports a WSL distribution built from the official `rancher/k3s` image and includes common services such as Helm, MinIO, GitLab and Prometheus.
-The Docker image archive used for this WSL distro is generated during the GitHub Action build and embedded in the binary, allowing installation to run completely offline.
+The CI workflow builds a Docker image, exports its **root filesystem** from a container and embeds this tarball in the binary, allowing installation to run completely offline.
 
 The CI workflow includes separate jobs that build Linux and Windows (x86_64) binaries. The Windows executable is available as `env-dev.exe`.
 
@@ -10,8 +10,8 @@ The repository also provides a `Dockerfile` used to build this image. It simply 
 `rancher/k3s:latest` so the resulting tarball already contains the k3s binaries.
 
 When compiling the project **from source**, set the `WSL_IMAGE_ARCHIVE` environment
-variable to the Docker image tarball produced by the CI workflow so the archive
-can be embedded into the binary. Compilation will fail if this variable is not
+variable to the root filesystem tarball produced by the CI workflow (exported
+from a container) so the archive can be embedded into the binary. Compilation will fail if this variable is not
 set. The `env-dev.exe` binary produced by the CI workflow already contains the
 image and therefore does not require this variable.
 
@@ -58,8 +58,9 @@ To do so:
 2. Open the latest successful workflow run and expand the **Artifacts** section.
 3. Download the WSL image archive. On Linux, the file is published as
    `env-dev-image-linux.tar`, while on Windows the file is named
-   `env-dev-image-windows.tar`.  Both artifacts contain the same
-   `env-dev-image.tar` archive.
+   `env-dev-image-windows.tar`. Both artifacts contain the same
+   `env-dev-image.tar` file, which is the root filesystem exported from the
+   container built by the workflow.
 
    Extract it with `tar -xf env-dev-image-windows.tar` (or
    `env-dev-image-linux.tar` on Linux), then import the distro:
@@ -71,10 +72,10 @@ To do so:
    The default distribution path is `C:\wsldistros`.
 
 If you plan to compile the project yourself, set the `WSL_IMAGE_ARCHIVE`
-environment variable to the archive's path before running commands so the image
-can be embedded into the binary. This variable is only required when compiling
-from source; the `env-dev.exe` produced by the CI workflow already includes the
-WSL image. For example:
+environment variable to the path of the extracted root filesystem tarball
+before running commands so the image can be embedded into the binary. This
+variable is only required when compiling from source; the `env-dev.exe`
+produced by the CI workflow already includes the WSL image. For example:
 
 ```bash
 export WSL_IMAGE_ARCHIVE=/path/to/env-dev-image.tar
