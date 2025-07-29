@@ -2,11 +2,12 @@ use std::{io, process::Command};
 use std::error::Error;
 use std::str;
 use serde::{Deserialize, Serialize};
-use serde_yaml;
+
 
 #[derive(Serialize, Deserialize, Debug)]
 struct ClusterConfig {
-    apiVersion: String,
+    #[serde(rename = "apiVersion")]
+    api_version: String,
     clusters: Vec<Cluster>,
     contexts: Vec<Context>,
     current_context: String,
@@ -54,7 +55,8 @@ struct UserDetails {
     token: String,
 }
 
-pub(crate) fn install_vcluster(instance_name: &str)->std::result::Result<(), Box<dyn Error>>  {
+#[allow(dead_code)]
+pub(crate) fn install_vcluster(instance_name: &str) -> std::result::Result<(), Box<dyn Error>> {
     Command::new("wsl")
     .arg("-d")
     .arg(instance_name)
@@ -364,6 +366,7 @@ pub(crate) fn generate_kubeconfig(instance_name: &str,vcluster_name: &str) -> Re
     Ok(())
 }
 
+  #[allow(dead_code)]
   fn get_k8s_secret(instance_name: &str, vcluster_name: &str, secret_key: &str) -> String {
     let output = Command::new("wsl")
         .args(&["-d", instance_name, "--", "sh", "-c",
@@ -619,6 +622,7 @@ if !stderr.is_empty() {
 }
 
 
+#[allow(dead_code)]
 fn deploy_cert_manager_(instance_name: &str){
   let commands = vec![
     "kubectl create namespace cert-manager".to_string(),
@@ -645,7 +649,8 @@ fn deploy_cert_manager_(instance_name: &str){
 }
 }
 
-fn create_certificate(instance_name: &str,vcluster_name: &str){
+#[allow(dead_code)]
+fn create_certificate(instance_name: &str, vcluster_name: &str){
   let commands = vec![
     format!(r###"kubectl wait --for=condition=ready pod/{}-0 -n {} --timeout=300s && echo "
     apiVersion: cert-manager.io/v1
