@@ -58,8 +58,17 @@ To do so:
 2. Open the latest successful workflow run and expand the **Artifacts** section.
 3. Download the WSL image archive. On Linux, the file is published as
    `env-dev-image-linux.tar`, while on Windows the file is named
-   `env-dev-image-windows.tar`.  Both contain the same `env-dev-image.tar`
-   archive.
+   `env-dev-image-windows.tar`.  Both artifacts contain the same
+   `env-dev-image.tar` archive.
+
+   Extract it with `tar -xf env-dev-image-windows.tar` (or
+   `env-dev-image-linux.tar` on Linux), then import the distro:
+
+   ```powershell
+   wsl --import k3s <path> <path>\env-dev-image.tar --version 2
+   ```
+
+   The default distribution path is `C:\wsldistros`.
 
 If you plan to compile the project yourself, set the `WSL_IMAGE_ARCHIVE`
 environment variable to the archive's path before running commands so the image
