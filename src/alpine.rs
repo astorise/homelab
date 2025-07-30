@@ -15,6 +15,8 @@ pub fn import_alpine(instance_name: &str, base_dir: &Path) -> Result<(), Box<dyn
     let bytes = include_bytes!(env!("WSL_IMAGE_PATH"));
     let mut file_alpine = fs::File::create(&tar_file)?;
     file_alpine.write_all(bytes)?;
+    file_alpine.sync_all()?;
+    drop(file_alpine); // ensure the file handle is closed
 
     println!("Extracting image to {}", tar_file.display());
     println!("Importing distro into {}", download_folder.display());
