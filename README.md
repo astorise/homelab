@@ -1,13 +1,12 @@
 # Homelab
 
 Command line interface to bootstrap and manage a local Kubernetes lab using Windows Subsystem for Linux (WSL).
-It imports a WSL distribution built from the official `rancher/k3s` image and includes common services such as Helm, MinIO, GitLab and Prometheus.
+It imports a WSL distribution based on BusyBox, copying the `k3s` binary from the official `rancher/k3s` image, and includes common services such as Helm, MinIO, GitLab and Prometheus.
 The CI workflow builds a Docker image, exports its **root filesystem** from a container and embeds this tarball in the binary, allowing installation to run completely offline.
 
 The CI workflow includes separate jobs that build Linux and Windows (x86_64) binaries. The Windows executable is available as `env-dev.exe`.
 
-The repository also provides a `Dockerfile` used to build this image. It simply extends
-`rancher/k3s:latest` so the resulting tarball already contains the k3s binaries.
+The repository also provides a `Dockerfile` used to build this image. It uses a multi-stage build where the final image is based on BusyBox and the `k3s` binary is copied from the official image.
 
 When compiling the project **from source**, set the `WSL_IMAGE_ARCHIVE` environment
 variable to the root filesystem tarball produced by the CI workflow (exported
