@@ -1,10 +1,12 @@
-# ---- Étape 1 : Récupérer les bibliothèques nécessaires depuis l’image NVIDIA ----
-FROM nvidia/cuda:12.9.1-cudnn-runtime-ubuntu24.04 AS cuda-libs
+# ---- Étape 1 : Récupérer K3s ----
+FROM rancher/k3s:latest AS k3s_stage
 
-# ---- Étape 2 : Base Alpine ultra-légère ----
+# ---- Étape 2 : Récupérer CUDA ----
+FROM nvidia/cuda:12.9.1-cudnn-runtime-ubuntu24.04 AS cuda_stage
+
+# ---- Étape 3 : Base Alpine ----
 FROM alpine:3.22
 
-# Installer les dépendances minimales
 RUN apk add --no-cache \
     bash \
     curl \
@@ -19,28 +21,22 @@ RUN apk add --no-cache \
 # Créer l’arborescence CUDA
 RUN mkdir -p /usr/local/cuda/lib64
 
-# Copier uniquement les bibliothèques nécessaires (CUDA runtime + cuDNN)
-COPY --from=cuda-libs /usr/local/cuda/lib64/libcuda*.so* /usr/local/cuda/lib64/
-COPY --from=cuda-libs /usr/local/cuda/lib64/libcudart*.so* /usr/local/cuda/lib64/
-COPY --from=cuda-libs /usr/local/cuda/lib64/libcublas*.so* /usr/local/cuda/lib64/
-COPY --from=cuda-libs /usr/local/cuda/lib64/libcudnn*.so* /usr/local/cuda/lib64/
+# Copier uniquement les bibliothèques nécessaires
+COPY --from=cuda_stage /usr/local/cuda/lib64/libcuda*.so* /usr/local/cuda/lib64/
+COPY --from=cuda_stage /usr/local/cuda/lib64/libcudart*.so* /usr/local/cuda/lib64/
+COPY --from=cuda_stage /usr/local/cuda/lib64/libcublas*.so* /usr/local/cuda/lib64/
+COPY --from=cuda_stage /usr/local/cuda/lib64/libcudnn*.so* /usr/local/cuda/lib64/
 
-# Configurer le chemin des bibliothèques
-ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64
-
-# ---- Étape 3 : Ajouter K3s ----
-FROM rancher/k3s:latest AS k3s-src
-COPY --from=k3s-src /bin/k3s /usr/local/bin/k3s
+# Copier K3s
+COPY --from=k3s_stage /bin/k3s /usr/local/bin/k3s
 RUN chmod +x /usr/local/bin/k3s
 
-# ---- Étape 4 : Préparer WSL + K3s init ----
-RUN mkdir -p /etc && touch /etc/fstab
-
-# Variables configurables
+# Variables d'environnement
+ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64
 ENV WSL_ROLE=server
 ENV WSL_PORT_RANGE=6443-6550
 
-# Script d'auto-start (charge /etc/k3s-env si présent)
+# Script d'auto-start
 RUN mkdir -p /etc/local.d && \
     echo '#!/bin/sh\n\
 [ -f /etc/k3s-env ] && . /etc/k3s-env\n\
