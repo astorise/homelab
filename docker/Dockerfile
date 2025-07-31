@@ -26,9 +26,8 @@ RUN chmod +x /usr/local/bin/k3s
 COPY --from=cuda-libs /usr/local/cuda/lib64 /usr/local/cuda/lib64
 COPY --from=cuda-libs /usr/lib/x86_64-linux-gnu/libcuda* /usr/lib/x86_64-linux-gnu/
 
-# Configurer les libs
-ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64
-RUN echo "/usr/local/cuda/lib64" >> /etc/ld.so.conf && ldconfig
+# Configurer les libs (sans ldconfig)
+ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu
 
 # Préparer WSL
 RUN mkdir -p /etc && touch /etc/fstab
@@ -42,10 +41,11 @@ RUN mkdir -p /etc/local.d
 RUN echo '#!/bin/sh\n\
 ROLE=${WSL_ROLE:-server}\n\
 PORT_RANGE=${WSL_PORT_RANGE:-6443-6550}\n\
+API_PORT=$(echo $PORT_RANGE | cut -d"-" -f1)\n\
 if [ "$ROLE" = "server" ]; then\n\
-  /usr/local/bin/k3s server --https-listen-port $(echo $PORT_RANGE | cut -d"-" -f1) --disable traefik &\n\
+  /usr/local/bin/k3s server --https-listen-port $API_PORT --disable traefik &\n\
 else\n\
-  /usr/local/bin/k3s agent --server https://<WSL_SERVER_IP>:$(echo $PORT_RANGE | cut -d"-" -f1) &\n\
+  /usr/local/bin/k3s agent --server https://<WSL_SERVER_IP>:$API_PORT &\n\
 fi\n' > /etc/local.d/k3s.start \
     && chmod +x /etc/local.d/k3s.start
 
