@@ -1,12 +1,10 @@
-# ---- Étape 1 : Récupérer K3s ----
-FROM rancher/k3s:latest AS k3s-src
-
-# ---- Étape 2 : Récupérer les bibliothèques CUDA depuis l'image NVIDIA officielle ----
+# ---- Étape 1 : Récupérer les bibliothèques nécessaires depuis l’image NVIDIA ----
 FROM nvidia/cuda:12.9.1-cudnn-runtime-ubuntu24.04 AS cuda-libs
 
-# ---- Étape 3 : Base Alpine ----
+# ---- Étape 2 : Base Alpine ultra-légère ----
 FROM alpine:3.22
 
+# Installer les dépendances minimales
 RUN apk add --no-cache \
     bash \
     curl \
@@ -18,36 +16,44 @@ RUN apk add --no-cache \
     eudev \
     openrc
 
-# Copier K3s
+# Créer l’arborescence CUDA
+RUN mkdir -p /usr/local/cuda/lib64
+
+# Copier uniquement les bibliothèques nécessaires (CUDA runtime + cuDNN)
+COPY --from=cuda-libs /usr/local/cuda/lib64/libcuda*.so* /usr/local/cuda/lib64/
+COPY --from=cuda-libs /usr/local/cuda/lib64/libcudart*.so* /usr/local/cuda/lib64/
+COPY --from=cuda-libs /usr/local/cuda/lib64/libcublas*.so* /usr/local/cuda/lib64/
+COPY --from=cuda-libs /usr/local/cuda/lib64/libcudnn*.so* /usr/local/cuda/lib64/
+
+# Configurer le chemin des bibliothèques
+ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64
+
+# ---- Étape 3 : Ajouter K3s ----
+FROM rancher/k3s:latest AS k3s-src
 COPY --from=k3s-src /bin/k3s /usr/local/bin/k3s
 RUN chmod +x /usr/local/bin/k3s
 
-# Copier uniquement les bibliothèques CUDA nécessaires
-COPY --from=cuda-libs /usr/local/cuda/lib64 /usr/local/cuda/lib64
-COPY --from=cuda-libs /usr/lib/x86_64-linux-gnu/libcuda* /usr/lib/x86_64-linux-gnu/
-
-# Configurer les libs (sans ldconfig)
-ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu
-
-# Préparer WSL
+# ---- Étape 4 : Préparer WSL + K3s init ----
 RUN mkdir -p /etc && touch /etc/fstab
 
 # Variables configurables
 ENV WSL_ROLE=server
 ENV WSL_PORT_RANGE=6443-6550
 
-# Script d'auto-start
-RUN mkdir -p /etc/local.d
-RUN echo '#!/bin/sh\n\
+# Script d'auto-start (charge /etc/k3s-env si présent)
+RUN mkdir -p /etc/local.d && \
+    echo '#!/bin/sh\n\
+[ -f /etc/k3s-env ] && . /etc/k3s-env\n\
 ROLE=${WSL_ROLE:-server}\n\
 PORT_RANGE=${WSL_PORT_RANGE:-6443-6550}\n\
 API_PORT=$(echo $PORT_RANGE | cut -d"-" -f1)\n\
 if [ "$ROLE" = "server" ]; then\n\
   /usr/local/bin/k3s server --https-listen-port $API_PORT --disable traefik &\n\
 else\n\
-  /usr/local/bin/k3s agent --server https://<WSL_SERVER_IP>:$API_PORT &\n\
-fi\n' > /etc/local.d/k3s.start \
-    && chmod +x /etc/local.d/k3s.start
+  if [ -z "$K3S_URL" ]; then echo "[ERREUR] K3S_URL manquant pour agent"; exit 1; fi\n\
+  /usr/local/bin/k3s agent --server "$K3S_URL" &\n\
+fi\n' > /etc/local.d/k3s.start && \
+    chmod +x /etc/local.d/k3s.start
 
 # Activer openrc
 RUN rc-update add local default
