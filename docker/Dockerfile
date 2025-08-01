@@ -1,32 +1,39 @@
+# ---- Étape 1 : Debian slim pour installer CUDA ----
+FROM debian:12-slim AS cuda_build
+
+# Installer wget et dpkg
+RUN apt-get update && apt-get install -y wget dpkg xz-utils && rm -rf /var/lib/apt/lists/*
+
+# Télécharger le package CUDA runtime .deb
+RUN wget -O /tmp/cuda.deb https://developer.download.nvidia.com/compute/cuda/12.9.1/local_installers/cuda-repo-ubuntu2404-12-9-local_12.9.1-1_amd64.deb
+
+# Extraire les fichiers
+RUN dpkg-deb -x /tmp/cuda.deb /tmp/cuda
+
+# ---- Étape 2 : Image finale Alpine ----
 FROM alpine:3.22
 
-# Dépendances de base
-RUN apk add --no-cache \
-    bash curl ca-certificates libc6-compat util-linux iptables iproute2 eudev openrc xz
+# Installer outils minimaux
+RUN apk add --no-cache bash curl ca-certificates libc6-compat util-linux iptables iproute2 eudev openrc
 
-# Créer le dossier CUDA
+# Créer arborescence CUDA et copier seulement les libs nécessaires
 RUN mkdir -p /usr/local/cuda/lib64
+COPY --from=cuda_build /tmp/cuda/usr/local/cuda/lib64/libcuda*.so* /usr/local/cuda/lib64/
+COPY --from=cuda_build /tmp/cuda/usr/local/cuda/lib64/libcudart*.so* /usr/local/cuda/lib64/
+COPY --from=cuda_build /tmp/cuda/usr/local/cuda/lib64/libcublas*.so* /usr/local/cuda/lib64/
+COPY --from=cuda_build /tmp/cuda/usr/local/cuda/lib64/libcudnn*.so* /usr/local/cuda/lib64/
 
-# Télécharger et extraire uniquement le runtime (≈200 Mo)
-RUN curl -fsSL https://developer.download.nvidia.com/compute/cuda/redist/cuda_runtime/linux-x86_64/cuda_runtime-linux-x86_64-12.9.105-archive.tar.xz \
-    | tar -xJ --strip-components=1 -C /usr/local/cuda
-
-# (Optionnel) cuDNN : ajouter seulement si nécessaire
-RUN curl -fsSL https://developer.download.nvidia.com/compute/redist/cudnn/v9.5.0/local_installers/12.9/cudnn-linux-x86_64-9.5.0.50_cuda12-archive.tar.xz \
-    | tar -xJ --strip-components=1 -C /usr/local/cuda
-
-# Chemin des libs
 ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64
 
-# Ajouter K3s
+# ---- K3s ----
 ADD https://github.com/k3s-io/k3s/releases/latest/download/k3s /usr/local/bin/k3s
 RUN chmod +x /usr/local/bin/k3s
 
-# Variables
+# Variables WSL
 ENV WSL_ROLE=server
 ENV WSL_PORT_RANGE=6443-6550
 
-# Script d'auto‑start
+# Script auto-start K3s
 RUN mkdir -p /etc/local.d && \
     echo '#!/bin/sh\n\
 [ -f /etc/k3s-env ] && . /etc/k3s-env\n\
