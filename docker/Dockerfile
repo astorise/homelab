@@ -22,10 +22,6 @@ COPY --from=cuda_build /usr/local/cuda/lib64 /usr/local/cuda/lib64
 
 ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64
 
-# ---- K3s ----
-ADD https://github.com/k3s-io/k3s/releases/latest/download/k3s /usr/local/bin/k3s
-RUN chmod +x /usr/local/bin/k3s
-
 # ---- Config WSL ----
 ENV WSL_ROLE=server
 ENV WSL_PORT_RANGE=6443-6550

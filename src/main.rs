@@ -7,6 +7,7 @@ mod gitlab;
 mod helm;
 mod k3s;
 mod minio;
+mod oci;
 mod prometheus;
 mod tools;
 mod update;

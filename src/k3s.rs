@@ -1,4 +1,12 @@
-use std::{error::Error, process::Command, thread, time::Duration};
+use std::{
+    error::Error,
+    io::Write,
+    process::{Command, Stdio},
+    thread,
+    time::Duration,
+};
+
+use crate::oci;
 
 pub(crate) fn install_k3s(instance_name: &str) -> std::result::Result<(), Box<dyn Error>> {
     Command::new("wsl")
@@ -8,16 +16,30 @@ pub(crate) fn install_k3s(instance_name: &str) -> std::result::Result<(), Box<dy
         .output()
         .expect("Échec de l'exécution de la commande");
 
-    // Ensure the k3s binary from the base image is available under /usr/local/bin
-    Command::new("wsl")
+    // Install k3s binary if missing
+    let status = Command::new("wsl")
         .arg("-d")
         .arg(instance_name)
-        .args([
-            "sh",
-            "-c",
-            "[ -f /usr/local/bin/k3s ] || ln -s /bin/k3s /usr/local/bin/k3s",
-        ])
+        .args(["sh", "-c", "test -f /usr/local/bin/k3s"])
         .status()?;
+    if !status.success() {
+        let k3s = oci::fetch_k3s_binary()?;
+        let mut child = Command::new("wsl")
+            .arg("-d")
+            .arg(instance_name)
+            .args(["--", "sh", "-c", "cat > /usr/local/bin/k3s"])
+            .stdin(Stdio::piped())
+            .spawn()?;
+        child.stdin.as_mut().unwrap().write_all(&k3s)?;
+        if !child.wait()?.success() {
+            return Err("échec de la copie du binaire k3s".into());
+        }
+        Command::new("wsl")
+            .arg("-d")
+            .arg(instance_name)
+            .args(["--", "chmod", "+x", "/usr/local/bin/k3s"])
+            .status()?;
+    }
 
     // Copier le script dans WSL et le rendre exécutable, puis l'exécuter
     let commands = vec![
