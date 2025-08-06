@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Include xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Fragment>
+    <CustomAction Id="InstallHomeDns" ExeCommand="[INSTALLFOLDER]home-dns.exe install" Execute="deferred" Return="check"/>
+    <CustomAction Id="InstallHomeProxy" ExeCommand="[INSTALLFOLDER]home-proxy.exe install" Execute="deferred" Return="check"/>
+    <CustomAction Id="UninstallHomeDns" ExeCommand="[INSTALLFOLDER]home-dns.exe uninstall" Execute="deferred" Return="check"/>
+    <CustomAction Id="UninstallHomeProxy" ExeCommand="[INSTALLFOLDER]home-proxy.exe uninstall" Execute="deferred" Return="check"/>
+    <InstallExecuteSequence>
+      <Custom Action="InstallHomeDns" After="InstallFinalize">NOT Installed</Custom>
+      <Custom Action="InstallHomeProxy" After="InstallFinalize">NOT Installed</Custom>
+      <Custom Action="UninstallHomeDns" Before="RemoveFiles">REMOVE="ALL"</Custom>
+      <Custom Action="UninstallHomeProxy" Before="RemoveFiles">REMOVE="ALL"</Custom>
+    </InstallExecuteSequence>
+  </Fragment>
+</Include>
