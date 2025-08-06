@@ -2,9 +2,8 @@ name: Build Tauri
 
 on:
   push:
-    branches: [ main ]
-  pull_request:
-    branches: [ main ]
+    branches-ignore:
+      - 'codex/*'
   workflow_dispatch:
 
 jobs:
