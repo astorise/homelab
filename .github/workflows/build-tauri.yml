@@ -23,10 +23,9 @@ jobs:
       - name: Build services
         shell: bash
         run: |
-          cd home-dns
-          cargo build --release --target x86_64-pc-windows-msvc
-          cd ../home-proxy
-          cargo build --release --target x86_64-pc-windows-msvc
+          for crate in home-dns home-proxy; do
+            cargo build --release --target x86_64-pc-windows-msvc --manifest-path $crate/Cargo.toml
+          done
       - name: Copy service binaries
         shell: bash
         run: |
