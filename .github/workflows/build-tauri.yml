@@ -24,15 +24,15 @@ jobs:
         shell: bash
         run: |
           cd home-dns
-          cargo build --release
+          cargo build --release --target x86_64-pc-windows-msvc
           cd ../home-proxy
-          cargo build --release
+          cargo build --release --target x86_64-pc-windows-msvc
       - name: Copy service binaries
         shell: bash
         run: |
           mkdir -p home-lab/src-tauri/resources
-          cp home-dns/target/release/home-dns.exe home-lab/src-tauri/resources/
-          cp home-proxy/target/release/home-proxy.exe home-lab/src-tauri/resources/
+          cp home-dns/target/x86_64-pc-windows-msvc/release/home-dns.exe home-lab/src-tauri/resources/
+          cp home-proxy/target/x86_64-pc-windows-msvc/release/home-proxy.exe home-lab/src-tauri/resources/
       - uses: actions/upload-artifact@v4
         with:
           name: installer
