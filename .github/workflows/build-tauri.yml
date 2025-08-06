@@ -1,0 +1,42 @@
+name: Build Tauri
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+          target: x86_64-pc-windows-msvc
+          override: true
+      - name: Build services
+        shell: bash
+        run: |
+          cd home-dns
+          cargo build --release
+          cd ../home-proxy
+          cargo build --release
+      - name: Copy service binaries
+        shell: bash
+        run: |
+          mkdir -p home-lab/src-tauri/resources
+          cp home-dns/target/release/home-dns.exe home-lab/src-tauri/resources/
+          cp home-proxy/target/release/home-proxy.exe home-lab/src-tauri/resources/
+      - name: Build Tauri app
+        working-directory: home-lab
+        run: |
+          npm ci
+          npm run tauri build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: installer
+          path: home-lab/src-tauri/target/release/bundle/**/*
