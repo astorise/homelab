@@ -11,6 +11,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       RUSTFLAGS: "-C target-feature=+crt-static"
+      CARGO_TARGET_DIR: target
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -32,7 +33,7 @@ jobs:
         shell: bash
         run: |
           cross build --release --target x86_64-pc-windows-gnu --manifest-path home-dns/Cargo.toml
-          if [ ! -f home-dns/target/x86_64-pc-windows-gnu/release/home-dns.exe ]; then
+          if [ ! -f target/x86_64-pc-windows-gnu/release/home-dns.exe ]; then
             echo "home-dns.exe not found after build" >&2
             exit 1
           fi
@@ -40,13 +41,13 @@ jobs:
         shell: bash
         run: |
           mkdir -p home-lab/src-tauri/resources
-          if [ -f home-dns/target/x86_64-pc-windows-gnu/release/home-dns.exe ]; then
-            cp home-dns/target/x86_64-pc-windows-gnu/release/home-dns.exe home-lab/src-tauri/resources/
+          if [ -f target/x86_64-pc-windows-gnu/release/home-dns.exe ]; then
+            cp target/x86_64-pc-windows-gnu/release/home-dns.exe home-lab/src-tauri/resources/
           else
             echo "home-dns.exe not found; aborting copy" >&2
             exit 1
           fi
-          cp home-proxy/target/x86_64-pc-windows-gnu/release/home-proxy.exe home-lab/src-tauri/resources/
+          cp target/x86_64-pc-windows-gnu/release/home-proxy.exe home-lab/src-tauri/resources/
       - name: Activer universe et installer dépendances système
         run: |
           sudo apt-get update
