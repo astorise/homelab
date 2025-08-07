@@ -38,10 +38,6 @@ jobs:
           mkdir -p home-lab/src-tauri/resources
           cp home-dns/target/x86_64-pc-windows-gnu/release/home-dns.exe home-lab/src-tauri/resources/
           cp home-proxy/target/x86_64-pc-windows-gnu/release/home-proxy.exe home-lab/src-tauri/resources/
-      - uses: actions/upload-artifact@v4
-        with:
-          name: installer
-          path: home-lab/src-tauri/target/release/bundle/**/*
       - name: Activer universe et installer dépendances système
         run: |
           sudo apt-get update
@@ -60,8 +56,14 @@ jobs:
           toolchain: stable
 
       - name: Installer dépendances JS
+        working-directory: home-lab
         run: npm ci
 
       - name: Builder Tauri
+        working-directory: home-lab
         run: npm run tauri build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: installer
+          path: home-lab/src-tauri/target/release/bundle/**/*
 
