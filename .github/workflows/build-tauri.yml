@@ -10,7 +10,6 @@ jobs:
   build:
     runs-on: ubuntu-latest
     env:
-      RUSTFLAGS: "-C target-feature=+crt-static"
       CARGO_TARGET_DIR: target
     steps:
       - uses: actions/checkout@v4
@@ -28,8 +27,12 @@ jobs:
           HOST=$(rustc -vV | sed -n 's/^host: //p')
           cargo install cross --git https://github.com/cross-rs/cross --locked --target "$HOST"
       - name: Build home-proxy service
+        env:
+          RUSTFLAGS: "-C target-feature=+crt-static"
         run: cross build --release --target x86_64-pc-windows-gnu --manifest-path home-proxy/Cargo.toml
       - name: Build home-dns service
+        env:
+          RUSTFLAGS: "-C target-feature=+crt-static"
         shell: bash
         run: |
           cross build --release --target x86_64-pc-windows-gnu --manifest-path home-dns/Cargo.toml
@@ -70,6 +73,8 @@ jobs:
         run: npm ci
 
       - name: Builder Tauri
+        env:
+          RUSTFLAGS: ""
         working-directory: home-lab
         run: npm run tauri build
       - uses: actions/upload-artifact@v4
