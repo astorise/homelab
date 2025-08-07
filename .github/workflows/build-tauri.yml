@@ -20,20 +20,22 @@ jobs:
         with:
           profile: minimal
           toolchain: stable
-          target: x86_64-pc-windows-msvc
+          target: x86_64-pc-windows-gnu
           override: true
+      - name: Installer cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
       - name: Build services
         shell: bash
         run: |
           for crate in home-dns home-proxy; do
-            cargo build --release --target x86_64-pc-windows-msvc --manifest-path $crate/Cargo.toml
+            cross build --release --target x86_64-pc-windows-gnu --manifest-path $crate/Cargo.toml
           done
       - name: Copy service binaries
         shell: bash
         run: |
           mkdir -p home-lab/src-tauri/resources
-          cp home-dns/target/x86_64-pc-windows-msvc/release/home-dns.exe home-lab/src-tauri/resources/
-          cp home-proxy/target/x86_64-pc-windows-msvc/release/home-proxy.exe home-lab/src-tauri/resources/
+          cp home-dns/target/x86_64-pc-windows-gnu/release/home-dns.exe home-lab/src-tauri/resources/
+          cp home-proxy/target/x86_64-pc-windows-gnu/release/home-proxy.exe home-lab/src-tauri/resources/
       - uses: actions/upload-artifact@v4
         with:
           name: installer
