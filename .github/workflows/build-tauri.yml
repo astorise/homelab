@@ -26,17 +26,26 @@ jobs:
         run: |
           HOST=$(rustc -vV | sed -n 's/^host: //p')
           cargo install cross --git https://github.com/cross-rs/cross --locked --target "$HOST"
-      - name: Build services
+      - name: Build home-proxy service
+        run: cross build --release --target x86_64-pc-windows-gnu --manifest-path home-proxy/Cargo.toml
+      - name: Build home-dns service
         shell: bash
         run: |
-          for crate in home-dns home-proxy; do
-            cross build --release --target x86_64-pc-windows-gnu --manifest-path $crate/Cargo.toml
-          done
+          cross build --release --target x86_64-pc-windows-gnu --manifest-path home-dns/Cargo.toml
+          if [ ! -f home-dns/target/x86_64-pc-windows-gnu/release/home-dns.exe ]; then
+            echo "home-dns.exe not found after build" >&2
+            exit 1
+          fi
       - name: Copy service binaries
         shell: bash
         run: |
           mkdir -p home-lab/src-tauri/resources
-          cp home-dns/target/x86_64-pc-windows-gnu/release/home-dns.exe home-lab/src-tauri/resources/
+          if [ -f home-dns/target/x86_64-pc-windows-gnu/release/home-dns.exe ]; then
+            cp home-dns/target/x86_64-pc-windows-gnu/release/home-dns.exe home-lab/src-tauri/resources/
+          else
+            echo "home-dns.exe not found; aborting copy" >&2
+            exit 1
+          fi
           cp home-proxy/target/x86_64-pc-windows-gnu/release/home-proxy.exe home-lab/src-tauri/resources/
       - name: Activer universe et installer dépendances système
         run: |
