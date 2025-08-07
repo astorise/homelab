@@ -1,14 +1,15 @@
+---
 name: Build Tauri
 
-on:
+'on':
   push:
     branches-ignore:
       - 'codex/*'
-  workflow_dispatch:
+  workflow_dispatch: {}
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
     env:
       RUSTFLAGS: "-C target-feature=+crt-static"
       CARGO_TARGET_DIR: target
@@ -21,59 +22,24 @@ jobs:
         with:
           profile: minimal
           toolchain: stable
-          target: x86_64-pc-windows-gnu
           override: true
-      - name: Install cross
-        run: |
-          HOST=$(rustc -vV | sed -n 's/^host: //p')
-          cargo install cross --git https://github.com/cross-rs/cross --locked --target "$HOST"
       - name: Build home-proxy service
-        run: cross build --release --target x86_64-pc-windows-gnu --manifest-path home-proxy/Cargo.toml
+        run: cargo build --release --manifest-path home-proxy/Cargo.toml
       - name: Build home-dns service
-        shell: bash
-        run: |
-          cross build --release --target x86_64-pc-windows-gnu --manifest-path home-dns/Cargo.toml
-          if [ ! -f target/x86_64-pc-windows-gnu/release/home-dns.exe ]; then
-            echo "home-dns.exe not found after build" >&2
-            exit 1
-          fi
+        run: cargo build --release --manifest-path home-dns/Cargo.toml
       - name: Copy service binaries
         shell: bash
         run: |
           mkdir -p home-lab/src-tauri/resources
-          if [ -f target/x86_64-pc-windows-gnu/release/home-dns.exe ]; then
-            cp target/x86_64-pc-windows-gnu/release/home-dns.exe home-lab/src-tauri/resources/
-          else
-            echo "home-dns.exe not found; aborting copy" >&2
-            exit 1
-          fi
-          cp target/x86_64-pc-windows-gnu/release/home-proxy.exe home-lab/src-tauri/resources/
-      - name: Activer universe et installer dépendances système
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y software-properties-common
-          sudo add-apt-repository universe
-          sudo apt-get update
-          sudo apt-get install -y \
-            pkg-config \
-            libglib2.0-dev \
-            libgtk-3-dev \
-            libwebkit2gtk-4.1-dev
-
-      - name: Installer toolchain Rust
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-
+          cp target/release/home-proxy.exe home-lab/src-tauri/resources/
+          cp target/release/home-dns.exe home-lab/src-tauri/resources/
       - name: Installer dépendances JS
         working-directory: home-lab
         run: npm ci
-
       - name: Builder Tauri
         working-directory: home-lab
-        run: npm run tauri build
+        run: npm run tauri build -- --target x86_64-pc-windows-msvc
       - uses: actions/upload-artifact@v4
         with:
           name: installer
           path: home-lab/src-tauri/target/release/bundle/**/*
-
