@@ -2,6 +2,8 @@
 name = "home-proxy"
 version = "0.1.0"
 edition = "2024"
+license = "GPL-3.0-only"
+repository = "https://github.com/example/homelab"
 
 [dependencies]
 sysinfo = "0.36.1"
