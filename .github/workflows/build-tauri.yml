@@ -22,8 +22,10 @@ jobs:
           toolchain: stable
           target: x86_64-pc-windows-gnu
           override: true
-      - name: Installer cross
-        run: cargo install cross --git https://github.com/cross-rs/cross
+      - name: Install cross
+        run: |
+          unset TARGET CARGO_BUILD_TARGET
+          cargo install cross --git https://github.com/cross-rs/cross --locked
       - name: Build services
         shell: bash
         run: |
