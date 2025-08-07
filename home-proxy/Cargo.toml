@@ -2,11 +2,9 @@
 name = "home-proxy"
 version = "0.1.0"
 edition = "2024"
-license = "GPL-3.0-only"
-repository = "https://github.com/example/homelab"
 
 [dependencies]
-sysinfo = "0.36.1"
-tokio = "1.47.1"
-tokio-tungstenite = "0.27.0"
-windows-service = "0.8.0"
+sysinfo = { workspace = true }
+tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
+windows-service = { workspace = true }
