@@ -8,27 +8,27 @@ fn greet(name: &str) -> String {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .plugin(tauri_plugin_tray::init())
         .setup(|app| {
             use tauri::menu::{MenuBuilder, MenuItem};
-            use tauri_plugin_tray::{TrayIconBuilder, TrayIconEvent};
+            use tauri::tray::{TrayIconBuilder, TrayIconEvent};
+            use tauri::Manager;
 
             let app_handle = app.app_handle();
 
-            let quit = MenuItem::with_id(app_handle.clone(), "quit", "Quit", true, None);
-            let menu = MenuBuilder::new(app_handle.clone())
+            let quit = MenuItem::with_id(app_handle, "quit", "Quit", true, None::<&str>)?;
+            let menu = MenuBuilder::new(app_handle)
                 .item(&quit)
                 .build()?;
 
             TrayIconBuilder::new()
                 .icon(app_handle.default_window_icon().unwrap().clone())
                 .menu(&menu)
-                .on_event(|_, event| match event {
+                .on_tray_icon_event(|_, event| match event {
                     TrayIconEvent::Enter { .. } => println!("tray hover"),
                     TrayIconEvent::DoubleClick { .. } => println!("tray double click"),
                     _ => {}
                 })
-                .build(app_handle.clone())?;
+                .build(app_handle)?;
 
             Ok(())
         })
