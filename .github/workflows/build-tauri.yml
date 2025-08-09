@@ -52,7 +52,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Download services artifacts into Tauri resources
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           name: services-win
           path: home-lab/src-tauri/resources
