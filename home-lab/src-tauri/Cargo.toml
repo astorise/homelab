@@ -14,12 +14,12 @@ edition = "2021"
 name = "home_lab_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+
 [build-dependencies]
-tauri-build = { version = "2", features = [] }
+tauri-build = { version = "2" }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-opener = "2"
-tauri-plugin-tray = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
