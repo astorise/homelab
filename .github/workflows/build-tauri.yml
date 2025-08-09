@@ -1,0 +1,98 @@
+name: Build Tauri
+
+on:
+  push:
+    branches-ignore: ['codex/*']
+  workflow_dispatch:
+
+jobs:
+  build-services:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install mingw for Windows cross-compile
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mingw-w64
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+
+      - name: Cache Rust (workspace)
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: services-x86_64-pc-windows-gnu
+          cache-on-failure: true
+
+      - name: Build services (Windows gnu)
+        env:
+          RUSTFLAGS: "-C target-feature=+crt-static"
+        run: |
+          cargo build -p home-dns   --release --target x86_64-pc-windows-gnu
+          cargo build -p home-proxy --release --target x86_64-pc-windows-gnu
+          ls -lah target/x86_64-pc-windows-gnu/release
+          mkdir -p services-win
+          cp target/x86_64-pc-windows-gnu/release/home-dns.exe   services-win/
+          cp target/x86_64-pc-windows-gnu/release/home-proxy.exe services-win/
+
+      - name: Upload services artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: services-win
+          path: services-win/*
+
+  # === OPTION RECOMMANDÉE: installateur Windows officiel (runner Windows) ===
+  build-tauri-win:
+    runs-on: windows-latest
+    needs: build-services
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download services artifacts into Tauri resources
+        uses: actions/download-artifact@v4
+        with:
+          name: services-win
+          path: home-lab/src-tauri/resources
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install frontend deps + Tauri CLI
+        working-directory: home-lab
+        shell: pwsh
+        run: |
+          if (Test-Path package-lock.json) { npm ci } else { npm install }
+          $hasCli = (npm pkg get devDependencies.'@tauri-apps/cli' | Select-String -Quiet '@tauri-apps/cli')
+          if (-not $hasCli) { npm i -D @tauri-apps/cli@latest }
+          npx tauri -V
+
+      - name: Build Tauri (Windows - NSIS + MSI)
+        uses: tauri-apps/tauri-action@v0.5.22
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_BUNDLE_DEBUG: "true"
+          TAURI_BUNDLE_TARGETS: "nsis,msi"
+        with:
+          projectPath: ./home-lab
+
+      - name: Upload NSIS setup
+        uses: actions/upload-artifact@v4
+        with:
+          name: nsis-setup
+          path: target/release/bundle/nsis/*.exe
+          if-no-files-found: error
+
+      - name: Upload MSI package
+        uses: actions/upload-artifact@v4
+        with:
+          name: msi-package
+          path: target/release/bundle/msi/*.msi
+          if-no-files-found: error
