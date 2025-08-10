@@ -1,4 +1,6 @@
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
+use tauri::{Emitter, Manager};
+
 #[tauri::command]
 fn greet(name: &str) -> String {
     format!("Hello, {}! You've been greeted from Rust!", name)
@@ -71,7 +73,6 @@ pub fn run() {
             use tauri::menu::MenuEvent;
             use tauri::path::BaseDirectory;
             use tauri::tray::{TrayIcon, TrayIconBuilder, TrayIconEvent};
-            use tauri::Manager;
 
             let app_handle = app.app_handle();
             let resolver = app_handle.path();
