@@ -28,6 +28,35 @@ fn icon_for_state(
     )?)
 }
 
+#[tauri::command]
+fn read_service_log(
+    app_handle: tauri::AppHandle,
+    service: &str,
+) -> Result<String, String> {
+    use std::fs;
+    use tauri::path::BaseDirectory;
+
+    let resolver = app_handle.path();
+    let path = resolver
+        .resolve(format!("logs/{service}.log"), BaseDirectory::Resource)
+        .map_err(|e| e.to_string())?;
+    fs::read_to_string(path).map_err(|e| e.to_string())
+}
+
+fn show_history_window(app: &tauri::AppHandle, service: &str) {
+    use tauri::{WebviewUrl, WebviewWindowBuilder};
+
+    let label = format!("{service}-history");
+    if app.get_window(&label).is_none() {
+        let url = WebviewUrl::App(format!("history.html?service={service}").into());
+        let _ = WebviewWindowBuilder::new(app, &label, url)
+            .title(format!("{service} history"))
+            .build();
+    } else if let Some(window) = app.get_window(&label) {
+        let _ = window.set_focus();
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -190,14 +219,39 @@ pub fn run() {
                         _ => {}
                     }
                 })
-                .on_tray_icon_event(|_, event| match event {
-                    TrayIconEvent::Enter { .. } => println!("tray hover"),
-                    TrayIconEvent::DoubleClick { .. } => println!("tray double click"),
-                    _ => {}
+                .build(app_handle)?;
+
+            let dns_tray = TrayIconBuilder::with_id("dns")
+                .icon(icon_for_state(&resolver, "dns", ServiceState::Running)?)
+                .on_tray_icon_event(|tray, event| {
+                    if let TrayIconEvent::DoubleClick { .. } = event {
+                        show_history_window(tray.app_handle(), "dns");
+                    }
+                })
+                .build(app_handle)?;
+
+            let https_tray = TrayIconBuilder::with_id("https")
+                .icon(icon_for_state(&resolver, "https", ServiceState::Running)?)
+                .on_tray_icon_event(|tray, event| {
+                    if let TrayIconEvent::DoubleClick { .. } = event {
+                        show_history_window(tray.app_handle(), "https");
+                    }
+                })
+                .build(app_handle)?;
+
+            let k3s_tray = TrayIconBuilder::with_id("k3s")
+                .icon(icon_for_state(&resolver, "k3s", ServiceState::Running)?)
+                .on_tray_icon_event(|tray, event| {
+                    if let TrayIconEvent::DoubleClick { .. } = event {
+                        show_history_window(tray.app_handle(), "k3s");
+                    }
                 })
                 .build(app_handle)?;
 
             let tray_handle = tray.clone();
+            let dns_tray_handle = dns_tray.clone();
+            let https_tray_handle = https_tray.clone();
+            let k3s_tray_handle = k3s_tray.clone();
             let app_handle_clone = app_handle.clone();
 
             thread::spawn(move || {
@@ -208,12 +262,15 @@ pub fn run() {
                             match service {
                                 "dns" => {
                                     let _ = dns_handle.inner().set_icon(Some(icon.clone()));
+                                    let _ = dns_tray_handle.set_icon(Some(icon.clone()));
                                 }
                                 "https" => {
                                     let _ = https_handle.inner().set_icon(Some(icon.clone()));
+                                    let _ = https_tray_handle.set_icon(Some(icon.clone()));
                                 }
                                 "k3s" => {
                                     let _ = k3s_handle.inner().set_icon(Some(icon.clone()));
+                                    let _ = k3s_tray_handle.set_icon(Some(icon.clone()));
                                 }
                                 _ => {}
                             }
@@ -235,7 +292,7 @@ pub fn run() {
 
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![greet])
+        .invoke_handler(tauri::generate_handler![greet, read_service_log])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Service History</title>
+</head>
+<body>
+  <pre id="log"></pre>
+  <script type="module">
+    const { invoke } = window.__TAURI__.core;
+    const params = new URLSearchParams(window.location.search);
+    const service = params.get("service") || "";
+    async function load() {
+      try {
+        const content = await invoke("read_service_log", { service });
+        document.getElementById("log").textContent = content;
+      } catch (e) {
+        document.getElementById("log").textContent = `Error: ${e}`;
+      }
+    }
+    load();
+  </script>
+</body>
+</html>
