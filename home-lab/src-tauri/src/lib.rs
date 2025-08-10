@@ -110,7 +110,7 @@ pub fn run() {
                     None::<&str>,
                 )?)
                 .build()?;
-            dns.inner().set_icon(Some(load_icon("dns")?.try_into()?));
+            dns.set_icon(Some(load_icon("dns")?.try_into()?));
 
             // HTTPS submenu
             let https = SubmenuBuilder::new(app_handle, "HTTPS")
@@ -136,9 +136,7 @@ pub fn run() {
                     None::<&str>,
                 )?)
                 .build()?;
-            https
-                .inner()
-                .set_icon(Some(load_icon("https")?.try_into()?));
+            https.set_icon(Some(load_icon("https")?.try_into()?));
 
             // k3s submenu
             let k3s = SubmenuBuilder::new(app_handle, "k3s")
@@ -164,7 +162,7 @@ pub fn run() {
                     None::<&str>,
                 )?)
                 .build()?;
-            k3s.inner().set_icon(Some(load_icon("k3s")?.try_into()?));
+            k3s.set_icon(Some(load_icon("k3s")?.try_into()?));
             let dns_handle = dns.clone();
             let https_handle = https.clone();
             let k3s_handle = k3s.clone();
@@ -263,15 +261,15 @@ pub fn run() {
                         if let Ok(icon) = img.try_into() {
                             match service {
                                 "dns" => {
-                                    let _ = dns_handle.inner().set_icon(Some(icon.clone()));
+                                    let _ = dns_handle.set_icon(Some(icon.clone()));
                                     let _ = dns_tray_handle.set_icon(Some(icon.clone()));
                                 }
                                 "https" => {
-                                    let _ = https_handle.inner().set_icon(Some(icon.clone()));
+                                    let _ = https_handle.set_icon(Some(icon.clone()));
                                     let _ = https_tray_handle.set_icon(Some(icon.clone()));
                                 }
                                 "k3s" => {
-                                    let _ = k3s_handle.inner().set_icon(Some(icon.clone()));
+                                    let _ = k3s_handle.set_icon(Some(icon.clone()));
                                     let _ = k3s_tray_handle.set_icon(Some(icon.clone()));
                                 }
                                 _ => {}
