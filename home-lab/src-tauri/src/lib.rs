@@ -4,21 +4,49 @@ fn greet(name: &str) -> String {
     format!("Hello, {}! You've been greeted from Rust!", name)
 }
 
+#[derive(Clone, Copy)]
+enum ServiceState {
+    Running,
+    Stopped,
+    Error,
+}
+
+fn icon_for_state(
+    resolver: &tauri::path::PathResolver,
+    service: &str,
+    state: ServiceState,
+) -> tauri::Result<tauri::image::Image> {
+    let color = match state {
+        ServiceState::Running => "green",
+        ServiceState::Stopped => "orange",
+        ServiceState::Error => "red",
+    };
+    let name = format!("{service}-{color}.png");
+    tauri::image::Image::from_path(resolver.resolve(
+        format!("icons/{name}"),
+        tauri::path::BaseDirectory::Resource,
+    )?)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
-        use std::convert::TryInto;
+            use std::convert::TryInto;
+            use std::sync::mpsc;
+            use std::thread;
+            use std::time::Duration;
 
             use tauri::image::Image;
             use tauri::menu::{MenuBuilder, MenuItem, SubmenuBuilder};
             use tauri::path::BaseDirectory;
-            use tauri::tray::{MenuEvent, TrayIconBuilder, TrayIconEvent};
+            use tauri::tray::{MenuEvent, TrayIcon, TrayIconBuilder, TrayIconEvent};
             use tauri::Manager;
 
             let app_handle = app.app_handle();
-let resolver = app_handle.path();
+            let resolver = app_handle.path();
+            let (status_tx, status_rx) = mpsc::channel::<(&'static str, ServiceState)>();
 
             // Helper to load an icon from the bundled resources directory
             let load_icon = |name: &str| {
@@ -106,49 +134,61 @@ let resolver = app_handle.path();
                 )?)
                 .build()?;
             k3s.inner().set_icon(Some(load_icon("k3s")?.try_into()?));
+            let dns_handle = dns.clone();
+            let https_handle = https.clone();
+            let k3s_handle = k3s.clone();
             let quit = MenuItem::with_id(app_handle, "quit", "Quit", true, None::<&str>)?;
             let menu = MenuBuilder::new(app_handle)
-               .item(&dns)
+                .item(&dns)
                 .item(&https)
                 .item(&k3s)
                 .item(&quit)
                 .build()?;
 
-            TrayIconBuilder::new()
+            let tray = TrayIconBuilder::new()
                 .icon(app_handle.default_window_icon().unwrap().clone())
                 .menu(&menu)
-                 .on_menu_event(|app, event: MenuEvent| match event.id.as_ref() {
-                    "dns_start" => {
-                        let _ = app.emit("dns-start", ());
+                .on_menu_event({
+                    let status_tx = status_tx.clone();
+                    move |app, event: MenuEvent| match event.id.as_ref() {
+                        "dns_start" => {
+                            let _ = status_tx.send(("dns", ServiceState::Running));
+                            let _ = app.emit("dns-start", ());
+                        }
+                        "dns_stop" => {
+                            let _ = status_tx.send(("dns", ServiceState::Stopped));
+                            let _ = app.emit("dns-stop", ());
+                        }
+                        "dns_configure" => {
+                            let _ = app.emit("dns-configure", ());
+                        }
+                        "https_start" => {
+                            let _ = status_tx.send(("https", ServiceState::Running));
+                            let _ = app.emit("https-start", ());
+                        }
+                        "https_stop" => {
+                            let _ = status_tx.send(("https", ServiceState::Stopped));
+                            let _ = app.emit("https-stop", ());
+                        }
+                        "https_configure" => {
+                            let _ = app.emit("https-configure", ());
+                        }
+                        "k3s_start" => {
+                            let _ = status_tx.send(("k3s", ServiceState::Running));
+                            let _ = app.emit("k3s-start", ());
+                        }
+                        "k3s_stop" => {
+                            let _ = status_tx.send(("k3s", ServiceState::Stopped));
+                            let _ = app.emit("k3s-stop", ());
+                        }
+                        "k3s_configure" => {
+                            let _ = app.emit("k3s-configure", ());
+                        }
+                        "quit" => {
+                            app.exit(0);
+                        }
+                        _ => {}
                     }
-                    "dns_stop" => {
-                        let _ = app.emit("dns-stop", ());
-                    }
-                    "dns_configure" => {
-                        let _ = app.emit("dns-configure", ());
-                    }
-                    "https_start" => {
-                        let _ = app.emit("https-start", ());
-                    }
-                    "https_stop" => {
-                        let _ = app.emit("https-stop", ());
-                    }
-                    "https_configure" => {
-                        let _ = app.emit("https-configure", ());
-                    }
-                    "k3s_start" => {
-                        let _ = app.emit("k3s-start", ());
-                    }
-                    "k3s_stop" => {
-                        let _ = app.emit("k3s-stop", ());
-                    }
-                    "k3s_configure" => {
-                        let _ = app.emit("k3s-configure", ());
-                    }
-                    "quit" => {
-                        app.exit(0);
-                    }
-                    _ => {}
                 })
                 .on_tray_icon_event(|_, event| match event {
                     TrayIconEvent::Enter { .. } => println!("tray hover"),
@@ -156,6 +196,42 @@ let resolver = app_handle.path();
                     _ => {}
                 })
                 .build(app_handle)?;
+
+            let tray_handle = tray.clone();
+            let app_handle_clone = app_handle.clone();
+
+            thread::spawn(move || {
+                let resolver = app_handle_clone.path();
+                while let Ok((service, state)) = status_rx.recv() {
+                    if let Ok(img) = icon_for_state(&resolver, service, state) {
+                        if let Ok(icon) = img.try_into() {
+                            match service {
+                                "dns" => {
+                                    let _ = dns_handle.inner().set_icon(Some(icon.clone()));
+                                }
+                                "https" => {
+                                    let _ = https_handle.inner().set_icon(Some(icon.clone()));
+                                }
+                                "k3s" => {
+                                    let _ = k3s_handle.inner().set_icon(Some(icon.clone()));
+                                }
+                                _ => {}
+                            }
+                            let _ = tray_handle.set_icon(Some(icon));
+                        }
+                    }
+                }
+            });
+
+            // Periodic task placeholder for monitoring services
+            let periodic_tx = status_tx.clone();
+            thread::spawn(move || loop {
+                thread::sleep(Duration::from_secs(60));
+                // TODO: query actual service states
+                let _ = periodic_tx.send(("dns", ServiceState::Running));
+                let _ = periodic_tx.send(("https", ServiceState::Running));
+                let _ = periodic_tx.send(("k3s", ServiceState::Running));
+            });
 
             Ok(())
         })
