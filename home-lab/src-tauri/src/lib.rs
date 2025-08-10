@@ -68,8 +68,9 @@ pub fn run() {
 
             use tauri::image::Image;
             use tauri::menu::{MenuBuilder, MenuItem, SubmenuBuilder};
+            use tauri::menu::MenuEvent;
             use tauri::path::BaseDirectory;
-            use tauri::tray::{MenuEvent, TrayIcon, TrayIconBuilder, TrayIconEvent};
+            use tauri::tray::{TrayIcon, TrayIconBuilder, TrayIconEvent};
             use tauri::Manager;
 
             let app_handle = app.app_handle();
