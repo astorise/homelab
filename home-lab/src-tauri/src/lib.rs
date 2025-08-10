@@ -11,28 +11,27 @@ enum ServiceState {
     Error,
 }
 
-fn icon_for_state(
-    resolver: &tauri::path::PathResolver,
+fn icon_for_state<R: tauri::Runtime>(
+    resolver: &tauri::path::PathResolver<R>,
     service: &str,
     state: ServiceState,
-) -> tauri::Result<tauri::image::Image> {
+) -> tauri::Result<tauri::image::Image<'static>> {
     let color = match state {
         ServiceState::Running => "green",
         ServiceState::Stopped => "orange",
         ServiceState::Error => "red",
     };
     let name = format!("{service}-{color}.png");
-    tauri::image::Image::from_path(resolver.resolve(
+    let path = resolver.resolve(
         format!("icons/{name}"),
         tauri::path::BaseDirectory::Resource,
-    )?)
+    )?;
+    let bytes = std::fs::read(path)?;
+    tauri::image::Image::from_bytes(&bytes)
 }
 
 #[tauri::command]
-fn read_service_log(
-    app_handle: tauri::AppHandle,
-    service: &str,
-) -> Result<String, String> {
+fn read_service_log(app_handle: tauri::AppHandle, service: &str) -> Result<String, String> {
     use std::fs;
     use tauri::path::BaseDirectory;
 
@@ -78,10 +77,11 @@ pub fn run() {
             let (status_tx, status_rx) = mpsc::channel::<(&'static str, ServiceState)>();
 
             // Helper to load an icon from the bundled resources directory
-            let load_icon = |name: &str| {
-                Image::from_path(
-                    resolver.resolve(format!("icons/{name}.png"), BaseDirectory::Resource)?,
-                )
+            let load_icon = |name: &str| -> tauri::Result<Image<'static>> {
+                let path =
+                    resolver.resolve(format!("icons/{name}.png"), BaseDirectory::Resource)?;
+                let bytes = std::fs::read(path)?;
+                Image::from_bytes(&bytes)
             };
 
             // DNS submenu
