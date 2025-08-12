@@ -1,36 +1,52 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
 
-  <!-- 1) Composants placés dans le dossier d'installation de l'app -->
+  
+  <!-- 1) Fichiers dans le dossier d'installation de l'app -->
   <Fragment>
-    <!-- ⚠️ Vérifie l'ID dans main.wxs. Sur Tauri v2 c'est très souvent APPLICATIONFOLDER -->
+    <!-- NOTE: vérifie que l'Id correspond bien à ton main.wxs généré par Tauri (souvent APPLICATIONFOLDER) -->
     <DirectoryRef Id="APPLICATIONFOLDER">
+      <!-- EXE home-dns -->
       <Component Id="CmpHomeDns" Guid="*">
         <File Id="FileHomeDns" KeyPath="yes"
               Source="$(sys.SOURCEFILEDIR)home-dns.exe"
               Name="home-dns.exe"/>
       </Component>
 
+      <!-- EXE home-proxy -->
       <Component Id="CmpHomeProxy" Guid="*">
         <File Id="FileHomeProxy" KeyPath="yes"
               Source="$(sys.SOURCEFILEDIR)home-proxy.exe"
               Name="home-proxy.exe"/>
       </Component>
-    </DirectoryRef>
-  </Fragment>
 
-  <!-- 2) Groupe qui référence ces composants -->
-  <Fragment>
-    <ComponentGroup Id="AppExtraServices">
+      <!-- Dossier conf + dns.yaml -->
+      <Directory Id="ConfDir" Name="conf"/>
+    </DirectoryRef>
+
+    <Component Id="CmpDnsYaml" Guid="*">
+      <CreateFolder Directory="ConfDir"/>
+      <!-- NeverOverwrite: n'écrase pas le fichier si l'utilisateur l'a modifié -->
+      <File Id="FileDnsYaml"
+            Source="$(sys.SOURCEFILEDIR)conf\dns.yaml"
+            Name="dns.yaml"
+            KeyPath="yes"
+            Vital="yes"
+            NeverOverwrite="yes"/>
+    </Component>
+
+    <!-- Groupe pour raccrocher tout à la Feature principale -->
+    <ComponentGroup Id="AppAllComponents">
       <ComponentRef Id="CmpHomeDns"/>
       <ComponentRef Id="CmpHomeProxy"/>
+      <ComponentRef Id="CmpDnsYaml"/>
     </ComponentGroup>
   </Fragment>
 
-  <!-- 3) Extension de la Feature principale : on y rattache le groupe -->
+  <!-- 2) Extension de la Feature principale -->
   <Fragment>
     <Feature Id="ProductFeature">
-      <ComponentGroupRef Id="AppExtraServices"/>
+      <ComponentGroupRef Id="AppAllComponents"/>
     </Feature>
   </Fragment>
 
