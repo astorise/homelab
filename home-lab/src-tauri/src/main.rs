@@ -2,5 +2,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    home_lab_lib::run()
+       if let Err(e) = home_lab_lib::run() {
+        eprintln!("error while running tauri application: {e}");
+    }
 }
