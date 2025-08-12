@@ -38,6 +38,7 @@
     ],
     "windows": {
       "nsis": {
+        "installMode": "perMachine",
         "installerHooks": "resources/install-services.nsh"
       },
       "wix": {
