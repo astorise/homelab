@@ -1,14 +1,22 @@
-// Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-#[tauri::command]
-fn greet(name: &str) -> String {
-    format!("Hello, {}! You've been greeted from Rust!", name)
-}
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-#[cfg_attr(mobile, tauri::mobile_entry_point)]
-pub fn run() {
+mod icons;
+mod menu;
+
+use std::sync::Arc;
+
+pub fn run() -> tauri::Result<()> {
     tauri::Builder::default()
-        .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![greet])
+        .on_window_event(|window, event| {
+      if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+        api.prevent_close();           // n'arrête pas l'app
+        let _ = window.hide();         // cache la fenêtre
+      }
+    })
+        .setup(|app| {
+            let loaded_icons = Arc::new(crate::icons::Icons::load(&app.handle(), 20)?);
+            crate::menu::setup_ui(&app.handle(), loaded_icons)?;
+            Ok(())
+        })
         .run(tauri::generate_context!())
-        .expect("error while running tauri application");
 }
