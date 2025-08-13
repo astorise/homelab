@@ -32,7 +32,7 @@
       "icons/icon.ico"
     ],
     "resources": [
-       "resources/conf/**",
+       "resources/conf/*",
       "resources/home-dns.exe",
       "resources/home-proxy.exe",
       "icons/**/*"
