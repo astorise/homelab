@@ -1,41 +1,37 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
 
-  
-  <!-- 1) Fichiers dans le dossier d'installation de l'app -->
+
+  <!-- Tout est lié à APPLICATIONFOLDER généré par Tauri -->
   <Fragment>
-    <!-- NOTE: vérifie que l'Id correspond bien à ton main.wxs généré par Tauri (souvent APPLICATIONFOLDER) -->
     <DirectoryRef Id="APPLICATIONFOLDER">
-      <!-- EXE home-dns -->
-      <Component Id="CmpHomeDns" Guid="*">
-        <File Id="FileHomeDns" KeyPath="yes"
-              Source="$(sys.SOURCEFILEDIR)home-dns.exe"
-              Name="home-dns.exe"/>
-      </Component>
-
-      <!-- EXE home-proxy -->
-      <Component Id="CmpHomeProxy" Guid="*">
-        <File Id="FileHomeProxy" KeyPath="yes"
-              Source="$(sys.SOURCEFILEDIR)home-proxy.exe"
-              Name="home-proxy.exe"/>
-      </Component>
-
-      <!-- Dossier conf + dns.yaml -->
+      <!-- Sous-dossier conf -->
       <Directory Id="ConfDir" Name="conf"/>
     </DirectoryRef>
 
-    <Component Id="CmpDnsYaml" Guid="*">
-      <CreateFolder Directory="ConfDir"/>
-      <!-- NeverOverwrite: n'écrase pas le fichier si l'utilisateur l'a modifié -->
-      <File Id="FileDnsYaml"
-            Source="$(sys.SOURCEFILEDIR)conf\dns.yaml"
-            Name="dns.yaml"
-            KeyPath="yes"
-            Vital="yes"
-            NeverOverwrite="yes"/>
+    <!-- Binaires dans APPLICATIONFOLDER -->
+    <Component Id="CmpHomeDns" Guid="*" Directory="APPLICATIONFOLDER">
+      <File Id="FileHomeDns"
+            Source="$(var.SourceDir)home-dns.exe"
+            KeyPath="yes"/>
     </Component>
 
-    <!-- Groupe pour raccrocher tout à la Feature principale -->
+    <Component Id="CmpHomeProxy" Guid="*" Directory="APPLICATIONFOLDER">
+      <File Id="FileHomeProxy"
+            Source="$(var.SourceDir)home-proxy.exe"
+            KeyPath="yes"/>
+    </Component>
+
+    <!-- Fichier de config dans conf\  (préservé aux upgrades) -->
+    <Component Id="CmpDnsYaml" Guid="*" Directory="ConfDir" NeverOverwrite="yes">
+      <CreateFolder/>
+      <File Id="FileDnsYaml"
+            Source="$(var.SourceDir)conf\dns.yaml"
+            KeyPath="yes"
+            Vital="yes"/>
+    </Component>
+
+    <!-- Groupe pour raccorder à la Feature -->
     <ComponentGroup Id="AppAllComponents">
       <ComponentRef Id="CmpHomeDns"/>
       <ComponentRef Id="CmpHomeProxy"/>
@@ -43,12 +39,14 @@
     </ComponentGroup>
   </Fragment>
 
-  <!-- 2) Extension de la Feature principale -->
+  <!-- Extension de la Feature principale générée par Tauri -->
   <Fragment>
     <Feature Id="ProductFeature">
       <ComponentGroupRef Id="AppAllComponents"/>
     </Feature>
   </Fragment>
+
+
 
     <!-- 4) Custom Action pour installer WSL -->
   <Fragment>
