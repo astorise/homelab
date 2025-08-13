@@ -13,4 +13,3 @@ serde = { version = "1.0", features = ["derive"] }
 serde_yaml = "0.9"
 serde_json = "1.0"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
-parking_lot = "0.12"
