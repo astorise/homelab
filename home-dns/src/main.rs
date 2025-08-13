@@ -1,6 +1,7 @@
-
 use anyhow::{Context, Result};
 use chrono::Utc;
+use flexi_logger::{Age, Cleanup, Criterion, Duplicate, FileSpec, Logger, Naming};
+use log::{debug, error, info, warn, LevelFilter};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -18,7 +19,7 @@ use windows_service::service_manager::*;
 
 const SERVICE_NAME: &str = "HomeDnsService";
 const SERVICE_DISPLAY_NAME: &str = "Home DNS Service";
-const SERVICE_DESCRIPTION: &str = "Applique la configuration DNS à toutes les interfaces et sauvegarde par adresse MAC dans dns.yaml. Restaure à l'arrêt/crash.";
+const SERVICE_DESCRIPTION: &str = "Applique la configuration DNS à toutes les interfaces et sauvegarde par adresse MAC dans dns.yaml. Restaure à l'arrêt/crash. Log vers fichier.";
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct DnsConfig {
@@ -30,6 +31,10 @@ struct DnsConfig {
     /// Sauvegardes par MAC normalisée (AA-BB-CC-DD-EE-FF)
     #[serde(default)]
     backups: HashMap<String, DnsBackup>,
+
+    /// Niveau de log: "debug" ou "info" (défaut: info)
+    #[serde(default)]
+    log_level: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -57,8 +62,42 @@ fn program_data_dir() -> PathBuf {
     PathBuf::from(r"C:\ProgramData\home-dns")
 }
 
+fn logs_dir() -> PathBuf {
+    program_data_dir().join("logs")
+}
+
 fn config_path() -> PathBuf {
     program_data_dir().join("dns.yaml")
+}
+
+fn init_logger(level: LevelFilter) -> Result<()> {
+    fs::create_dir_all(logs_dir()).ok();
+    Logger::try_with_str(match level {
+        LevelFilter::Debug => "debug",
+        _ => "info",
+    })?
+    .log_to_file(
+        FileSpec::default()
+            .directory(logs_dir())
+            .basename("home-dns")
+            .suffix("log"),
+    )
+    .format(flexi_logger::detailed_format)
+    .duplicate_to_stderr(Duplicate::Info)
+    .rotate(
+        Criterion::AgeOrSize(Age::Day, 5_000_000),
+        Naming::Timestamps,
+        Cleanup::KeepLogFiles(7),
+    )
+    .start()?;
+    Ok(())
+}
+
+fn level_from_cfg(cfg: &DnsConfig) -> LevelFilter {
+    match cfg.log_level.as_deref().unwrap_or("info").to_ascii_lowercase().as_str() {
+        "debug" => LevelFilter::Debug,
+        _ => LevelFilter::Info,
+    }
 }
 
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -82,6 +121,7 @@ fn load_config_or_init() -> Result<DnsConfig> {
             servers_v4: vec!["1.1.1.1".into(), "1.0.0.1".into()],
             servers_v6: vec![],
             backups: HashMap::new(),
+            log_level: Some("info".into()),
         };
         let yaml = serde_yaml::to_string(&cfg)?;
         write_atomic(&p, yaml.as_bytes())?;
@@ -106,7 +146,6 @@ fn normalize_mac(mac: &str) -> String {
 }
 
 fn get_all_adapters() -> Result<Vec<PsAdapter>> {
-    // On récupère toutes les interfaces (actives/inactives)
     let ps = r#"Get-NetAdapter | Select-Object -Property Name,MacAddress,Status | ConvertTo-Json -Compress"#;
     let out = Command::new("powershell")
         .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps])
@@ -118,7 +157,6 @@ fn get_all_adapters() -> Result<Vec<PsAdapter>> {
         anyhow::bail!("Get-NetAdapter a échoué: {}", String::from_utf8_lossy(&out.stderr));
     }
     let stdout = String::from_utf8_lossy(&out.stdout);
-    // ConvertTo-Json renvoie soit un objet, soit un tableau -> on normalise.
     let adapters: Vec<PsAdapter> = if stdout.trim_start().starts_with('[') {
         serde_json::from_str(stdout.trim()).context("parse JSON adapters")?
     } else {
@@ -129,8 +167,6 @@ fn get_all_adapters() -> Result<Vec<PsAdapter>> {
 }
 
 fn read_current_dns(alias: &str, family: &str) -> Result<(bool, Vec<String>)> {
-    // family: "IPv4" | "IPv6"
-    // Retourne (is_dhcp, servers)
     let ps = format!(
         r#"$x = Get-DnsClientServerAddress -InterfaceAlias "{}" -AddressFamily {}
 if ($x -eq $null -or $x.ServerAddresses -eq $null -or $x.ServerAddresses.Count -eq 0) {{"DHCP";""}} else {{"STATIC"; [string]::Join(",", $x.ServerAddresses)}}"#,
@@ -175,6 +211,7 @@ fn set_dns_with_powershell(alias: &str, family: &str, servers: &[String]) -> Res
         r#"Set-DnsClientServerAddress -InterfaceAlias "{}" -AddressFamily {} -ServerAddresses {}"#,
         alias, family, joined
     );
+    debug!("Apply DNS [{}] {} => {}", alias, family, joined);
     let status = Command::new("powershell")
         .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &cmd])
         .status()?;
@@ -189,6 +226,7 @@ fn reset_dns_to_dhcp(alias: &str, family: &str) -> Result<()> {
         r#"Set-DnsClientServerAddress -InterfaceAlias "{}" -AddressFamily {} -ResetServerAddresses"#,
         alias, family
     );
+    debug!("Reset DNS [{}] {} to DHCP", alias, family);
     let status = Command::new("powershell")
         .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &cmd])
         .status()?;
@@ -200,17 +238,22 @@ fn reset_dns_to_dhcp(alias: &str, family: &str) -> Result<()> {
 
 fn snapshot_and_apply_all(mut cfg: DnsConfig) -> Result<DnsConfig> {
     let adapters = get_all_adapters()?;
+    info!("Applying DNS to {} adapters", adapters.len());
     for ad in adapters {
         let mac = match ad.mac_address {
             Some(ref m) if !m.trim().is_empty() => normalize_mac(m),
-            _ => continue, // ignore interfaces sans MAC (loopback, etc.)
+            _ => {
+                debug!("Skip adapter without MAC: {}", ad.name);
+                continue;
+            }
         };
         let alias = ad.name;
-        // Lecture état courant
+        let status = ad.status.unwrap_or_default();
+        debug!("Processing adapter [{}] MAC={} Status={}", alias, mac, status);
+
         let (is_dhcp_v4, servers_v4) = read_current_dns(&alias, "IPv4").unwrap_or((true, vec![]));
         let (is_dhcp_v6, servers_v6) = read_current_dns(&alias, "IPv6").unwrap_or((true, vec![]));
 
-        // Sauvegarde / MAJ backup
         cfg.backups.insert(
             mac.clone(),
             DnsBackup {
@@ -224,23 +267,23 @@ fn snapshot_and_apply_all(mut cfg: DnsConfig) -> Result<DnsConfig> {
             },
         );
 
-        // Appliquer config souhaitée (même si interface est "Down" ou "Disabled")
         if !cfg.servers_v4.is_empty() {
-            let _ = set_dns_with_powershell(&alias, "IPv4", &cfg.servers_v4);
+            if let Err(e) = set_dns_with_powershell(&alias, "IPv4", &cfg.servers_v4) {
+                warn!("Failed to set IPv4 DNS on {}: {}", alias, e);
+            }
         }
         if !cfg.servers_v6.is_empty() {
-            let _ = set_dns_with_powershell(&alias, "IPv6", &cfg.servers_v6);
+            if let Err(e) = set_dns_with_powershell(&alias, "IPv6", &cfg.servers_v6) {
+                warn!("Failed to set IPv6 DNS on {}: {}", alias, e);
+            }
         }
     }
-    // Persister dns.yaml avec backups+dirty
     save_config(&cfg)?;
     Ok(cfg)
 }
 
 fn restore_all() -> Result<()> {
-    // Restaure pour toutes les interfaces présentes dans dns.yaml.backups où dirty=true
     let mut cfg = load_config_or_init()?;
-    // On récupère la photo actuelle des alias par MAC
     let adapters = get_all_adapters().unwrap_or_default();
     let mut mac_to_alias: HashMap<String, String> = HashMap::new();
     for ad in adapters {
@@ -250,14 +293,16 @@ fn restore_all() -> Result<()> {
         }
     }
 
+    let mut restored = 0usize;
     let keys: Vec<String> = cfg.backups.keys().cloned().collect();
     for mac in keys {
         if let Some(entry) = cfg.backups.get_mut(&mac) {
             if !entry.dirty {
                 continue;
             }
-            // Trouver alias actuel (ou fallback sur l'ancien alias)
             let alias = mac_to_alias.get(&mac).cloned().unwrap_or_else(|| entry.alias.clone());
+
+            info!("Restoring adapter [{}] MAC={}", alias, mac);
 
             if entry.is_dhcp_v4 {
                 let _ = reset_dns_to_dhcp(&alias, "IPv4");
@@ -270,19 +315,36 @@ fn restore_all() -> Result<()> {
                 let _ = set_dns_with_powershell(&alias, "IPv6", &entry.servers_v6);
             }
             entry.dirty = false;
+            restored += 1;
         }
+    }
+    if restored > 0 {
+        info!("Restored {} adapter(s)", restored);
     }
     save_config(&cfg)?;
     Ok(())
+}
+
+/// --- Hooks pour journaliser les requêtes DNS (à appeler depuis ton résolveur) ---
+#[allow(dead_code)]
+fn log_dns_request(query_name: &str, client: &str, qtype: &str) {
+    // Niveau: DEBUG pour toutes les requêtes
+    debug!("DNS request: name={} type={} from={}", query_name, qtype, client);
+}
+
+#[allow(dead_code)]
+fn log_local_resolution(query_name: &str, resolved_to: &str) {
+    // Niveau: INFO pour les résolutions locales
+    info!("Locally resolved: {} -> {}", query_name, resolved_to);
 }
 
 define_windows_service!(ffi_service_main, service_main);
 static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 fn service_main(_args: Vec<OsString>) {
+    let _ = init_logger(LevelFilter::Info); // démarrage minimal
     if let Err(e) = run_service() {
-        eprintln!("[home-dns] FATAL: {e:?}");
-        // Tentative de restauration si crash
+        error!("[home-dns] FATAL: {e:?}");
         let _ = restore_all();
     }
 }
@@ -304,7 +366,7 @@ fn run_service() -> Result<()> {
             controls_accepted: ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,
             exit_code: ServiceExitCode::Win32(0),
             checkpoint: 0,
-            wait_hint: Duration::from_millis(3000),
+            wait_hint: std::time::Duration::from_millis(3000),
             process_id: None,
         };
         let _ = status_handle.set_service_status(status);
@@ -312,29 +374,31 @@ fn run_service() -> Result<()> {
 
     set_status(ServiceState::StartPending);
 
-    // Si un crash précédent a laissé des backups "dirty", on restaure d'abord
-    let _ = restore_all();
-
-    // Charger la config et appliquer à TOUTES les interfaces (actives/inactives)
     let cfg = load_config_or_init()?;
+    let desired = level_from_cfg(&cfg);
+    let _ = init_logger(desired);
+    info!("Service starting (level={:?})", desired);
+
+    let _ = restore_all(); // si crash précédent, restaure
     let _cfg_after_apply = snapshot_and_apply_all(cfg)?;
 
     set_status(ServiceState::Running);
+    info!("Service running");
 
-    // Boucle: attendre STOP
     while !STOP_REQUESTED.load(Ordering::SeqCst) {
-        std::thread::sleep(std::time::Duration::from_secs(1));
+        thread::sleep(Duration::from_secs(1));
     }
 
-    // À l'arrêt: on restaure
+    info!("Service stopping");
     let _ = restore_all();
     set_status(ServiceState::Stopped);
+    info!("Service stopped");
     Ok(())
 }
 
 fn install_service() -> Result<()> {
-    // Initialise dns.yaml si absent
-    let _ = load_config_or_init()?;
+    let cfg = load_config_or_init()?;
+    let _ = init_logger(level_from_cfg(&cfg));
 
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CREATE_SERVICE)?;
     let exe_path = std::env::current_exe()?;
@@ -347,33 +411,34 @@ fn install_service() -> Result<()> {
         executable_path: exe_path.clone(),
         launch_arguments: vec!["run".into()],
         dependencies: vec![],
-        account_name: None, // LocalSystem
+        account_name: None,
         account_password: None,
     };
     let service = manager.create_service(&service_info, ServiceAccess::CHANGE_CONFIG | ServiceAccess::START)?;
     let _ = service.set_description(SERVICE_DESCRIPTION);
 
-    // Configure recovery: 1er échec => run "<exe> restore"
     configure_recovery_action_run_restore(&exe_path)?;
-
+    info!("Service installed");
     Ok(())
 }
 
 fn uninstall_service() -> Result<()> {
+    let _ = init_logger(LevelFilter::Info);
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
     let service = manager.open_service(SERVICE_NAME, ServiceAccess::STOP | ServiceAccess::QUERY_STATUS | ServiceAccess::DELETE)?;
     let _ = service.stop();
     service.delete()?;
+    info!("Service uninstalled");
     Ok(())
 }
 
 fn configure_recovery_action_run_restore(exe: &Path) -> Result<()> {
-    // sc.exe failure HomeDnsService actions= run/0 reset= 0 command= "\"C:\path\home-dns.exe\" restore"
     let exe_str = exe.display().to_string();
     let cmd = format!(
         r#"sc.exe failure "{}" actions= run/0 reset= 0 command= "\"{}\" restore""#,
         SERVICE_NAME, exe_str
     );
+    debug!("Configuring SCM recovery: {}", cmd);
     let status = Command::new("cmd").args(["/C", &cmd]).status()?;
     if !status.success() {
         anyhow::bail!("sc.exe failure a échoué");
@@ -382,6 +447,8 @@ fn configure_recovery_action_run_restore(exe: &Path) -> Result<()> {
 }
 
 fn main() -> Result<()> {
+    let _ = init_logger(LevelFilter::Info);
+
     let arg = std::env::args().nth(1).unwrap_or_default();
     match arg.as_str() {
         "install" => {
@@ -394,17 +461,19 @@ fn main() -> Result<()> {
         }
         "run" => {
             if let Err(e) = windows_service::service_dispatcher::start(SERVICE_NAME, ffi_service_main) {
-                eprintln!("Erreur démarrage service: {e:?}");
-                // En cas d'échec, on tente une restauration
+                error!("Erreur démarrage service: {e:?}");
                 let _ = restore_all();
             }
         }
         "apply-once" => {
             let cfg = load_config_or_init()?;
+            let _ = init_logger(level_from_cfg(&cfg));
             let _ = snapshot_and_apply_all(cfg)?;
             println!("DNS appliqué sur toutes les interfaces.");
         }
         "restore" => {
+            let cfg = load_config_or_init()?;
+            let _ = init_logger(level_from_cfg(&cfg));
             restore_all()?;
             println!("DNS restaurés (toutes interfaces connues via dns.yaml).");
         }
