@@ -1,0 +1,47 @@
+syntax = "proto3";
+package homedns.v1;
+
+message Empty {}
+
+message Ack {
+  bool ok = 1;
+  string message = 2;
+}
+
+message AddRecordRequest {
+  string name = 1;
+  string rrtype = 2;  // "A" | "AAAA"
+  string value = 3;
+  uint32 ttl = 4;
+}
+
+message RemoveRecordRequest {
+  string name = 1;
+  string rrtype = 2;  // "A" | "AAAA" | "" (all)
+  string value = 3;   // optional
+}
+
+message Record {
+  string name = 1;
+  repeated string a = 2;
+  repeated string aaaa = 3;
+  uint32 ttl = 4;
+}
+
+message ListRecordsResponse {
+  repeated Record records = 1;
+}
+
+message StatusResponse {
+  string state = 1;
+  string log_level = 2;
+}
+
+service HomeDns {
+  rpc StopService(Empty) returns (Ack);
+  rpc ReloadConfig(Empty) returns (Ack);
+  rpc GetStatus(Empty) returns (StatusResponse);
+  rpc AddRecord(AddRecordRequest) returns (Ack);
+  rpc RemoveRecord(RemoveRecordRequest) returns (Ack);
+  rpc ListRecords(Empty) returns (ListRecordsResponse);
+}
