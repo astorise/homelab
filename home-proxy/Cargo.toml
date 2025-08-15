@@ -20,7 +20,7 @@ flexi_logger = "0.28"
 parking_lot = "0.12"
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
-thiserror = "1.0"
+thiserror = "2.0"
 tonic = { version = "0.12", features = ["transport"] }
 prost = "0.13"
 chrono = "0.4"
