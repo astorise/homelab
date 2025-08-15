@@ -6,6 +6,19 @@ on:
   workflow_dispatch:
 
 jobs:
+  build-docker-image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t env-dev-image -f docker/Dockerfile .
+      - run: |
+          cid=$(docker create env-dev-image)
+          docker export "$cid" -o env-dev-image.tar
+          docker rm "$cid"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: env-dev-image.tar
+          path: env-dev-image.tar
   build-services:
     runs-on: ubuntu-latest
     steps:
