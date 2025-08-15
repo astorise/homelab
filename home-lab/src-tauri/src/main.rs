@@ -1,1 +1,1 @@
-fn main() { homedns_tauri::run(); }
+fn main() { homelab_tauri::run(); }

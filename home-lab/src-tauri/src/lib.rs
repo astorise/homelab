@@ -7,6 +7,9 @@ use anyhow::Result;
 use tonic::transport::{Channel, Endpoint, Uri};
 use tower::service_fn;
 use tokio::net::windows::named_pipe::ClientOptions;
+use std::sync::Arc;
+mod icons;
+mod menu;
 
 // === gRPC generated modules (prost/tonic) ===
 pub mod homedns {
@@ -128,38 +131,16 @@ pub fn run() {
             dns_remove_record,
         ])
         .setup(|app| {
-            use tauri::menu::{Menu, MenuItem};
-            use tauri::tray::{TrayIconBuilder, TrayIconEvent, MouseButton, MouseButtonState};
-
-            let quit_item = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&quit_item])?;
-
-            let mut tray_builder = TrayIconBuilder::new()
-                .menu(&menu)
-                .show_menu_on_left_click(true);
-
-            if let Some(icon) = app.default_window_icon() {
-                tray_builder = tray_builder.icon(icon.clone());
-            }
-
-            tray_builder
-                .on_menu_event(|app, event| if event.id.as_ref() == "quit" { app.exit(0); })
-                .on_tray_icon_event(|tray, event| match event {
-                    TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } => {
-                        let app = tray.app_handle();
-                        if let Some(win) = app.get_webview_window("main") {
-                            let _ = win.unminimize();
-                            let _ = win.show();
-                            let _ = win.set_focus();
-                        }
-                    }
-                    _ => {}
-                })
-                .build(app)?;
-
+                     let loaded_icons = Arc::new(crate::icons::Icons::load(&app.handle(), 20)?);
+            crate::menu::setup_ui(&app.handle(), loaded_icons)?;
             Ok(())
         })
-        .on_window_event(|_window, _event| {})
+        .on_window_event(|window, event| {
+      if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+        api.prevent_close();           // n'arrête pas l'app
+        let _ = window.hide();         // cache la fenêtre
+      }
+    })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
