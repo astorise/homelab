@@ -21,7 +21,7 @@ use homedns::homedns::v1::*;
 
 const PIPE_NAME: &str = r"\\.\pipe\home-dns";
 
-async fn make_channel() -> Result<Channel> {
+async fn dns_make_channel() -> Result<Channel> {
     // Endpoint URI is dummy; transport comes from the connector (named pipe stream).
     let ep = Endpoint::try_from("http://localhost:50051")?
         .connect_timeout(Duration::from_secs(5))
@@ -56,8 +56,8 @@ struct ListRecordsOut { records: Vec<RecordOut> }
 async fn ping() -> String { "pong".into() }
 
 #[tauri::command]
-async fn grpc_get_status() -> Result<StatusOut, String> {
-    let ch = make_channel().await.map_err(map_err)?;
+async fn dns_get_status() -> Result<StatusOut, String> {
+    let ch = dns_make_channel().await.map_err(map_err)?;
     let mut client = HomeDnsClient::new(ch);
     let resp = client.get_status(tonic::Request::new(Empty{})).await.map_err(map_err)?;
     let s = resp.into_inner();
@@ -65,8 +65,8 @@ async fn grpc_get_status() -> Result<StatusOut, String> {
 }
 
 #[tauri::command]
-async fn grpc_stop_service() -> Result<AckOut, String> {
-    let ch = make_channel().await.map_err(map_err)?;
+async fn dns_stop_service() -> Result<AckOut, String> {
+    let ch = dns_make_channel().await.map_err(map_err)?;
     let mut client = HomeDnsClient::new(ch);
     let resp = client.stop_service(tonic::Request::new(Empty{})).await.map_err(map_err)?;
     let a = resp.into_inner();
@@ -74,8 +74,8 @@ async fn grpc_stop_service() -> Result<AckOut, String> {
 }
 
 #[tauri::command]
-async fn grpc_reload_config() -> Result<AckOut, String> {
-    let ch = make_channel().await.map_err(map_err)?;
+async fn dns_reload_config() -> Result<AckOut, String> {
+    let ch = dns_make_channel().await.map_err(map_err)?;
     let mut client = HomeDnsClient::new(ch);
     let resp = client.reload_config(tonic::Request::new(Empty{})).await.map_err(map_err)?;
     let a = resp.into_inner();
@@ -83,8 +83,8 @@ async fn grpc_reload_config() -> Result<AckOut, String> {
 }
 
 #[tauri::command]
-async fn grpc_list_records() -> Result<ListRecordsOut, String> {
-    let ch = make_channel().await.map_err(map_err)?;
+async fn dns_list_records() -> Result<ListRecordsOut, String> {
+    let ch = dns_make_channel().await.map_err(map_err)?;
     let mut client = HomeDnsClient::new(ch);
     let resp = client.list_records(tonic::Request::new(Empty{})).await.map_err(map_err)?;
     let list = resp.into_inner();
@@ -97,8 +97,8 @@ async fn grpc_list_records() -> Result<ListRecordsOut, String> {
 }
 
 #[tauri::command]
-async fn grpc_add_record(name: String, rrtype: String, value: String, ttl: u32) -> Result<AckOut, String> {
-    let ch = make_channel().await.map_err(map_err)?;
+async fn dns_add_record(name: String, rrtype: String, value: String, ttl: u32) -> Result<AckOut, String> {
+    let ch = dns_make_channel().await.map_err(map_err)?;
     let mut client = HomeDnsClient::new(ch);
     let req = AddRecordRequest { name, rrtype, value, ttl };
     let resp = client.add_record(tonic::Request::new(req)).await.map_err(map_err)?;
@@ -107,8 +107,8 @@ async fn grpc_add_record(name: String, rrtype: String, value: String, ttl: u32) 
 }
 
 #[tauri::command]
-async fn grpc_remove_record(name: String, rrtype: String, value: String) -> Result<AckOut, String> {
-    let ch = make_channel().await.map_err(map_err)?;
+async fn dns_remove_record(name: String, rrtype: String, value: String) -> Result<AckOut, String> {
+    let ch = dns_make_channel().await.map_err(map_err)?;
     let mut client = HomeDnsClient::new(ch);
     let req = RemoveRecordRequest { name, rrtype, value };
     let resp = client.remove_record(tonic::Request::new(req)).await.map_err(map_err)?;
@@ -120,12 +120,12 @@ pub fn run() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
             ping,
-            grpc_get_status,
-            grpc_stop_service,
-            grpc_reload_config,
-            grpc_list_records,
-            grpc_add_record,
-            grpc_remove_record,
+            dns_get_status,
+            dns_stop_service,
+            dns_reload_config,
+            dns_list_records,
+            dns_add_record,
+            dns_remove_record,
         ])
         .setup(|app| {
             use tauri::menu::{Menu, MenuItem};

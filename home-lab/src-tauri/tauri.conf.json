@@ -4,7 +4,9 @@
   "version": "0.2.0",
   "identifier": "com.example.homedns",
   "build": {
-    "frontendDist": "../dist",
+    "beforeBuildCommand": "npm --prefix ../frontend ci && npm --prefix ../frontend run build",
+    "beforeDevCommand": "npm --prefix ../frontend run dev -- --port 5173 --strictPort",
+    "frontendDist": "../frontend/dist",
     "devUrl": "http://localhost:5173"
   },
   "app": {
@@ -22,20 +24,17 @@
     ]
   },
   "bundle": {
-    "icon": ["icons/icon.ico"],   
-    "targets": [
-      "msi",
-      "nsis"
-    ],
+    "icon": ["icons/icon.ico"],
+    "targets": ["msi", "nsis"],
     "windows": {
       "nsis": {
         "installMode": "perMachine",
         "installerHooks": "resources/install-services.nsh"
       },
-      "wix": { "language": "fr-FR",
-    "fragmentPaths": [
-          "resources/install-services.wxi"
-        ] }
+      "wix": {
+        "language": "fr-FR",
+        "fragmentPaths": ["resources/install-services.wxi"]
+      }
     }
   },
   "plugins": {}
