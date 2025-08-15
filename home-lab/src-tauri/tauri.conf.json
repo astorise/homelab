@@ -2,9 +2,12 @@
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "home-lab",
   "version": "0.1.0",
-  "identifier": "fr.astorise.home-lab",
+  "identifier": "name.astori.home-lab",
   "build": {
-    "frontendDist": "../src"
+    "beforeDevCommand": "npm --prefix ./frontend ci && npm --prefix ./frontend run dev",
+    "beforeBuildCommand": "npm --prefix ./frontend ci && npm --prefix ./frontend run build",
+    "frontendDist": "../frontend/dist",
+    "devUrl": "http://localhost:5173"
   },
   "app": {
     "withGlobalTauri": true,
@@ -32,12 +35,14 @@
       "icons/icon.ico"
     ],
     "resources": [
+       "resources/conf/*",
       "resources/home-dns.exe",
       "resources/home-proxy.exe",
       "icons/**/*"
     ],
     "windows": {
       "nsis": {
+        "installMode": "perMachine",
         "installerHooks": "resources/install-services.nsh"
       },
       "wix": {
@@ -48,6 +53,3 @@
     }
   }
 }
-
-
-

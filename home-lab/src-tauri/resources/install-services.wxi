@@ -1,37 +1,70 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
 
-  <!-- 1) Composants placés dans le dossier d'installation de l'app -->
+
+  <!-- Tout est lié à APPLICATIONFOLDER généré par Tauri -->
   <Fragment>
-    <!-- ⚠️ Vérifie l'ID dans main.wxs. Sur Tauri v2 c'est très souvent APPLICATIONFOLDER -->
     <DirectoryRef Id="APPLICATIONFOLDER">
-      <Component Id="CmpHomeDns" Guid="*">
-        <File Id="FileHomeDns" KeyPath="yes"
-              Source="$(sys.SOURCEFILEDIR)home-dns.exe"
-              Name="home-dns.exe"/>
-      </Component>
-
-      <Component Id="CmpHomeProxy" Guid="*">
-        <File Id="FileHomeProxy" KeyPath="yes"
-              Source="$(sys.SOURCEFILEDIR)home-proxy.exe"
-              Name="home-proxy.exe"/>
-      </Component>
+      <!-- Sous-dossier conf -->
+      <Directory Id="ConfDir" Name="conf"/>
     </DirectoryRef>
-  </Fragment>
 
-  <!-- 2) Groupe qui référence ces composants -->
-  <Fragment>
-    <ComponentGroup Id="AppExtraServices">
+    <!-- Binaires dans APPLICATIONFOLDER -->
+    <Component Id="CmpHomeDns" Guid="*" Directory="APPLICATIONFOLDER">
+      <File Id="FileHomeDns"
+            Source="$(var.SourceDir)home-dns.exe"
+            KeyPath="yes"/>
+    </Component>
+
+    <Component Id="CmpHomeProxy" Guid="*" Directory="APPLICATIONFOLDER">
+      <File Id="FileHomeProxy"
+            Source="$(var.SourceDir)home-proxy.exe"
+            KeyPath="yes"/>
+    </Component>
+
+    <!-- Fichier de config dans conf\  (préservé aux upgrades) -->
+    <Component Id="CmpDnsYaml" Guid="*" Directory="ConfDir" NeverOverwrite="yes">
+      <CreateFolder/>
+      <File Id="FileDnsYaml"
+            Source="$(var.SourceDir)conf\dns.yaml"
+            KeyPath="yes"
+            Vital="yes"/>
+    </Component>
+
+    <!-- Groupe pour raccorder à la Feature -->
+    <ComponentGroup Id="AppAllComponents">
       <ComponentRef Id="CmpHomeDns"/>
       <ComponentRef Id="CmpHomeProxy"/>
+      <ComponentRef Id="CmpDnsYaml"/>
     </ComponentGroup>
   </Fragment>
 
-  <!-- 3) Extension de la Feature principale : on y rattache le groupe -->
+  <!-- Extension de la Feature principale générée par Tauri -->
   <Fragment>
     <Feature Id="ProductFeature">
-      <ComponentGroupRef Id="AppExtraServices"/>
+      <ComponentGroupRef Id="AppAllComponents"/>
     </Feature>
+  </Fragment>
+
+
+
+    <!-- 4) Custom Action pour installer WSL -->
+  <Fragment>
+    <!-- Forcer le scope machine -->
+    <Property Id="ALLUSERS" Value="1" />
+    <!-- Action silencieuse via PowerShell -->
+    <CustomAction
+      Id="RunWslInstall"
+      Directory="SystemFolder"
+      ExeCommand='powershell -ExecutionPolicy Bypass -WindowStyle Hidden -Command "wsl --install --no-distribution"'
+      Execute="deferred"
+      Impersonate="no"
+      Return="check" />
+
+    <!-- Ordonnancement : uniquement lors d'une première install -->
+    <InstallExecuteSequence>
+      <Custom Action="RunWslInstall" Before="InstallFinalize">NOT Installed</Custom>
+    </InstallExecuteSequence>
   </Fragment>
 
 </Wix>

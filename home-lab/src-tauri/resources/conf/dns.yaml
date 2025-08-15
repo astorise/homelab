@@ -1,0 +1,23 @@
+listen: "0.0.0.0:53"
+upstreams:
+  - "8.8.8.8:53"
+  - "1.1.1.1:53"
+
+rules:
+  # Wildcards
+  - pattern: "*.exemple.local"
+    ip: "192.168.1.42"
+    ttl: 60
+  - pattern: "*.dev"
+    ip: "127.0.0.1"
+    ttl: 60
+
+  # Exact match
+  - pattern: "intra.exemple.local"
+    ip: "10.0.0.12"
+    ttl: 120
+
+  # IPv6 (AAAA)
+  - pattern: "ipv6.exemple.local"
+    ip: "2001:db8::42"
+    ttl: 300

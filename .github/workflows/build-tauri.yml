@@ -9,7 +9,7 @@ jobs:
   build-services:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install mingw for Windows cross-compile
         run: |
@@ -49,10 +49,10 @@ jobs:
     runs-on: windows-latest
     needs: build-services
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Download services artifacts into Tauri resources
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           name: services-win
           path: home-lab/src-tauri/resources
@@ -63,7 +63,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
 
       - name: Install frontend deps + Tauri CLI
         working-directory: home-lab
@@ -73,6 +73,15 @@ jobs:
           $hasCli = (npm pkg get devDependencies.'@tauri-apps/cli' | Select-String -Quiet '@tauri-apps/cli')
           if (-not $hasCli) { npm i -D @tauri-apps/cli@latest }
           npx tauri -V
+
+      # Optionnel : cache npm
+      - name: Enable npm cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-node-${{ hashFiles('home-lab/**/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-
 
       - name: Build Tauri (Windows - NSIS + MSI)
         uses: tauri-apps/tauri-action@v0.5.22
