@@ -4,8 +4,8 @@
   "version": "0.2.0",
   "identifier": "com.example.homedns",
   "build": {
-    "beforeBuildCommand": "npm --prefix ../frontend ci && npm --prefix ../frontend run build",
-    "beforeDevCommand": "npm --prefix ../frontend run dev -- --port 5173 --strictPort",
+    "beforeDevCommand": "npm --prefix ./frontend ci && npm --prefix ./frontend run dev",
+    "beforeBuildCommand": "npm --prefix ./frontend ci && npm --prefix ./frontend run build",
     "frontendDist": "../frontend/dist",
     "devUrl": "http://localhost:5173"
   },

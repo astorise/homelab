@@ -1,0 +1,13 @@
+{
+  "name": "home-lab",
+  "private": true,
+  "workspaces": ["frontend"],
+  "scripts": {
+    "tauri": "tauri",
+    "dev": "npm --prefix ./frontend run dev",
+    "build:frontend": "npm --prefix ./frontend ci && npm --prefix ./frontend run build"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.7"
+  }
+}
