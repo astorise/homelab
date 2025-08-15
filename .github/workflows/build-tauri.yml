@@ -10,7 +10,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: docker build -t env-dev-image -f docker/Dockerfile .
+      - run: docker build -t env-dev-image -f docker-image/Dockerfile .
       - run: |
           cid=$(docker create env-dev-image)
           docker export "$cid" -o env-dev-image.tar
