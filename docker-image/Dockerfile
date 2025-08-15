@@ -1,5 +1,5 @@
 # ---- BusyBox image  ----
-FROM busybox:1.36.1-musl
+FROM busybox:1.37.0-musl
 
 # Ensure BusyBox provides required network utilities
 RUN mkdir -p /sbin \
