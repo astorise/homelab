@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "HomeDNS",
-  "version": "0.2.0",
-  "identifier": "com.example.homedns",
+  "productName": "home-lab",
+  "version": "0.1.0",
+  "identifier": "name.astori.home-lab",
   "build": {
     "beforeDevCommand": "npm --prefix ./frontend ci && npm --prefix ./frontend run dev",
     "beforeBuildCommand": "npm --prefix ./frontend ci && npm --prefix ./frontend run build",
@@ -10,32 +10,46 @@
     "devUrl": "http://localhost:5173"
   },
   "app": {
-    "security": {
-      "csp": null
-    },
+    "withGlobalTauri": true,
     "windows": [
       {
         "label": "main",
-        "title": "HomeDNS",
-        "width": 1024,
-        "height": 720,
-        "resizable": true
+        "title": "Home Lab",
+        "visible": false,
+        "skipTaskbar": true
       }
-    ]
+    ],
+    "security": {
+      "csp": null
+    }
   },
+  
   "bundle": {
-    "icon": ["icons/icon.ico"],
-    "targets": ["msi", "nsis"],
+    "active": true,
+    "targets": ["nsis", "msi"],               
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "resources": [
+       "resources/conf/*",
+      "resources/home-dns.exe",
+      "resources/home-proxy.exe",
+      "icons/**/*"
+    ],
     "windows": {
       "nsis": {
         "installMode": "perMachine",
         "installerHooks": "resources/install-services.nsh"
       },
       "wix": {
-        "language": "fr-FR",
-        "fragmentPaths": ["resources/install-services.wxi"]
+        "fragmentPaths": [
+          "resources/install-services.wxi"
+        ]
       }
     }
-  },
-  "plugins": {}
+  }
 }
