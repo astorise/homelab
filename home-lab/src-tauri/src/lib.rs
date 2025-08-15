@@ -10,6 +10,16 @@ use tokio::net::windows::named_pipe::ClientOptions;
 use std::sync::Arc;
 mod icons;
 mod menu;
+mod proxy;
+use crate::proxy::{
+    proxy_get_status,
+    proxy_stop_service,
+    proxy_reload_config,
+    proxy_list_routes,
+    proxy_add_route,
+    proxy_remove_route,
+};
+
 
 // === gRPC generated modules (prost/tonic) ===
 pub mod homedns {
@@ -129,6 +139,12 @@ pub fn run() {
             dns_list_records,
             dns_add_record,
             dns_remove_record,
+            proxy::proxy_get_status,
+            proxy::proxy_stop_service,
+            proxy::proxy_reload_config,
+            proxy::proxy_list_routes,
+            proxy::proxy_add_route,
+            proxy::proxy_remove_route,
         ])
         .setup(|app| {
                      let loaded_icons = Arc::new(crate::icons::Icons::load(&app.handle(), 20)?);
