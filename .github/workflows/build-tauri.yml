@@ -60,7 +60,7 @@ jobs:
   # === OPTION RECOMMANDÉE: installateur Windows officiel (runner Windows) ===
   build-tauri-win:
     runs-on: windows-latest
-    needs: build-services
+    needs: [build-services, build-docker-image]
     steps:
       - uses: actions/checkout@v5
 
@@ -69,6 +69,15 @@ jobs:
         with:
           name: services-win
           path: home-lab/src-tauri/resources
+
+      - name: Download Docker image into Tauri resources
+        uses: actions/download-artifact@v5
+        with:
+          name: env-dev-image.tar
+          path: home-lab/src-tauri/resources
+
+      - name: Rename Docker image
+        run: mv home-lab/src-tauri/resources/env-dev-image.tar home-lab/src-tauri/resources/homelab-img.tar
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
