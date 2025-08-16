@@ -18,7 +18,7 @@ path = "src/main.rs"
 tauri = { version = "2", features = ["tray-icon"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 # IMPORTANT: include 'codegen' so generated code compiles
-tonic = { version = "0.11", features = ["transport", "codegen"] }
+tonic = { version = "0.14", features = ["transport", "codegen"] }
 prost = "0.12"
 serde = { version = "1", features = ["derive"] }
 anyhow = "1"
@@ -31,6 +31,6 @@ tiny-skia = "0.11"
 png = "0.17"
 
 [build-dependencies]
-tonic-build = "0.11"
+tonic-build = "0.14"
 prost-build = "0.12"
 protoc-bin-vendored = "3"

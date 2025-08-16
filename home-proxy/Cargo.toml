@@ -5,7 +5,7 @@ edition = "2021"
 
 [build-dependencies]
 protoc-bin-vendored = "3.0"
-tonic-build = "0.12"
+tonic-build = "0.14"
 
 [dependencies]
 anyhow = "1"
@@ -21,7 +21,7 @@ parking_lot = "0.12"
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 thiserror = "2.0"
-tonic = { version = "0.12", features = ["transport"] }
+tonic = { version = "0.14", features = ["transport"] }
 prost = "0.13"
 chrono = "0.4"
 tokio = { version = "1", features = ["full"] }
