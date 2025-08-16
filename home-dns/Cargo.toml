@@ -17,12 +17,12 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 log = "0.4"
 flexi_logger = { version = "0.31", default-features = false, features = ["colors"] }
 tonic = { version = "0.11", features = ["transport"] }
-prost = "0.12"
+prost = "0.14"
 tokio-util = "0.7"
 parking_lot = "0.12"
 futures-util = "0.3"
 
 [build-dependencies]
 tonic-build = "0.11"
-prost-build = "0.12"
+prost-build = "0.14"
 protoc-bin-vendored = "3"
