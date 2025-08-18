@@ -34,10 +34,10 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "resources": [
-       "resources/conf",
-      "icons/**/*"
-    ],
+    "resources":  {
+       "resources/conf":"conf",
+      "icons/**/*":"icons/**/*"
+    },
     "externalBin": [
       "bin/home-dns.exe",
       "bin/home-proxy.exe"
