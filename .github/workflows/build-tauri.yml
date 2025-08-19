@@ -70,12 +70,6 @@ jobs:
           name: services-win
           path: home-lab/src-tauri/bin
 
-      - name: Rename service binaries for Tauri bundler
-        shell: pwsh
-        run: |
-          Rename-Item -Path home-lab/src-tauri/bin/home-dns.exe -NewName home-dns.exe-x86_64-pc-windows-msvc.exe
-          Rename-Item -Path home-lab/src-tauri/bin/home-proxy.exe -NewName home-proxy.exe-x86_64-pc-windows-msvc.exe
-
       - name: Download Docker image into Tauri resources
         uses: actions/download-artifact@v5
         with:
