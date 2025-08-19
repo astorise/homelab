@@ -36,11 +36,12 @@
     ],
     "resources":  {
        "resources/conf":"conf",
-      "icons/**/*":"icons/**/*"
+      "icons":"icons",
+      "bin/home-dns.exe":"home-dns.exe",
+      "bin/home-proxy.exe":"home-proxy.exe"
     },
     "externalBin": [
-      "bin/home-dns.exe",
-      "bin/home-proxy.exe"
+     
     ],
     "windows": {
       "nsis": {
