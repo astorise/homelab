@@ -1,0 +1,8 @@
+http: 80
+https: 443
+wsl_resolve: "auto"
+# wsl_ip: "172.29.96.1"
+wsl_refresh_secs: 30
+routes: {}
+log_level: "info"
+
