@@ -9,7 +9,7 @@ jobs:
   build-docker-image:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - run: docker build -t env-dev-image -f docker-image/Dockerfile .
       - run: |
           cid=$(docker create env-dev-image)
@@ -64,11 +64,11 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Download services artifacts into Tauri resources
+      - name: Download services artifacts into Tauri bin
         uses: actions/download-artifact@v5
         with:
           name: services-win
-          path: home-lab/src-tauri/resources
+          path: home-lab/src-tauri/bin
 
       - name: Download Docker image into Tauri resources
         uses: actions/download-artifact@v5

@@ -9,7 +9,7 @@ lerna-debug.log*
 !src-tauri/resources/logs/
 !src-tauri/resources/logs/*.log
 !src-tauri/resources/logs/*.log
-
+src-tauri/bin
 node_modules
 dist
 dist-ssr
