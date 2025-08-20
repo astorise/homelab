@@ -14,10 +14,10 @@ ENV WSL_PORT_RANGE=6443-6550
 RUN mkdir -p /usr/local/bin
 
 # Copy initialization scripts and environment
-COPY docker/k3s-env /etc/k3s-env
-COPY docker/fstab /etc/fstab
-COPY docker/mount_all.sh /usr/local/bin/mount_all.sh
-COPY docker/k3s-init.sh /usr/local/bin/k3s-init.sh
+COPY docker-image/k3s-env /etc/k3s-env
+COPY docker-image/fstab /etc/fstab
+COPY docker-image/mount_all.sh /usr/local/bin/mount_all.sh
+COPY docker-image/k3s-init.sh /usr/local/bin/k3s-init.sh
 RUN chmod +x /usr/local/bin/mount_all.sh /usr/local/bin/k3s-init.sh
 
 # Script de démarrage auto

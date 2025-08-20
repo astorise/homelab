@@ -34,11 +34,14 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "resources": [
-       "resources/conf/*",
-      "resources/home-dns.exe",
-      "resources/home-proxy.exe",
-      "icons/**/*"
+    "resources":  {
+       "resources/conf":"conf",
+      "icons":"icons",
+      "bin/home-dns.exe":"home-dns.exe",
+      "bin/home-proxy.exe":"home-proxy.exe"
+    },
+    "externalBin": [
+     
     ],
     "windows": {
       "nsis": {
