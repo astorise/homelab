@@ -87,17 +87,25 @@ fn level_from_cfg(cfg: &ProxyConfig) -> LevelFilter {
 }
 
 fn init_logger(level: LevelFilter) -> Result<()> {
-    std::fs::create_dir_all(logs_dir())?;
+    let dir = logs_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| {
+        eprintln!("cannot create log directory {}: {e}", dir.display());
+        e
+    })?;
     Logger::try_with_env_or_str(format!("{level}"))?
         .log_to_file(
             FileSpec::default()
-                .directory(logs_dir())
+                .directory(dir)
                 .basename("home-proxy")
                 .suffix("log"),
         )
         .duplicate_to_stderr(Duplicate::Error)
         .rotate(Criterion::Age(Age::Day), Naming::Timestamps, Cleanup::KeepLogFiles(14))
-        .start()?;
+        .start()
+        .map_err(|e| {
+            eprintln!("failed to start logger: {e}");
+            e
+        })?;
     Ok(())
 }
 
@@ -448,7 +456,7 @@ fn run_service() -> Result<()> {
     unsafe { STATUS_HANDLE = Some(service_control_handler::register(SERVICE_NAME, event_handler)?); }
     set_status(ServiceState::StartPending);
 
-    let cfg = load_config_or_init()?; let level = level_from_cfg(&cfg); let _ = init_logger(level);
+    let cfg = load_config_or_init()?; let level = level_from_cfg(&cfg); init_logger(level)?;
     info!("Service starting (level={:?})", level);
 
     let shared = Shared { cfg: Arc::new(Mutex::new(cfg)), cache: Arc::new(Mutex::new((0, None))), stopping: Arc::new(AtomicBool::new(false)) };
@@ -530,7 +538,7 @@ fn main() -> Result<()> {
         "install" => { install_service()?; println!("Service installé. Modifiez {} puis démarrez le service.", config_path().display()); }
         "uninstall" => { uninstall_service()?; println!("Service désinstallé."); }
         "console" => {
-            let cfg = load_config_or_init()?; let _ = init_logger(level_from_cfg(&cfg));
+            let cfg = load_config_or_init()?; init_logger(level_from_cfg(&cfg))?;
             let shared = Shared { cfg: Arc::new(Mutex::new(cfg)), cache: Arc::new(Mutex::new((0, None))), stopping: Arc::new(AtomicBool::new(false)) };
             let rt = Runtime::new()?;
             let http_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), shared.cfg.lock().http);

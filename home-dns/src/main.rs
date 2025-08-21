@@ -88,13 +88,21 @@ fn logs_dir() -> PathBuf { program_data_dir().join("logs") }
 fn config_path() -> PathBuf { program_data_dir().join("dns.yaml") }
 
 fn init_logger(level: LevelFilter) -> Result<()> {
-    fs::create_dir_all(logs_dir()).ok();
+    let dir = logs_dir();
+    fs::create_dir_all(&dir).map_err(|e| {
+        eprintln!("cannot create log directory {}: {e}", dir.display());
+        e
+    })?;
     Logger::try_with_str(match level { LevelFilter::Debug => "debug", _ => "info" })?
-        .log_to_file(FileSpec::default().directory(logs_dir()).basename("home-dns").suffix("log"))
+        .log_to_file(FileSpec::default().directory(dir).basename("home-dns").suffix("log"))
         .format(flexi_logger::detailed_format)
         .duplicate_to_stderr(Duplicate::Info)
         .rotate(Criterion::AgeOrSize(Age::Day, 5_000_000), Naming::Timestamps, Cleanup::KeepLogFiles(7))
-        .start()?;
+        .start()
+        .map_err(|e| {
+            eprintln!("failed to start logger: {e}");
+            e
+        })?;
     Ok(())
 }
 
@@ -393,7 +401,10 @@ define_windows_service!(ffi_service_main, service_main);
 static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 fn service_main(_args: Vec<OsString>) {
-    let _ = init_logger(LevelFilter::Info);
+    if let Err(e) = init_logger(LevelFilter::Info) {
+        eprintln!("logger init failed: {e:?}");
+        return;
+    }
     if let Err(e) = run_service() {
         error!("[home-dns] FATAL: {e:?}");
         let _ = restore_all();
@@ -421,7 +432,7 @@ fn run_service() -> Result<()> {
 
     set_status(ServiceState::StartPending);
 
-    let cfg = load_config_or_init()?; let level = level_from_cfg(&cfg); let _ = init_logger(level);
+    let cfg = load_config_or_init()?; let level = level_from_cfg(&cfg); init_logger(level)?;
     info!("Service starting (level={:?})", level);
 
     let _ = restore_all();
@@ -458,7 +469,7 @@ fn run_service() -> Result<()> {
 }
 
 fn install_service() -> Result<()> {
-    let cfg = load_config_or_init()?; let _ = init_logger(level_from_cfg(&cfg));
+    let cfg = load_config_or_init()?; init_logger(level_from_cfg(&cfg))?;
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CREATE_SERVICE)?;
     let exe_path = std::env::current_exe()?;
     let service_info = ServiceInfo {
@@ -481,7 +492,7 @@ fn install_service() -> Result<()> {
 }
 
 fn uninstall_service() -> Result<()> {
-    let _ = init_logger(LevelFilter::Info);
+    init_logger(LevelFilter::Info)?;
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
     let service = manager.open_service(SERVICE_NAME, ServiceAccess::STOP | ServiceAccess::QUERY_STATUS | ServiceAccess::DELETE)?;
     let _ = service.stop(); service.delete()?; info!("Service uninstalled"); Ok(())
@@ -496,7 +507,7 @@ fn configure_recovery_action_run_restore(exe: &Path) -> Result<()> {
 }
 
 fn main() -> Result<()> {
-    let _ = init_logger(LevelFilter::Info);
+    init_logger(LevelFilter::Info)?;
     let arg = std::env::args().nth(1).unwrap_or_default();
     match arg.as_str() {
         "install" => { install_service()?; println!("Service installé. Éditez {} si besoin puis démarrez le service.", config_path().display()); }
@@ -507,11 +518,11 @@ fn main() -> Result<()> {
             }
         }
         "apply-once" => {
-            let cfg = load_config_or_init()?; let _ = init_logger(level_from_cfg(&cfg)); let _ = snapshot_and_apply_all(cfg)?;
+            let cfg = load_config_or_init()?; init_logger(level_from_cfg(&cfg))?; snapshot_and_apply_all(cfg)?;
             println!("DNS appliqué sur toutes les interfaces.");
         }
         "restore" => {
-            let cfg = load_config_or_init()?; let _ = init_logger(level_from_cfg(&cfg)); restore_all()?;
+            let cfg = load_config_or_init()?; init_logger(level_from_cfg(&cfg))?; restore_all()?;
             println!("DNS restaurés (toutes interfaces connues via dns.yaml).");
         }
         _ => { eprintln!("Usage: home-dns [install|uninstall|run|apply-once|restore]"); }
