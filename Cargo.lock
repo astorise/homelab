@@ -1563,6 +1563,7 @@ dependencies = [
  "tonic-build 0.11.0",
  "tower 0.5.2",
  "usvg",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
