@@ -4,8 +4,8 @@
   "workspaces": ["frontend"],
   "scripts": {
     "tauri": "tauri",
-    "dev": "npm --prefix ./frontend run dev",
-    "build:frontend": "npm --prefix ./frontend ci && npm --prefix ./frontend run build"
+    "dev": "npm run -w frontend dev",
+    "build:frontend": "npm run -w frontend build"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.7"

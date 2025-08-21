@@ -4,8 +4,8 @@
   "version": "0.1.0",
   "identifier": "name.astori.home-lab",
   "build": {
-    "beforeDevCommand": "npm --prefix ./frontend ci && npm --prefix ./frontend run dev",
-    "beforeBuildCommand": "npm --prefix ./frontend ci && npm --prefix ./frontend run build",
+    "beforeDevCommand": "npm run -w frontend dev",
+    "beforeBuildCommand": "npm run -w frontend build",
     "frontendDist": "../frontend/dist",
     "devUrl": "http://localhost:5173"
   },
@@ -36,6 +36,7 @@
     ],
     "resources":  {
        "resources/conf":"conf",
+      "resources/logs":"logs",
       "icons":"icons",
       "bin/home-dns.exe":"home-dns.exe",
       "bin/home-proxy.exe":"home-proxy.exe"
