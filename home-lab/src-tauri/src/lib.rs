@@ -1,6 +1,5 @@
 #![cfg_attr(all(not(debug_assertions), target_os = "windows"), windows_subsystem = "windows")]
 
-use tauri::Manager;
 use serde::Serialize;
 use std::time::Duration;
 use anyhow::Result;
@@ -11,14 +10,6 @@ use std::sync::Arc;
 mod icons;
 mod menu;
 mod proxy;
-use crate::proxy::{
-    proxy_get_status,
-    proxy_stop_service,
-    proxy_reload_config,
-    proxy_list_routes,
-    proxy_add_route,
-    proxy_remove_route,
-};
 
 
 // === gRPC generated modules (prost/tonic) ===
@@ -130,7 +121,7 @@ async fn dns_remove_record(name: String, rrtype: String, value: String) -> Resul
 }
 
 pub fn run() {
-    tauri::Builder::default()
+    if let Err(err) = tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
             ping,
             dns_get_status,
@@ -147,16 +138,63 @@ pub fn run() {
             proxy::proxy_remove_route,
         ])
         .setup(|app| {
-                     let loaded_icons = Arc::new(crate::icons::Icons::load(&app.handle(), 20)?);
+            let loaded_icons = Arc::new(crate::icons::Icons::load(&app.handle(), 20)?);
             crate::menu::setup_ui(&app.handle(), loaded_icons)?;
             Ok(())
         })
         .on_window_event(|window, event| {
-      if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-        api.prevent_close();           // n'arrête pas l'app
-        let _ = window.hide();         // cache la fenêtre
-      }
-    })
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close(); // n'arrête pas l'app
+                let _ = window.hide(); // cache la fenêtre
+            }
+        })
         .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+    {
+        show_run_error(&err.to_string());
+    }
+}
+
+#[cfg(windows)]
+fn show_run_error(msg: &str) {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    use std::ptr::{null_mut};
+    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
+    use windows_sys::Win32::UI::Controls::{TASKDIALOGCONFIG, TDCBF_OK_BUTTON};
+
+    unsafe {
+        let module_name: Vec<u16> = OsStr::new("comctl32.dll").encode_wide().chain(Some(0)).collect();
+        let title_w: Vec<u16> = OsStr::new("homelab-tauri").encode_wide().chain(Some(0)).collect();
+        let content_w: Vec<u16> = OsStr::new(msg).encode_wide().chain(Some(0)).collect();
+
+        let module = GetModuleHandleW(module_name.as_ptr());
+        if !module.is_null() {
+            let proc = GetProcAddress(module, b"TaskDialogIndirect\0".as_ptr());
+            if let Some(raw) = proc {
+                type TaskDialogIndirectFn = unsafe extern "system" fn(
+                    *const TASKDIALOGCONFIG,
+                    *mut i32,
+                    *mut i32,
+                    *mut i32,
+                ) -> i32;
+                let func: TaskDialogIndirectFn = std::mem::transmute(raw);
+                let mut config: TASKDIALOGCONFIG = std::mem::zeroed();
+                config.cbSize = std::mem::size_of::<TASKDIALOGCONFIG>() as u32;
+                config.pszWindowTitle = title_w.as_ptr();
+                config.pszContent = content_w.as_ptr();
+                config.dwCommonButtons = TDCBF_OK_BUTTON;
+                if func(&config, null_mut(), null_mut(), null_mut()) >= 0 {
+                    return;
+                }
+            }
+        }
+
+        MessageBoxW(null_mut(), content_w.as_ptr(), title_w.as_ptr(), MB_OK | MB_ICONERROR);
+    }
+}
+
+#[cfg(not(windows))]
+fn show_run_error(msg: &str) {
+    eprintln!("error while running tauri application: {msg}");
 }
