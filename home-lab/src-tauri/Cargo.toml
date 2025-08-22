@@ -23,6 +23,9 @@ prost = "0.12"
 serde = { version = "1", features = ["derive"] }
 anyhow = "1"
 tower = { version = "0.5", features = ["util"] }
+tauri-plugin-log = "2"
+log = "0.4"
+dirs = "6"
 
 # Rasterisation SVG
 resvg = "0.45"

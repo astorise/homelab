@@ -7,6 +7,9 @@ use tonic::transport::{Channel, Endpoint, Uri};
 use tower::service_fn;
 use tokio::net::windows::named_pipe::ClientOptions;
 use std::sync::Arc;
+use std::path::PathBuf;
+use std::str::FromStr;
+use log::LevelFilter;
 mod icons;
 mod menu;
 mod proxy;
@@ -121,7 +124,31 @@ async fn dns_remove_record(name: String, rrtype: String, value: String) -> Resul
 }
 
 pub fn run() {
+    let log_level = std::env::var("HOME_LAB_LOG_LEVEL")
+        .ok()
+        .and_then(|lvl| LevelFilter::from_str(&lvl).ok())
+        .unwrap_or(LevelFilter::Info);
+
+    let log_dir = dirs::data_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("home-lab")
+        .join("logs");
+
     if let Err(err) = tauri::Builder::default()
+        .plugin(
+            tauri_plugin_log::Builder::new()
+                .level(log_level)
+                .max_file_size(1_000_000)
+                .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepOne)
+                .targets([
+                    tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Stdout),
+                    tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Folder {
+                        path: log_dir,
+                        file_name: None,
+                    }),
+                ])
+                .build(),
+        )
         .invoke_handler(tauri::generate_handler![
             ping,
             dns_get_status,
