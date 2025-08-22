@@ -39,7 +39,7 @@ prost-build = "0.12"
 protoc-bin-vendored = "3"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = [
+windows-sys = { version = "0.60", features = [
     "Win32_Foundation",
     "Win32_System_LibraryLoader",
     "Win32_UI_WindowsAndMessaging",
