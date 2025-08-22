@@ -134,6 +134,10 @@ pub fn run() {
         .join("home-lab")
         .join("logs");
 
+    if let Err(e) = std::fs::create_dir_all(&log_dir) {
+        eprintln!("failed to create log directory {}: {e}", log_dir.display());
+    }
+
     if let Err(err) = tauri::Builder::default()
         .plugin(
             tauri_plugin_log::Builder::new()
