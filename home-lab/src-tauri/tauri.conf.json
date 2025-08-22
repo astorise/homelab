@@ -45,6 +45,7 @@
      
     ],
     "windows": {
+      "manifest": "resources/app.manifest",
       "nsis": {
         "installMode": "perMachine",
         "installerHooks": "resources/install-services.nsh"
