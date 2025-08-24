@@ -27,7 +27,7 @@ message ListRoutesResponse {
   repeated Route routes = 1;
 }
 
-service homehttp {
+service HomeHttp {
   rpc StopService(Empty) returns (Acknowledge);
   rpc ReloadConfig(Empty) returns (Acknowledge);
   rpc GetStatus(Empty) returns (StatusResponse);
