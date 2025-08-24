@@ -45,7 +45,7 @@ mod homehttp {
         }
     }
 }
-use homehttp::homehttp::v1::home_http_server::{homehttp, HomeHttpServer};
+use homehttp::homehttp::v1::home_http_server::{HomeHttp, HomeHttpServer};
 use homehttp::homehttp::v1::*;
 
 const SERVICE_NAME: &str = "homehttp";
@@ -167,7 +167,7 @@ struct Shared {
 struct HomeHttpSvc { shared: Shared }
 
 #[tonic::async_trait]
-impl homehttp for HomeHttpSvc {
+impl HomeHttp for HomeHttpSvc {
     async fn stop_service(&self, _req: tonic::Request<Empty>) -> std::result::Result<tonic::Response<Acknowledge>, tonic::Status> {
         self.shared.stopping.store(true, Ordering::SeqCst);
         Ok(tonic::Response::new(Acknowledge{ ok: true, message: "stopping".into() }))
