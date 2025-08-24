@@ -13,7 +13,7 @@ pub mod homehttp {
         }
     }
 }
-
+use homehttp::homehttp::v1::home_http_client::HomeHttpClient;
 use homehttp::homehttp::v1::*;
 
 const PIPE_NAME: &str = r"\\.\pipe\home-http";
@@ -93,7 +93,7 @@ pub async fn add_route(host: String, port: u32) -> Result<AckOut, String> {
 #[tauri::command]
 pub async fn remove_route(host: String) -> Result<AckOut, String> {
     let ch = http_make_channel().await.map_err(map_err)?;
-    let mut client = HomehttpClient::new(ch);
+    let mut client = HomeHttpClient::new(ch);
     let req = RemoveRouteRequest { host };
     let resp = client.remove_route(req).await.map_err(map_err)?;
     let a = resp.into_inner();
