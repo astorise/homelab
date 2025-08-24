@@ -81,18 +81,18 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             // Tes handlers d’origine :
 
-            dns::get_status,
-            dns::stop_service,
-            dns::reload_config,
-            dns::list_records,
-            dns::add_record,
-            dns::remove_record,
-            http::get_status,
-            http::stop_service,
-            http::reload_config,
-            http::list_routes,
-            http::add_route,
-            http::remove_route,
+            dns::dns_get_status,
+            dns::dns_stop_service,
+            dns::dns_reload_config,
+            dns::dns_list_records,
+            dns::dns_add_record,
+            dns::dns_remove_record,
+            http::http_get_status,
+            http::http_stop_service,
+            http::http_reload_config,
+            http::http_list_routes,
+            http::http_add_route,
+            http::http_remove_route,
    
         ])
         .run(tauri::generate_context!())

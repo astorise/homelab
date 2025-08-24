@@ -70,10 +70,10 @@ struct RecordOut { name: String, a: Vec<String>, aaaa: Vec<String>, ttl: u32 }
 struct ListRecordsOut { records: Vec<RecordOut> }
 
 #[tauri::command]
-async fn ping() -> String { "pong".into() }
+async fn dns_ping() -> String { "pong".into() }
 
 #[tauri::command]
-pub async fn get_status() -> Result<StatusOut, String> {
+pub async fn dns_get_status() -> Result<StatusOut, String> {
     let ch = dns_make_channel().await.map_err(map_err)?;
     let mut client = HomeDnsClient::new(ch);
     let resp = client.get_status(tonic::Request::new(Empty{})).await.map_err(map_err)?;
@@ -82,7 +82,7 @@ pub async fn get_status() -> Result<StatusOut, String> {
 }
 
 #[tauri::command]
-pub async fn stop_service() -> Result<AckOut, String> {
+pub async fn dns_stop_service() -> Result<AckOut, String> {
     let ch = dns_make_channel().await.map_err(map_err)?;
     let mut client = HomeDnsClient::new(ch);
     let resp = client.stop_service(tonic::Request::new(Empty{})).await.map_err(map_err)?;
@@ -91,7 +91,7 @@ pub async fn stop_service() -> Result<AckOut, String> {
 }
 
 #[tauri::command]
-pub async fn reload_config() -> Result<AckOut, String> {
+pub async fn dns_reload_config() -> Result<AckOut, String> {
     let ch = dns_make_channel().await.map_err(map_err)?;
     let mut client = HomeDnsClient::new(ch);
     let resp = client.reload_config(tonic::Request::new(Empty{})).await.map_err(map_err)?;
@@ -100,7 +100,7 @@ pub async fn reload_config() -> Result<AckOut, String> {
 }
 
 #[tauri::command]
-pub async fn list_records() -> Result<ListRecordsOut, String> {
+pub async fn dns_list_records() -> Result<ListRecordsOut, String> {
     let ch = dns_make_channel().await.map_err(map_err)?;
     let mut client = HomeDnsClient::new(ch);
     let resp = client.list_records(tonic::Request::new(Empty{})).await.map_err(map_err)?;
@@ -114,7 +114,7 @@ pub async fn list_records() -> Result<ListRecordsOut, String> {
 }
 
 #[tauri::command]
-pub async fn add_record(name: String, rrtype: String, value: String, ttl: u32) -> Result<AckOut, String> {
+pub async fn dns_add_record(name: String, rrtype: String, value: String, ttl: u32) -> Result<AckOut, String> {
     let ch = dns_make_channel().await.map_err(map_err)?;
     let mut client = HomeDnsClient::new(ch);
     let req = AddRecordRequest { name, rrtype, value, ttl };
@@ -124,7 +124,7 @@ pub async fn add_record(name: String, rrtype: String, value: String, ttl: u32) -
 }
 
 #[tauri::command]
-pub async fn remove_record(name: String, rrtype: String, value: String) -> Result<AckOut, String> {
+pub async fn dns_remove_record(name: String, rrtype: String, value: String) -> Result<AckOut, String> {
     let ch = dns_make_channel().await.map_err(map_err)?;
     let mut client = HomeDnsClient::new(ch);
     let req = RemoveRecordRequest { name, rrtype, value };
