@@ -39,7 +39,7 @@
       "resources/logs":"logs",
       "icons":"icons",
       "bin/home-dns.exe":"home-dns.exe",
-      "bin/home-proxy.exe":"home-proxy.exe"
+      "bin/home-http.exe":"home-http.exe"
     },
     "externalBin": [
      

@@ -38,24 +38,24 @@ use windows_service::service::*;
 use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
 use windows_service::{define_windows_service, service_manager::*};
 
-mod homeproxy {
-    pub mod homeproxy {
+mod homehttp {
+    pub mod homehttp {
         pub mod v1 {
-            tonic::include_proto!("homeproxy.v1");
+            tonic::include_proto!("homehttp.v1");
         }
     }
 }
-use homeproxy::homeproxy::v1::home_proxy_server::{HomeProxy, HomeProxyServer};
-use homeproxy::homeproxy::v1::*;
+use homehttp::homehttp::v1::home_http_server::{homehttp, HomeHttpServer};
+use homehttp::homehttp::v1::*;
 
-const SERVICE_NAME: &str = "HomeProxy";
-const SERVICE_DISPLAY_NAME: &str = "Home Proxy (HTTP/SNI to WSL)";
+const SERVICE_NAME: &str = "homehttp";
+const SERVICE_DISPLAY_NAME: &str = "Home Http (HTTP/SNI to WSL)";
 const SERVICE_DESCRIPTION: &str =
-    r"HTTP proxy + TLS SNI pass-through to WSL with gRPC IPC over named pipe \\.\pipe\home-proxy";
-const PIPE_NAME: &str = r"\\.\pipe\home-proxy";
+    r"HTTP http + TLS SNI pass-through to WSL with gRPC IPC over named pipe \\.\pipe\home-http";
+const PIPE_NAME: &str = r"\\.\pipe\home-http";
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-struct ProxyConfig {
+struct HttpConfig {
     #[serde(default = "default_http_port")]
     http: u16,
     #[serde(default = "default_https_port")]
@@ -75,11 +75,11 @@ fn default_https_port() -> u16 { 443 }
 fn default_resolve() -> String { "auto".into() }
 fn default_refresh() -> u64 { 30 }
 
-fn program_data_dir() -> PathBuf { PathBuf::from(r"C:\ProgramData\home-proxy") }
+fn program_data_dir() -> PathBuf { PathBuf::from(r"C:\ProgramData\home-http") }
 fn logs_dir() -> PathBuf { program_data_dir().join("logs") }
 fn config_path() -> PathBuf { program_data_dir().join("http.yaml") }
 
-fn level_from_cfg(cfg: &ProxyConfig) -> LevelFilter {
+fn level_from_cfg(cfg: &HttpConfig) -> LevelFilter {
     match cfg.log_level.as_deref().unwrap_or("info") {
         "trace" => LevelFilter::Trace, "debug" => LevelFilter::Debug, "warn" => LevelFilter::Warn,
         "error" => LevelFilter::Error, "off" => LevelFilter::Off, _ => LevelFilter::Info
@@ -96,7 +96,7 @@ fn init_logger(level: LevelFilter) -> Result<()> {
         .log_to_file(
             FileSpec::default()
                 .directory(dir)
-                .basename("home-proxy")
+                .basename("home-http")
                 .suffix("log"),
         )
         .duplicate_to_stderr(Duplicate::Error)
@@ -109,11 +109,11 @@ fn init_logger(level: LevelFilter) -> Result<()> {
     Ok(())
 }
 
-fn load_config_or_init() -> Result<ProxyConfig> {
+fn load_config_or_init() -> Result<HttpConfig> {
     let p = config_path();
     if !p.exists() {
         std::fs::create_dir_all(program_data_dir())?;
-        let cfg = ProxyConfig {
+        let cfg = HttpConfig {
             http: 80, https: 443, wsl_resolve: "auto".into(), wsl_ip: None, wsl_refresh_secs: 30,
             routes: HashMap::new(), log_level: Some("info".into()),
         };
@@ -121,10 +121,10 @@ fn load_config_or_init() -> Result<ProxyConfig> {
         return Ok(cfg);
     }
     let s = std::fs::read_to_string(&p).with_context(|| format!("lecture config: {}", p.display()))?;
-    let cfg: ProxyConfig = serde_yaml::from_str(&s).context("YAML invalide")?;
+    let cfg: HttpConfig = serde_yaml::from_str(&s).context("YAML invalide")?;
     Ok(cfg)
 }
-fn save_config(cfg: &ProxyConfig) -> Result<()> {
+fn save_config(cfg: &HttpConfig) -> Result<()> {
     let yaml = serde_yaml::to_string(cfg)?;
     write_atomic(&config_path(), yaml.as_bytes())
 }
@@ -135,7 +135,7 @@ fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn wsl_ip(cfg: &ProxyConfig, cache: &Arc<Mutex<(u64, Option<String>)>>) -> String {
+fn wsl_ip(cfg: &HttpConfig, cache: &Arc<Mutex<(u64, Option<String>)>>) -> String {
     if cfg.wsl_resolve == "static" {
         return cfg.wsl_ip.clone().unwrap_or_else(|| "127.0.0.1".into());
     }
@@ -160,14 +160,14 @@ fn wsl_ip(cfg: &ProxyConfig, cache: &Arc<Mutex<(u64, Option<String>)>>) -> Strin
 // ---- gRPC service impl ----
 #[derive(Clone)]
 struct Shared {
-    cfg: Arc<Mutex<ProxyConfig>>,
+    cfg: Arc<Mutex<HttpConfig>>,
     cache: Arc<Mutex<(u64, Option<String>)>>,
     stopping: Arc<AtomicBool>,
 }
-struct HomeProxySvc { shared: Shared }
+struct HomeHttpSvc { shared: Shared }
 
 #[tonic::async_trait]
-impl HomeProxy for HomeProxySvc {
+impl homehttp for HomeHttpSvc {
     async fn stop_service(&self, _req: tonic::Request<Empty>) -> std::result::Result<tonic::Response<Acknowledge>, tonic::Status> {
         self.shared.stopping.store(true, Ordering::SeqCst);
         Ok(tonic::Response::new(Acknowledge{ ok: true, message: "stopping".into() }))
@@ -273,10 +273,10 @@ impl futures_util::stream::Stream for PipeIncoming {
     }
 }
 
-// ---- HTTP proxy (Hyper 1.x) ----
+// ---- HTTP http (Hyper 1.x) ----
 #[derive(Clone)]
-struct HttpProxy { client: Client<HttpConnector, Full<Bytes>>, shared: Shared }
-impl HttpProxy {
+struct HttpHttp { client: Client<HttpConnector, Full<Bytes>>, shared: Shared }
+impl HttpHttp {
     fn new(shared: Shared) -> Self {
         let client = Client::builder(TokioExecutor::new()).build_http();
         Self { client, shared }
@@ -322,11 +322,11 @@ impl HttpProxy {
         let mut out_req = Request::from_parts(parts, Full::from(bytes));
         *out_req.uri_mut() = new_uri;
 
-        // Proxy avec client hyper
+        // Http avec client hyper
         let resp = match self.client.request(out_req).await {
     Ok(r) => r,
     Err(e) => {
-        // Convertit l’erreur client en 502 côté proxy
+        // Convertit l’erreur client en 502 côté http
         let msg = format!("upstream error: {e}");
         let body = Full::from(Bytes::from(msg))
             .map_err(|never| match never {}) // Infallible -> hyper::Error
@@ -341,9 +341,9 @@ impl HttpProxy {
 }
 
 // ---- TLS SNI pass-through ----
-struct TlsSniproxy { shared: Shared }
-impl TlsSniproxy { fn new(shared: Shared) -> Self { Self { shared } } }
-impl TlsSniproxy {
+struct TlsSnihttp { shared: Shared }
+impl TlsSnihttp { fn new(shared: Shared) -> Self { Self { shared } } }
+impl TlsSnihttp {
     async fn serve(&self, addr: SocketAddr) -> Result<()> {
         let listener = TcpListener::bind(addr).await?;
         info!("HTTPS (SNI pass-through) listening on {}", addr);
@@ -466,7 +466,7 @@ fn run_service() -> Result<()> {
     // gRPC IPC (named pipe)
     rt.spawn(async move {
         let incoming = PipeIncoming::new(PIPE_NAME).map(|res| res.map(PipeConn));
-        let svc = HomeProxyServer::new(HomeProxySvc { shared: shared_clone });
+        let svc = HomeHttpServer::new(HomeHttpSvc { shared: shared_clone });
         info!("gRPC IPC listening on named pipe {}", PIPE_NAME);
         if let Err(e) = tonic::transport::Server::builder().add_service(svc).serve_with_incoming(incoming).await {
             error!("gRPC server error: {e:?}");
@@ -476,8 +476,8 @@ fn run_service() -> Result<()> {
     // Serveurs HTTP / HTTPS
     let http_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), shared.cfg.lock().http);
     let https_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), shared.cfg.lock().https);
-    let http = HttpProxy::new(shared.clone());
-    let tls = TlsSniproxy::new(shared.clone());
+    let http = HttpHttp::new(shared.clone());
+    let tls = TlsSnihttp::new(shared.clone());
 
     rt.spawn(async move {
         if let Err(e) = http.serve(http_addr).await { error!("http server: {e:?}"); }
@@ -525,7 +525,7 @@ fn uninstall_service() -> Result<()> {
     service.delete()?; Ok(())
 }
 
-fn usage() { eprintln!("Usage: home-proxy [run|install|uninstall|console]"); }
+fn usage() { eprintln!("Usage: home-http [run|install|uninstall|console]"); }
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -543,13 +543,13 @@ fn main() -> Result<()> {
             let rt = Runtime::new()?;
             let http_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), shared.cfg.lock().http);
             let https_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), shared.cfg.lock().https);
-            let http = HttpProxy::new(shared.clone());
-            let tls = TlsSniproxy::new(shared.clone());
+            let http = HttpHttp::new(shared.clone());
+            let tls = TlsSnihttp::new(shared.clone());
             rt.spawn({
                 let shared = shared.clone();
                 async move {
                     let incoming = PipeIncoming::new(PIPE_NAME).map(|res| res.map(PipeConn));
-                    let svc = HomeProxyServer::new(HomeProxySvc { shared });
+                    let svc = HomeHttpServer::new(HomeHttpSvc { shared });
                     if let Err(e) = tonic::transport::Server::builder().add_service(svc).serve_with_incoming(incoming).await {
                         error!("gRPC server error: {e:?}");
                     }

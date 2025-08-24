@@ -1,231 +1,103 @@
-#![cfg_attr(all(not(debug_assertions), target_os = "windows"), windows_subsystem = "windows")]
+// src-tauri/src/lib.rs
 
-use serde::Serialize;
-use std::time::Duration;
-use anyhow::Result;
-use tonic::transport::{Channel, Endpoint, Uri};
-use tower::service_fn;
-use tokio::net::windows::named_pipe::ClientOptions;
-use std::sync::Arc;
-use std::path::PathBuf;
-use std::str::FromStr;
-use log::LevelFilter;
-mod icons;
-mod menu;
-mod proxy;
+use std::{fs, path::PathBuf};
+use tracing::{error, info};
+use tracing_appender::non_blocking::WorkerGuard;
+use tracing_subscriber::{fmt, EnvFilter};
+mod http;
+mod dns;
 
 
-// === gRPC generated modules (prost/tonic) ===
-pub mod homedns {
-    pub mod homedns {
-        pub mod v1 {
-            tonic::include_proto!("homedns.v1");
+// ====== LOGGING ======
+
+static mut LOG_GUARD: Option<WorkerGuard> = None;
+
+fn resolve_log_dir() -> PathBuf {
+    if cfg!(target_os = "windows") {
+        // Release -> %ProgramData%, Dev -> %LocalAppData% (fallback si indispo)
+        let base = if cfg!(debug_assertions) {
+            std::env::var_os("LOCALAPPDATA")
+        } else {
+            std::env::var_os("PROGRAMDATA").or_else(|| std::env::var_os("LOCALAPPDATA"))
+        }
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+        base.join("home-lab").join("logs")
+    } else {
+        dirs::data_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("home-lab")
+            .join("logs")
+    }
+}
+
+fn init_file_logger() {
+    // Règle par défaut si RUST_LOG non défini
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+
+    let log_dir = resolve_log_dir();
+    let _ = fs::create_dir_all(&log_dir);
+
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_dir.join("app.log"))
+        .ok();
+
+    match file {
+        Some(file) => {
+            let (nb, guard) = tracing_appender::non_blocking(file);
+            unsafe { LOG_GUARD = Some(guard) } // évite la perte de logs à la fermeture
+
+            let _ = fmt()
+                .with_env_filter(filter)
+                .with_writer(nb)
+                .try_init();
+
+            info!("Logger initialisé → {}", log_dir.to_string_lossy());
+        }
+        None => {
+            let _ = fmt().with_env_filter(filter).try_init();
+            info!(
+                "Logger (console only) — impossible d’ouvrir {}",
+                log_dir.to_string_lossy()
+            );
         }
     }
 }
-use homedns::homedns::v1::home_dns_client::HomeDnsClient;
-use homedns::homedns::v1::*;
 
-const PIPE_NAME: &str = r"\\.\pipe\home-dns";
-
-async fn dns_make_channel() -> Result<Channel> {
-    // Endpoint URI is dummy; transport comes from the connector (named pipe stream).
-    let ep = Endpoint::try_from("http://localhost:50051")?
-        .connect_timeout(Duration::from_secs(5))
-        .tcp_nodelay(true);
-    let path = PIPE_NAME.to_string();
-    let ch = ep.connect_with_connector(service_fn(move |_uri: Uri| {
-        let path = path.clone();
-        async move {
-            // Open the named pipe client; succeeds when the server pipe exists.
-            let client = ClientOptions::new().open(&path)?;
-            Ok::<_, std::io::Error>(client)
-        }
-    })).await?;
-    Ok(ch)
-}
-
-fn map_err<E: std::fmt::Display>(e: E) -> String { e.to_string() }
-
-#[derive(Serialize)]
-struct AckOut { ok: bool, message: String }
-
-#[derive(Serialize)]
-struct StatusOut { state: String, log_level: String }
-
-#[derive(Serialize)]
-struct RecordOut { name: String, a: Vec<String>, aaaa: Vec<String>, ttl: u32 }
-
-#[derive(Serialize)]
-struct ListRecordsOut { records: Vec<RecordOut> }
-
-#[tauri::command]
-async fn ping() -> String { "pong".into() }
-
-#[tauri::command]
-async fn dns_get_status() -> Result<StatusOut, String> {
-    let ch = dns_make_channel().await.map_err(map_err)?;
-    let mut client = HomeDnsClient::new(ch);
-    let resp = client.get_status(tonic::Request::new(Empty{})).await.map_err(map_err)?;
-    let s = resp.into_inner();
-    Ok(StatusOut{ state: s.state, log_level: s.log_level })
-}
-
-#[tauri::command]
-async fn dns_stop_service() -> Result<AckOut, String> {
-    let ch = dns_make_channel().await.map_err(map_err)?;
-    let mut client = HomeDnsClient::new(ch);
-    let resp = client.stop_service(tonic::Request::new(Empty{})).await.map_err(map_err)?;
-    let a = resp.into_inner();
-    Ok(AckOut{ ok: a.ok, message: a.message })
-}
-
-#[tauri::command]
-async fn dns_reload_config() -> Result<AckOut, String> {
-    let ch = dns_make_channel().await.map_err(map_err)?;
-    let mut client = HomeDnsClient::new(ch);
-    let resp = client.reload_config(tonic::Request::new(Empty{})).await.map_err(map_err)?;
-    let a = resp.into_inner();
-    Ok(AckOut{ ok: a.ok, message: a.message })
-}
-
-#[tauri::command]
-async fn dns_list_records() -> Result<ListRecordsOut, String> {
-    let ch = dns_make_channel().await.map_err(map_err)?;
-    let mut client = HomeDnsClient::new(ch);
-    let resp = client.list_records(tonic::Request::new(Empty{})).await.map_err(map_err)?;
-    let list = resp.into_inner();
-    let out = ListRecordsOut {
-        records: list.records.into_iter().map(|r| RecordOut {
-            name: r.name, a: r.a, aaaa: r.aaaa, ttl: r.ttl
-        }).collect()
-    };
-    Ok(out)
-}
-
-#[tauri::command]
-async fn dns_add_record(name: String, rrtype: String, value: String, ttl: u32) -> Result<AckOut, String> {
-    let ch = dns_make_channel().await.map_err(map_err)?;
-    let mut client = HomeDnsClient::new(ch);
-    let req = AddRecordRequest { name, rrtype, value, ttl };
-    let resp = client.add_record(tonic::Request::new(req)).await.map_err(map_err)?;
-    let a = resp.into_inner();
-    Ok(AckOut{ ok: a.ok, message: a.message })
-}
-
-#[tauri::command]
-async fn dns_remove_record(name: String, rrtype: String, value: String) -> Result<AckOut, String> {
-    let ch = dns_make_channel().await.map_err(map_err)?;
-    let mut client = HomeDnsClient::new(ch);
-    let req = RemoveRecordRequest { name, rrtype, value };
-    let resp = client.remove_record(tonic::Request::new(req)).await.map_err(map_err)?;
-    let a = resp.into_inner();
-    Ok(AckOut{ ok: a.ok, message: a.message })
-}
+// ====== ENTRYPOINT ======
 
 pub fn run() {
-    let log_level = std::env::var("HOME_LAB_LOG_LEVEL")
-        .ok()
-        .and_then(|lvl| LevelFilter::from_str(&lvl).ok())
-        .unwrap_or(LevelFilter::Info);
+    // Backtrace utile en cas de panic
+    std::env::set_var("RUST_BACKTRACE", "1");
 
-    let log_dir = dirs::data_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("home-lab")
-        .join("logs");
-
-    if let Err(e) = std::fs::create_dir_all(&log_dir) {
-        eprintln!("failed to create log directory {}: {e}", log_dir.display());
-    }
-
-    if let Err(err) = tauri::Builder::default()
-        .plugin(
-            tauri_plugin_log::Builder::new()
-                .level(log_level)
-                .max_file_size(1_000_000)
-                .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepOne)
-                .targets([
-                    tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Stdout),
-                    tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Folder {
-                        path: log_dir,
-                        file_name: None,
-                    }),
-                ])
-                .build(),
-        )
-        .invoke_handler(tauri::generate_handler![
-            ping,
-            dns_get_status,
-            dns_stop_service,
-            dns_reload_config,
-            dns_list_records,
-            dns_add_record,
-            dns_remove_record,
-            proxy::proxy_get_status,
-            proxy::proxy_stop_service,
-            proxy::proxy_reload_config,
-            proxy::proxy_list_routes,
-            proxy::proxy_add_route,
-            proxy::proxy_remove_route,
-        ])
-        .setup(|app| {
-            let loaded_icons = Arc::new(crate::icons::Icons::load(&app.handle(), 20)?);
-            crate::menu::setup_ui(&app.handle(), loaded_icons)?;
+    tauri::Builder::default()
+        .setup(|_app| {
+            init_file_logger();
+            info!("Démarrage de l’application Tauri…");
             Ok(())
         })
-        .on_window_event(|window, event| {
-            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                api.prevent_close(); // n'arrête pas l'app
-                let _ = window.hide(); // cache la fenêtre
-            }
-        })
+        .invoke_handler(tauri::generate_handler![
+            // Tes handlers d’origine :
+
+            dns::get_status,
+            dns::stop_service,
+            dns::reload_config,
+            dns::list_records,
+            dns::add_record,
+            dns::remove_record,
+            http::get_status,
+            http::stop_service,
+            http::reload_config,
+            http::list_routes,
+            http::add_route,
+            http::remove_route,
+   
+        ])
         .run(tauri::generate_context!())
-    {
-        show_run_error(&err.to_string());
-    }
-}
-
-#[cfg(windows)]
-fn show_run_error(msg: &str) {
-    use std::ffi::OsStr;
-    use std::os::windows::ffi::OsStrExt;
-    use std::ptr::{null_mut};
-    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
-    use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
-    use windows_sys::Win32::UI::Controls::{TASKDIALOGCONFIG, TDCBF_OK_BUTTON};
-
-    unsafe {
-        let module_name: Vec<u16> = OsStr::new("comctl32.dll").encode_wide().chain(Some(0)).collect();
-        let title_w: Vec<u16> = OsStr::new("homelab-tauri").encode_wide().chain(Some(0)).collect();
-        let content_w: Vec<u16> = OsStr::new(msg).encode_wide().chain(Some(0)).collect();
-
-        let module = GetModuleHandleW(module_name.as_ptr());
-        if !module.is_null() {
-            let proc = GetProcAddress(module, b"TaskDialogIndirect\0".as_ptr());
-            if let Some(raw) = proc {
-                type TaskDialogIndirectFn = unsafe extern "system" fn(
-                    *const TASKDIALOGCONFIG,
-                    *mut i32,
-                    *mut i32,
-                    *mut i32,
-                ) -> i32;
-                let func: TaskDialogIndirectFn = std::mem::transmute(raw);
-                let mut config: TASKDIALOGCONFIG = std::mem::zeroed();
-                config.cbSize = std::mem::size_of::<TASKDIALOGCONFIG>() as u32;
-                config.pszWindowTitle = title_w.as_ptr();
-                config.pszContent = content_w.as_ptr();
-                config.dwCommonButtons = TDCBF_OK_BUTTON;
-                if func(&config, null_mut(), null_mut(), null_mut()) >= 0 {
-                    return;
-                }
-            }
-        }
-
-        MessageBoxW(null_mut(), content_w.as_ptr(), title_w.as_ptr(), MB_OK | MB_ICONERROR);
-    }
-}
-
-#[cfg(not(windows))]
-fn show_run_error(msg: &str) {
-    eprintln!("error while running tauri application: {msg}");
+        .unwrap_or_else(|e| {
+            error!("Erreur critique Tauri: {:?}", e);
+            panic!("Erreur Tauri: {:?}", e);
+        });
 }

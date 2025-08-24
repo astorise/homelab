@@ -1,5 +1,5 @@
 syntax = "proto3";
-package homeproxy.v1;
+package homehttp.v1;
 
 message Empty {}
 
@@ -27,7 +27,7 @@ message ListRoutesResponse {
   repeated Route routes = 1;
 }
 
-service HomeProxy {
+service homehttp {
   rpc StopService(Empty) returns (Acknowledge);
   rpc ReloadConfig(Empty) returns (Acknowledge);
   rpc GetStatus(Empty) returns (StatusResponse);

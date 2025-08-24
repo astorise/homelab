@@ -18,7 +18,7 @@
 
     <Component Id="CmpHomeProxy" Guid="*" Directory="APPLICATIONFOLDER">
       <File Id="FileHomeProxy"
-            Source="$(var.SourceDir)home-proxy.exe"
+            Source="$(var.SourceDir)home-http.exe"
             KeyPath="yes"/>
     </Component>
 

@@ -26,6 +26,9 @@ tower = { version = "0.5", features = ["util"] }
 tauri-plugin-log = "2"
 log = "0.4"
 dirs = "6"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+tracing-appender = "0.2"
 
 # Rasterisation SVG
 resvg = "0.45"

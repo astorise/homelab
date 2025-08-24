@@ -1,7 +1,7 @@
 [workspace]
 members = [
   "home-dns",
-  "home-proxy",
+  "home-http",
   "home-lab/src-tauri",
 ]
 resolver = "3"
