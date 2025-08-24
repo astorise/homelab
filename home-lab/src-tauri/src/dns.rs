@@ -58,16 +58,16 @@ async fn dns_make_channel() -> Result<Channel> {
 fn map_err<E: std::fmt::Display>(e: E) -> String { e.to_string() }
 
 #[derive(Serialize)]
-struct AckOut { ok: bool, message: String }
+pub struct AckOut { ok: bool, message: String }
 
 #[derive(Serialize)]
-struct StatusOut { state: String, log_level: String }
+pub struct StatusOut { state: String, log_level: String }
 
 #[derive(Serialize)]
-struct RecordOut { name: String, a: Vec<String>, aaaa: Vec<String>, ttl: u32 }
+pub struct RecordOut { name: String, a: Vec<String>, aaaa: Vec<String>, ttl: u32 }
 
 #[derive(Serialize)]
-struct ListRecordsOut { records: Vec<RecordOut> }
+pub struct ListRecordsOut { records: Vec<RecordOut> }
 
 #[tauri::command]
 async fn dns_ping() -> String { "pong".into() }
