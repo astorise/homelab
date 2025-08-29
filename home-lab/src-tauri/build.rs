@@ -1,15 +1,30 @@
-#![allow(unsafe_code)]
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let protoc = protoc_bin_vendored::protoc_bin_path()?;
-    unsafe { std::env::set_var("PROTOC", protoc); }
+fn main() {
+    // Conserve la génération Tauri
+    tauri_build::build();
+
+    // --- Génération gRPC (Prost/Tonic) ---
+    // (vendored protoc pour éviter d'installer protoc sur la machine)
+    let protoc = protoc_bin_vendored::protoc_bin_path().expect("protoc introuvable");
+    std::env::set_var("PROTOC", protoc);
+
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+    let proto_dir = std::path::Path::new(&manifest_dir).join("proto");
+
+    let files = [
+        proto_dir.join("home_dns.proto"),
+        proto_dir.join("home_http.proto"),
+    ];
+
+    // Rebuild si les .proto changent
+    for f in &files {
+        println!("cargo:rerun-if-changed={}", f.display());
+    }
 
     tonic_build::configure()
-        .build_client(true)
-        .build_server(false)
-        .compile(&["proto/home_dns.proto", "proto/home_proxy.proto"], &["proto"])?;
-
-    println!("cargo:rerun-if-changed=proto/home_dns.proto");
-    println!("cargo:rerun-if-changed=proto/home_proxy.proto");
-    println!("cargo:rerun-if-changed=proto");
-    Ok(())
+        .build_server(false) // client uniquement côté app Tauri
+        .compile(
+            &files.iter().map(|p| p.as_path()).collect::<Vec<_>>(),
+            &[proto_dir.as_path()],
+        )
+        .expect("Échec compilation des .proto");
 }

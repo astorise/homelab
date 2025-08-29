@@ -1,1 +1,6 @@
-fn main() { homelab_tauri::run(); }
+// Prevents additional console window on Windows in release, DO NOT REMOVE!!
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+fn main() {
+    home_lab_lib::run()
+}

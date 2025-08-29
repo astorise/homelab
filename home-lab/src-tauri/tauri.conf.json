@@ -4,12 +4,12 @@
   "version": "0.1.0",
   "identifier": "name.astori.home-lab",
   "build": {
-    "beforeDevCommand": "npm --prefix ./frontend ci && npm --prefix ./frontend run dev",
-    "beforeBuildCommand": "npm --prefix ./frontend ci && npm --prefix ./frontend run build",
-    "frontendDist": "../frontend/dist",
+    "beforeDevCommand": "npm run  dev",
+    "beforeBuildCommand": "npm run  build",
+    "frontendDist": "../dist",
     "devUrl": "http://localhost:5173"
   },
-  "app": {
+   "app": {
     "withGlobalTauri": true,
     "windows": [
       {
@@ -34,11 +34,15 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "resources": [
-       "resources/conf/*",
-      "resources/home-dns.exe",
-      "resources/home-proxy.exe",
-      "icons/**/*"
+    "resources":  {
+       "resources/conf":"conf",
+      "resources/logs":"logs",
+      "icons":"icons",
+      "bin/home-dns.exe":"home-dns.exe",
+      "bin/home-http.exe":"home-http.exe"
+    },
+    "externalBin": [
+     
     ],
     "windows": {
       "nsis": {

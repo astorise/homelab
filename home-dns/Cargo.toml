@@ -6,7 +6,7 @@ build = "build.rs"
 
 [dependencies]
 sysinfo = { workspace = true }
-tokio = { version = "1.39", features = ["rt-multi-thread", "macros", "time", "sync"] }
+tokio = { version = "1.47", features = ["rt-multi-thread", "macros", "time", "sync"] }
 tokio-tungstenite = { workspace = true }
 windows-service = { workspace = true }
 anyhow = "1.0"

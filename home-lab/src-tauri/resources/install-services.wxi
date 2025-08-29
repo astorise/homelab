@@ -18,7 +18,7 @@
 
     <Component Id="CmpHomeProxy" Guid="*" Directory="APPLICATIONFOLDER">
       <File Id="FileHomeProxy"
-            Source="$(var.SourceDir)home-proxy.exe"
+            Source="$(var.SourceDir)home-http.exe"
             KeyPath="yes"/>
     </Component>
 
@@ -31,12 +31,21 @@
             Vital="yes"/>
     </Component>
 
+      <Component Id="CmpHttpYaml" Guid="*" Directory="ConfDir" NeverOverwrite="yes">
+        <CreateFolder/>
+        <File Id="FileHttpYaml"
+              Source="$(var.SourceDir)conf\\http.yaml"
+              KeyPath="yes"
+              Vital="yes"/>
+      </Component>
+
     <!-- Groupe pour raccorder à la Feature -->
     <ComponentGroup Id="AppAllComponents">
       <ComponentRef Id="CmpHomeDns"/>
       <ComponentRef Id="CmpHomeProxy"/>
       <ComponentRef Id="CmpDnsYaml"/>
-    </ComponentGroup>
+      <ComponentRef Id="CmpHttpYaml"/>
+      </ComponentGroup>
   </Fragment>
 
   <!-- Extension de la Feature principale générée par Tauri -->

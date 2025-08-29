@@ -1,13 +1,19 @@
 {
   "name": "home-lab",
   "private": true,
-  "workspaces": ["frontend"],
+  "version": "0.1.0",
+  "type": "module",
   "scripts": {
     "tauri": "tauri",
-    "dev": "npm --prefix ./frontend run dev",
-    "build:frontend": "npm --prefix ./frontend ci && npm --prefix ./frontend run build"
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
   },
-  "devDependencies": {
-    "@tauri-apps/cli": "^2.7"
+ "devDependencies": {
+    "@tauri-apps/cli": "^2",
+    "vite": "^7"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2"
   }
 }

@@ -1,0 +1,47 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      // 1) CodeLLDB (recommandé pour Rust)
+      "name": "Debug (LLDB) homelab-tauri.exe",
+      "type": "lldb",
+      "request": "launch",
+      "program": "${workspaceFolder}/target/debug/homelab-tauri.exe",
+      "cwd": "${workspaceFolder}",
+      "stopOnEntry": true,
+      "preLaunchTask": "cargo build homelab-tauri",
+      "env": {
+        // Force Windows à charger d'abord les DLL à côté de l'EXE (évite un WebView2Loader.dll parasite)
+        "PATH": "${workspaceFolder}/target/debug;${env:PATH}"
+      },
+      "console": "externalTerminal",
+      "initCommands": [],
+      "sourceLanguages": ["rust"],
+      "logging": {
+        "engineLogging": true,
+        "trace": true
+      }
+    },
+    {
+      // 2) Debugger Microsoft (cppvsdbg) - utile si LLDB échoue à lancer
+      "name": "Debug (cppvsdbg) homelab-tauri.exe",
+      "type": "cppvsdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/target/debug/homelab-tauri.exe",
+      "cwd": "${workspaceFolder}",
+      "preLaunchTask": "cargo build homelab-tauri",
+      "environment": [
+        { "name": "PATH", "value": "${workspaceFolder}\\target\\debug;${env:PATH}" }
+      ],
+      "externalConsole": true,
+      "stopAtEntry": true
+    },
+    {
+      // 3) Attach - quand tu lances d'abord `cargo tauri dev` en terminal
+      "name": "Attach to homelab-tauri.exe",
+      "type": "lldb",
+      "request": "attach",
+      "processName": "homelab-tauri.exe"
+    }
+  ]
+}

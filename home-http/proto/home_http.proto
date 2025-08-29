@@ -1,0 +1,37 @@
+syntax = "proto3";
+package homehttp.v1;
+
+message Empty {}
+
+message Acknowledge {
+  bool ok = 1;
+  string message = 2;
+}
+
+message StatusResponse {
+  string state = 1;
+  string log_level = 2;
+}
+
+message AddRouteRequest {
+  string host = 1;
+  uint32 port = 2;
+}
+
+message RemoveRouteRequest {
+  string host = 1;
+}
+
+message ListRoutesResponse {
+  message Route { string host = 1; uint32 port = 2; }
+  repeated Route routes = 1;
+}
+
+service HomeHttp {
+  rpc StopService(Empty) returns (Acknowledge);
+  rpc ReloadConfig(Empty) returns (Acknowledge);
+  rpc GetStatus(Empty) returns (StatusResponse);
+  rpc AddRoute(AddRouteRequest) returns (Acknowledge);
+  rpc RemoveRoute(RemoveRouteRequest) returns (Acknowledge);
+  rpc ListRoutes(Empty) returns (ListRoutesResponse);
+}
