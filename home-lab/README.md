@@ -15,3 +15,4 @@ npm run tauri dev  # start Tauri desktop app
 - `<dns-records>`: shows available DNS records.
 - `<http-status>`: displays the HTTP service state and log level.
 - `<http-routes>`: shows configured HTTP routes.
+- `<toast-container>`: hosts transient error messages; use `showError(message)` to display a toast.
