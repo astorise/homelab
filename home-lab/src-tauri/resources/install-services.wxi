@@ -43,13 +43,20 @@
     <CustomAction Id="UninstallHomeDns" Directory="APPLICATIONFOLDER" ExeCommand='"[APPLICATIONFOLDER]home-dns.exe" uninstall' Execute="deferred" Impersonate="no" Return="check" />
     <CustomAction Id="UninstallHomeHttp" Directory="APPLICATIONFOLDER" ExeCommand='"[APPLICATIONFOLDER]home-http.exe" uninstall' Execute="deferred" Impersonate="no" Return="check" />
 
+    <!-- Trace immédiate pour valider l'exécution dans le log MSI -->
+    <CustomAction Id="TraceBeforeServices" Directory="SystemFolder"
+                  ExeCommand='cmd /C echo MSI Trace: entering service install phase >> "[INSTALLDIR]installer-msi.log"'
+                  Execute="immediate" Return="ignore" />
+
     <!-- Action silencieuse via PowerShell pour WSL -->
     <CustomAction Id="RunWslInstall" Directory="SystemFolder" ExeCommand='powershell -ExecutionPolicy Bypass -WindowStyle Hidden -Command "wsl --install --no-distribution"' Execute="deferred" Impersonate="no" Return="check" />
 
     <!-- Ordonnancement -->
     <InstallExecuteSequence>
-      <Custom Action="InstallHomeDns" After="InstallFiles">NOT Installed</Custom>
-      <Custom Action="InstallHomeHttp" After="InstallFiles">NOT Installed</Custom>
+      <!-- Ordre: trace -> dns -> http, le tout avant InstallFinalize -->
+      <Custom Action="TraceBeforeServices" Before="InstallFinalize">NOT Installed</Custom>
+      <Custom Action="InstallHomeDns" After="TraceBeforeServices">NOT Installed</Custom>
+      <Custom Action="InstallHomeHttp" After="InstallHomeDns">NOT Installed</Custom>
       <Custom Action="RunWslInstall" Before="InstallFinalize">NOT Installed</Custom>
       <Custom Action="UninstallHomeDns" Before="RemoveFiles">Installed AND REMOVE="ALL"</Custom>
       <Custom Action="UninstallHomeHttp" Before="RemoveFiles">Installed AND REMOVE="ALL"</Custom>
