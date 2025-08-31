@@ -37,12 +37,11 @@
     "resources":  {
       "resources/conf":"conf",
       "resources/logs":"logs",
-      "icons":"icons"
+      "icons":"icons",
+      "bin/home-dns.exe":"home-dns.exe",
+      "bin/home-http.exe":"home-http.exe"
     },
-    "externalBin": [
-      "bin/home-dns.exe",
-      "bin/home-http.exe"
-    ],
+ 
     "windows": {
       "nsis": {
         "installMode": "perMachine",
