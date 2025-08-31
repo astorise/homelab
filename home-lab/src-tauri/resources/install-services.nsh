@@ -3,7 +3,8 @@ Var LOG_FILE
 Var LOG_HANDLE
 
 !macro NSIS_HOOK_PREINSTALL
-  ShowInstDetails show
+  ; SetDetailsPrint is valid in sections; ShowInstDetails must be outside.
+  ; Avoid ShowInstDetails here to keep NSIS happy in CI.
   SetDetailsPrint both
   StrCpy $LOG_FILE "$INSTDIR\installer.log"
   ClearErrors
