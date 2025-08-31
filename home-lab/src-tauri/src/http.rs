@@ -1,11 +1,10 @@
 use anyhow::Result;
 use serde::Serialize;
-use tonic::transport::{Channel, Endpoint, Uri};
 use tokio::net::windows::named_pipe::ClientOptions;
+use tonic::transport::{Channel, Endpoint, Uri};
 use tower::service_fn;
 
-// === gRPC generated modules (prost/tonic) ===
-// (tonic-build 0.11 / tonic 0.11 produit le même path de module)
+// === gRPC generated modules ===
 pub mod homehttp {
     pub mod homehttp {
         pub mod v1 {
@@ -16,25 +15,22 @@ pub mod homehttp {
 use homehttp::homehttp::v1::home_http_client::HomeHttpClient;
 use homehttp::homehttp::v1::*;
 
-#[cfg(debug_assertions)]
-const PIPE_NAME: &str = r"\\.\pipe\home-http-dev";
-#[cfg(not(debug_assertions))]
-// Supporte à la fois les pipes de dev et de prod
+// Pipes nommés: en dev "-dev", en prod sans suffixe. On essaie les deux.
 const PIPE_DEV: &str = r"\\.\pipe\home-http-dev";
 const PIPE_REL: &str = r"\\.\pipe\home-http";
-#[cfg(debug_assertions)]
-const PIPE_DEV: &str = r"\\.\pipe\home-http-dev";
 
 async fn connect_pipe(path: &str) -> Result<Channel> {
     let endpoint = Endpoint::try_from("http://pipe.invalid")?;
     let p = path.to_string();
-    let ch = endpoint.connect_with_connector(service_fn(move |_uri: Uri| {
-        let pp = p.clone();
-        async move {
-            let pipe = ClientOptions::new().open(pp)?;
-            Ok::<_, std::io::Error>(pipe)
-        }
-    })).await?;
+    let ch = endpoint
+        .connect_with_connector(service_fn(move |_uri: Uri| {
+            let pp = p.clone();
+            async move {
+                let pipe = ClientOptions::new().open(pp)?;
+                Ok::<_, std::io::Error>(pipe)
+            }
+        }))
+        .await?;
     Ok(ch)
 }
 
@@ -116,3 +112,4 @@ pub async fn http_remove_route(host: String) -> Result<AckOut, String> {
     let a = resp.into_inner();
     Ok(AckOut { ok: a.ok, message: a.message })
 }
+

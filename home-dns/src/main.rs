@@ -1,5 +1,4 @@
 use anyhow::{Context, Result};
-use chrono::Utc;
 use flexi_logger::{Age, Cleanup, Criterion, Duplicate, FileSpec, Logger, Naming};
 use homedns::homedns::v1::home_dns_server::{HomeDns, HomeDnsServer};
 use homedns::homedns::v1::*;

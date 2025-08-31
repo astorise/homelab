@@ -423,6 +423,7 @@ fn parse_sni(mut buf: &[u8]) -> Result<String> {
 static mut STATUS_HANDLE: Option<windows_service::service_control_handler::ServiceStatusHandle> = None;
 static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
 
+#[allow(static_mut_refs)]
 fn set_status(state: ServiceState) {
     unsafe {
         if let Some(h) = &STATUS_HANDLE {
@@ -440,6 +441,7 @@ fn set_status(state: ServiceState) {
 }
 
 define_windows_service!(ffi_service_main, service_main);
+#[allow(dead_code)]
 fn service_main(_args: Vec<std::ffi::OsString>) {
     if let Err(e) = run_service() {
         eprintln!("service error: {e:?}");

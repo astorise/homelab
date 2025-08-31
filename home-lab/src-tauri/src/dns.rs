@@ -1,13 +1,11 @@
 use anyhow::Result;
-use tauri::async_runtime::Mutex;
-use tonic::transport::{Channel, Endpoint, Uri};
-use homedns::homedns::v1::home_dns_client::HomeDnsClient;
-use tokio::net::windows::named_pipe::ClientOptions;
-use std::sync::Arc;
 use serde::Serialize;
 use std::time::Duration;
+use tokio::net::windows::named_pipe::ClientOptions;
+use tonic::transport::{Channel, Endpoint, Uri};
 use tower::service_fn;
 
+// === gRPC generated modules ===
 pub mod homedns {
     pub mod homedns {
         pub mod v1 {
@@ -15,136 +13,179 @@ pub mod homedns {
         }
     }
 }
-
-#[cfg(debug_assertions)]
-const PIPE_NAME: &str = r"\\.\pipe\home-dns-dev";
-#[cfg(not(debug_assertions))]
-// Supporte à la fois les pipes de dev et de prod, pour éviter les décalages
-const PIPE_DEV: &str = r"\\.\pipe\home-dns-dev";
-const PIPE_REL: &str = r"\\.\pipe\home-dns";
-// En build debug, l'attribut mal positionné peut masquer PIPE_DEV;
-// on le redéclare ici pour debug afin d'éviter l'erreur de compilation.
-#[cfg(debug_assertions)]
-const PIPE_DEV: &str = r"\\.\pipe\home-dns-dev";
-
-#[derive(Clone)]
-pub struct GrpcState {
-    pub client: Arc<Mutex<HomeDnsClient<Channel>>>,
-}
-
-pub async fn connect_npipe() -> Result<HomeDnsClient<Channel>> {
-    // Endpoint dummy; the connector overrides actual transport
-    let endpoint = Endpoint::try_from("http://[::]:50051")?;
-    let channel = endpoint.connect_with_connector(tower::service_fn(|_uri: Uri| async move {
-        let pipe = ClientOptions::new().open(PIPE_NAME)?;
-        Ok::<_, std::io::Error>(pipe)
-    })).await?;
-    Ok(HomeDnsClient::new(channel))
-}
-
-
-
+use homedns::homedns::v1::home_dns_client::HomeDnsClient;
 use homedns::homedns::v1::*;
 
+// Pipes nommés: en dev "-dev", en prod sans suffixe. On essaie les deux.
+const PIPE_DEV: &str = r"\\.\pipe\home-dns-dev";
+const PIPE_REL: &str = r"\\.\pipe\home-dns";
 
 async fn connect_pipe(path: &str) -> Result<Channel> {
-    // Endpoint URI is factice; le connecteur ouvre le pipe nommé.
+    // Endpoint URI factice; le connecteur ouvre le pipe nommé.
     let ep = Endpoint::try_from("http://pipe.invalid")?
         .connect_timeout(Duration::from_secs(5))
         .tcp_nodelay(true);
     let p = path.to_string();
-    let ch = ep.connect_with_connector(service_fn(move |_uri: Uri| {
-        let p2 = p.clone();
-        async move {
-            let client = ClientOptions::new().open(&p2)?;
-            Ok::<_, std::io::Error>(client)
-        }
-    })).await?;
+    let ch = ep
+        .connect_with_connector(service_fn(move |_uri: Uri| {
+            let p2 = p.clone();
+            async move {
+                let client = ClientOptions::new().open(&p2)?;
+                Ok::<_, std::io::Error>(client)
+            }
+        }))
+        .await?;
     Ok(ch)
 }
 
 async fn dns_make_channel() -> Result<Channel> {
-    // Essaie d'abord le pipe de dev, puis celui de prod
     match connect_pipe(PIPE_DEV).await {
         Ok(ch) => Ok(ch),
         Err(_) => connect_pipe(PIPE_REL).await,
     }
 }
 
-fn map_err<E: std::fmt::Display>(e: E) -> String { e.to_string() }
+fn map_err<E: std::fmt::Display>(e: E) -> String {
+    e.to_string()
+}
 
 #[derive(Serialize)]
-pub struct AckOut { ok: bool, message: String }
+pub struct AckOut {
+    ok: bool,
+    message: String,
+}
 
 #[derive(Serialize)]
-pub struct StatusOut { state: String, log_level: String }
+pub struct StatusOut {
+    state: String,
+    log_level: String,
+}
 
 #[derive(Serialize)]
-pub struct RecordOut { name: String, a: Vec<String>, aaaa: Vec<String>, ttl: u32 }
+pub struct RecordOut {
+    name: String,
+    a: Vec<String>,
+    aaaa: Vec<String>,
+    ttl: u32,
+}
 
 #[derive(Serialize)]
-pub struct ListRecordsOut { records: Vec<RecordOut> }
-
-#[tauri::command]
-async fn dns_ping() -> String { "pong".into() }
+pub struct ListRecordsOut {
+    records: Vec<RecordOut>,
+}
 
 #[tauri::command]
 pub async fn dns_get_status() -> Result<StatusOut, String> {
     let ch = dns_make_channel().await.map_err(map_err)?;
     let mut client = HomeDnsClient::new(ch);
-    let resp = client.get_status(tonic::Request::new(Empty{})).await.map_err(map_err)?;
+    let resp = client
+        .get_status(tonic::Request::new(Empty {}))
+        .await
+        .map_err(map_err)?;
     let s = resp.into_inner();
-    Ok(StatusOut{ state: s.state, log_level: s.log_level })
+    Ok(StatusOut {
+        state: s.state,
+        log_level: s.log_level,
+    })
 }
 
 #[tauri::command]
 pub async fn dns_stop_service() -> Result<AckOut, String> {
     let ch = dns_make_channel().await.map_err(map_err)?;
     let mut client = HomeDnsClient::new(ch);
-    let resp = client.stop_service(tonic::Request::new(Empty{})).await.map_err(map_err)?;
+    let resp = client
+        .stop_service(tonic::Request::new(Empty {}))
+        .await
+        .map_err(map_err)?;
     let a = resp.into_inner();
-    Ok(AckOut{ ok: a.ok, message: a.message })
+    Ok(AckOut {
+        ok: a.ok,
+        message: a.message,
+    })
 }
 
 #[tauri::command]
 pub async fn dns_reload_config() -> Result<AckOut, String> {
     let ch = dns_make_channel().await.map_err(map_err)?;
     let mut client = HomeDnsClient::new(ch);
-    let resp = client.reload_config(tonic::Request::new(Empty{})).await.map_err(map_err)?;
+    let resp = client
+        .reload_config(tonic::Request::new(Empty {}))
+        .await
+        .map_err(map_err)?;
     let a = resp.into_inner();
-    Ok(AckOut{ ok: a.ok, message: a.message })
+    Ok(AckOut {
+        ok: a.ok,
+        message: a.message,
+    })
 }
 
 #[tauri::command]
 pub async fn dns_list_records() -> Result<ListRecordsOut, String> {
     let ch = dns_make_channel().await.map_err(map_err)?;
     let mut client = HomeDnsClient::new(ch);
-    let resp = client.list_records(tonic::Request::new(Empty{})).await.map_err(map_err)?;
+    let resp = client
+        .list_records(tonic::Request::new(Empty {}))
+        .await
+        .map_err(map_err)?;
     let list = resp.into_inner();
     let out = ListRecordsOut {
-        records: list.records.into_iter().map(|r| RecordOut {
-            name: r.name, a: r.a, aaaa: r.aaaa, ttl: r.ttl
-        }).collect()
+        records: list
+            .records
+            .into_iter()
+            .map(|r| RecordOut {
+                name: r.name,
+                a: r.a,
+                aaaa: r.aaaa,
+                ttl: r.ttl,
+            })
+            .collect(),
     };
     Ok(out)
 }
 
 #[tauri::command]
-pub async fn dns_add_record(name: String, rrtype: String, value: String, ttl: u32) -> Result<AckOut, String> {
+pub async fn dns_add_record(
+    name: String,
+    rrtype: String,
+    value: String,
+    ttl: u32,
+) -> Result<AckOut, String> {
     let ch = dns_make_channel().await.map_err(map_err)?;
     let mut client = HomeDnsClient::new(ch);
-    let req = AddRecordRequest { name, rrtype, value, ttl };
-    let resp = client.add_record(tonic::Request::new(req)).await.map_err(map_err)?;
+    let req = AddRecordRequest {
+        name,
+        rrtype,
+        value,
+        ttl,
+    };
+    let resp = client
+        .add_record(tonic::Request::new(req))
+        .await
+        .map_err(map_err)?;
     let a = resp.into_inner();
-    Ok(AckOut{ ok: a.ok, message: a.message })
+    Ok(AckOut {
+        ok: a.ok,
+        message: a.message,
+    })
 }
 
 #[tauri::command]
-pub async fn dns_remove_record(name: String, rrtype: String, value: String) -> Result<AckOut, String> {
+pub async fn dns_remove_record(
+    name: String,
+    rrtype: String,
+    value: String,
+) -> Result<AckOut, String> {
     let ch = dns_make_channel().await.map_err(map_err)?;
     let mut client = HomeDnsClient::new(ch);
     let req = RemoveRecordRequest { name, rrtype, value };
-    let resp = client.remove_record(tonic::Request::new(req)).await.map_err(map_err)?;
+    let resp = client
+        .remove_record(tonic::Request::new(req))
+        .await
+        .map_err(map_err)?;
     let a = resp.into_inner();
-    Ok(AckOut{ ok: a.ok, message: a.message })
+    Ok(AckOut {
+        ok: a.ok,
+        message: a.message,
+    })
 }
+

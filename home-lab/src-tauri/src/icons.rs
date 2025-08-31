@@ -14,6 +14,7 @@ use resvg::{
 
 /// États d'icônes (détermine la couleur appliquée)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[allow(dead_code)]
 pub enum IconState {
     Ok,
     Warning,
