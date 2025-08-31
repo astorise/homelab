@@ -1,3 +1,4 @@
+import { invoke as tauriInvoke } from '@tauri-apps/api/core';
 /*
   Relaye les logs de l'IHM vers Tauri (console + fichier) quand disponible,
   et capture les erreurs globales pour aider au debug d'écran blanc.
@@ -67,16 +68,12 @@ try {
   })();
   console.info(`[console-bridge] Tauri=${viaTauri} Mock=${mocked}`);
   // Aides console: alias globaux pour l'invoke en DevTools
-  (async () => {
-    try {
-      const mod = await import('@tauri-apps/api/core');
-      // taInvoke(cmd, args) → Promise
-      globalThis.taInvoke = (cmd, args) => mod.invoke(cmd, args);
-      // Compatibilité v1 → v2: __TAURI__.core.invoke devient __TAURI__.invoke si absent
-      if (globalThis.__TAURI__ && globalThis.__TAURI__.core && !globalThis.__TAURI__.invoke) {
-        globalThis.__TAURI__.invoke = (...a) => globalThis.__TAURI__.core.invoke(...a);
-      }
-      console.info('[console-bridge] taInvoke disponible. Exemple: await taInvoke("dns_get_status")');
-    } catch {}
-  })();
+  try {
+    globalThis.taInvoke = (cmd, args) => tauriInvoke(cmd, args);
+    // Compatibilité v1 → v2: __TAURI__.core.invoke devient __TAURI__.invoke si absent
+    if (globalThis.__TAURI__ && globalThis.__TAURI__.core && !globalThis.__TAURI__.invoke) {
+      globalThis.__TAURI__.invoke = (...a) => globalThis.__TAURI__.core.invoke(...a);
+    }
+    console.info('[console-bridge] taInvoke disponible. Exemple: await taInvoke("dns_get_status")');
+  } catch {}
 } catch (_) {}

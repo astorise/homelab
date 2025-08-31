@@ -29,6 +29,4 @@ windows-service = "0.8"
 sysinfo = "0.37"
 
 
-[profile.release]
-lto = "thin"
-codegen-units = 1
+ 

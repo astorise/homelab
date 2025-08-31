@@ -1,7 +1,9 @@
 use std::{io::{BufRead, BufReader}, path::{Path, PathBuf}, process::{Child, Command, Stdio}, thread};
 use anyhow::Result;
 use tracing::{info, error};
-use tauri::{AppHandle, Manager, Wry};
+use tauri::{AppHandle, Wry};
+#[cfg(debug_assertions)]
+use tauri::Manager;
 
 #[cfg(target_os = "windows")]
 fn cargo_bin() -> &'static str { "cargo" }
@@ -9,7 +11,7 @@ fn cargo_bin() -> &'static str { "cargo" }
 fn cargo_bin() -> &'static str { "cargo" }
 
 struct ProcGuard {
-    name: &'static str,
+    _name: &'static str,
     child: Child,
 }
 
@@ -33,7 +35,7 @@ impl ProcGuard {
                 }
             });
         }
-        Self { name, child }
+        Self { _name: name, child }
     }
 }
 

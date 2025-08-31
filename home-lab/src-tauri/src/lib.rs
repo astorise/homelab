@@ -5,6 +5,7 @@ use tracing::{error, info, warn};
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{fmt, EnvFilter};
 use std::sync::Arc;
+#[cfg(debug_assertions)]
 use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
 
 mod icons;
@@ -12,6 +13,7 @@ mod menu;
 mod dns;
 mod http;
 mod ui;
+#[cfg(all(debug_assertions, target_os = "windows"))]
 mod dev_services;
 
 static mut LOG_GUARD: Option<WorkerGuard> = None;
