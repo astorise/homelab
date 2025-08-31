@@ -16,7 +16,16 @@ pub mod homedns {
     }
 }
 
-const PIPE_NAME: &str = r"\\.\pipe\home-dns";
+#[cfg(debug_assertions)]
+const PIPE_NAME: &str = r"\\.\pipe\home-dns-dev";
+#[cfg(not(debug_assertions))]
+// Supporte à la fois les pipes de dev et de prod, pour éviter les décalages
+const PIPE_DEV: &str = r"\\.\pipe\home-dns-dev";
+const PIPE_REL: &str = r"\\.\pipe\home-dns";
+// En build debug, l'attribut mal positionné peut masquer PIPE_DEV;
+// on le redéclare ici pour debug afin d'éviter l'erreur de compilation.
+#[cfg(debug_assertions)]
+const PIPE_DEV: &str = r"\\.\pipe\home-dns-dev";
 
 #[derive(Clone)]
 pub struct GrpcState {
@@ -38,21 +47,28 @@ pub async fn connect_npipe() -> Result<HomeDnsClient<Channel>> {
 use homedns::homedns::v1::*;
 
 
-async fn dns_make_channel() -> Result<Channel> {
-    // Endpoint URI is dummy; transport comes from the connector (named pipe stream).
-    let ep = Endpoint::try_from("http://localhost:50051")?
+async fn connect_pipe(path: &str) -> Result<Channel> {
+    // Endpoint URI is factice; le connecteur ouvre le pipe nommé.
+    let ep = Endpoint::try_from("http://pipe.invalid")?
         .connect_timeout(Duration::from_secs(5))
         .tcp_nodelay(true);
-    let path = PIPE_NAME.to_string();
+    let p = path.to_string();
     let ch = ep.connect_with_connector(service_fn(move |_uri: Uri| {
-        let path = path.clone();
+        let p2 = p.clone();
         async move {
-            // Open the named pipe client; succeeds when the server pipe exists.
-            let client = ClientOptions::new().open(&path)?;
+            let client = ClientOptions::new().open(&p2)?;
             Ok::<_, std::io::Error>(client)
         }
     })).await?;
     Ok(ch)
+}
+
+async fn dns_make_channel() -> Result<Channel> {
+    // Essaie d'abord le pipe de dev, puis celui de prod
+    match connect_pipe(PIPE_DEV).await {
+        Ok(ch) => Ok(ch),
+        Err(_) => connect_pipe(PIPE_REL).await,
+    }
 }
 
 fn map_err<E: std::fmt::Display>(e: E) -> String { e.to_string() }

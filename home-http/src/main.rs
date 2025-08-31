@@ -52,6 +52,9 @@ const SERVICE_NAME: &str = "homehttp";
 const SERVICE_DISPLAY_NAME: &str = "Home Http (HTTP/SNI to WSL)";
 const SERVICE_DESCRIPTION: &str =
     r"HTTP http + TLS SNI pass-through to WSL with gRPC IPC over named pipe \\.\pipe\home-http";
+#[cfg(debug_assertions)]
+const PIPE_NAME: &str = r"\\.\pipe\home-http-dev";
+#[cfg(not(debug_assertions))]
 const PIPE_NAME: &str = r"\\.\pipe\home-http";
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -539,25 +542,37 @@ fn main() -> Result<()> {
         "uninstall" => { uninstall_service()?; println!("Service désinstallé."); }
         "console" => {
             let cfg = load_config_or_init()?; init_logger(level_from_cfg(&cfg))?;
+            info!("Console mode starting");
             let shared = Shared { cfg: Arc::new(Mutex::new(cfg)), cache: Arc::new(Mutex::new((0, None))), stopping: Arc::new(AtomicBool::new(false)) };
             let rt = Runtime::new()?;
-            let http_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), shared.cfg.lock().http);
-            let https_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), shared.cfg.lock().https);
-            let http = HttpHttp::new(shared.clone());
-            let tls = TlsSnihttp::new(shared.clone());
+
+            // gRPC IPC sur named pipe: toujours actif même si HTTP/HTTPS échouent
             rt.spawn({
                 let shared = shared.clone();
                 async move {
                     let incoming = PipeIncoming::new(PIPE_NAME).map(|res| res.map(PipeConn));
                     let svc = HomeHttpServer::new(HomeHttpSvc { shared });
+                    info!("[console] gRPC IPC listening on named pipe {}", PIPE_NAME);
                     if let Err(e) = tonic::transport::Server::builder().add_service(svc).serve_with_incoming(incoming).await {
                         error!("gRPC server error: {e:?}");
                     }
                 }
             });
-            rt.block_on(async move {
-                tokio::join!(http.serve(http_addr), tls.serve(https_addr));
-            });
+
+            // Serveurs HTTP/HTTPS: on tente, mais on ne bloque pas si ça échoue (ex: ports 80/443 sans admin)
+            {
+                // En mode console (dev), on écoute en loopback uniquement pour éviter les popups pare-feu/UAC
+                let http_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), shared.cfg.lock().http);
+                let https_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), shared.cfg.lock().https);
+                let http = HttpHttp::new(shared.clone());
+                let tls = TlsSnihttp::new(shared.clone());
+                rt.spawn(async move { if let Err(e) = http.serve(http_addr).await { error!("http server: {e:?}"); } });
+                rt.spawn(async move { if let Err(e) = tls.serve(https_addr).await { error!("https server: {e:?}"); } });
+            }
+
+            // Boucle de garde: laisse tourner jusqu'à fermeture du processus
+            info!("Console mode running. Press Ctrl+C to stop.");
+            loop { thread::sleep(Duration::from_millis(500)); if shared.stopping.load(Ordering::SeqCst) { break; } }
         }
         _ => usage(),
     }

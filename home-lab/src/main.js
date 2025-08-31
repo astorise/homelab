@@ -1,3 +1,4 @@
+import './console-bridge.js';
 import './style.css';
 import './components/toast.js';
 import './components/dns-status.js';

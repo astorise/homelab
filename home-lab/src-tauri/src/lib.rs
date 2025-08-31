@@ -5,12 +5,14 @@ use tracing::{error, info, warn};
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{fmt, EnvFilter};
 use std::sync::Arc;
-use tauri::Manager;
+use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
 
 mod icons;
 mod menu;
 mod dns;
 mod http;
+mod ui;
+mod dev_services;
 
 static mut LOG_GUARD: Option<WorkerGuard> = None;
 
@@ -77,6 +79,31 @@ pub fn run() {
         .setup(|app| {
             let loaded_icons = Arc::new(crate::icons::Icons::load(&app.handle(), 20)?);
             crate::menu::setup_ui(&app.handle(), loaded_icons)?;
+
+            // En dev sur Windows, lance les services en mode console et redirige leurs logs
+            #[cfg(all(debug_assertions, target_os = "windows"))]
+            {
+                let _ = crate::dev_services::spawn(&app.handle());
+            }
+
+            // En dev, assure que la fenêtre principale est visible
+            // (sinon on a tendance à ouvrir le serveur Vite dans un navigateur externe,
+            //  où l'API Tauri n'est pas disponible).
+            #[cfg(debug_assertions)]
+            {
+                if let Some(main) = app.get_webview_window("main") {
+                    let _ = main.show();
+                    let _ = main.set_focus();
+                } else {
+                    // Si aucune fenêtre 'main' n'existe (ex: config la masque/retard), on la crée.
+                    let win = WebviewWindowBuilder::new(app, "main", WebviewUrl::default())
+                        .title("Home Lab")
+                        .center()
+                        .build()?;
+                    let _ = win.show();
+                    let _ = win.set_focus();
+                }
+            }
             Ok(())
         })
          .invoke_handler(tauri::generate_handler![
@@ -94,6 +121,7 @@ pub fn run() {
             http::http_list_routes,
             http::http_add_route,
             http::http_remove_route,
+            ui::ui_log,
         ])
         .run(tauri::generate_context!())
         .unwrap_or_else(|e| {

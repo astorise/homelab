@@ -37,6 +37,9 @@ mod homedns {
 const SERVICE_NAME: &str = "HomeDnsService";
 const SERVICE_DISPLAY_NAME: &str = "Home DNS Service";
 const SERVICE_DESCRIPTION: &str = r"DNS config + rollback + gRPC IPC over named pipe \\.\pipe\home-dns";
+#[cfg(debug_assertions)]
+const PIPE_NAME: &str = r"\\.\pipe\home-dns-dev";
+#[cfg(not(debug_assertions))]
 const PIPE_NAME: &str = r"\\.\pipe\home-dns";
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -468,6 +471,42 @@ fn run_service() -> Result<()> {
     Ok(())
 }
 
+#[allow(dead_code)]
+fn run_console() -> Result<()> {
+    let cfg = load_config_or_init()?; let level = level_from_cfg(&cfg); init_logger(level)?;
+    info!("Console mode starting (level={:?})", level);
+    let _ = restore_all();
+    let cfg = match snapshot_and_apply_all(cfg) {
+        Ok(c) => c,
+        Err(e) => {
+            warn!("snapshot/apply failed in console mode: {e:?} — continuing without applying");
+            // Charge config sans l'appliquer pour que le gRPC démarre quand même
+            load_config_or_init()?
+        }
+    };
+    let shared = SharedState { cfg: Arc::new(Mutex::new(cfg)), stopping: Arc::new(AtomicBool::new(false)) };
+    let shared_clone = shared.clone();
+    let rt = Runtime::new()?;
+    rt.spawn(async move {
+        let incoming = PipeIncoming::new(PIPE_NAME).map(|res| res.map(PipeConn));
+        let svc = HomeDnsServer::new(HomeDnsSvc{ state: shared_clone });
+        info!("[console] gRPC IPC listening on named pipe {}", PIPE_NAME);
+        if let Err(e) = tonic::transport::Server::builder()
+            .add_service(svc)
+            .serve_with_incoming(incoming)
+            .await
+        {
+            error!("[console] gRPC server error: {e:?}");
+        }
+    });
+    info!("Console mode running. Press Ctrl+C to stop.");
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        if shared.stopping.load(std::sync::atomic::Ordering::SeqCst) { break; }
+    }
+    Ok(())
+}
+
 fn install_service() -> Result<()> {
     let cfg = load_config_or_init()?; init_logger(level_from_cfg(&cfg))?;
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CREATE_SERVICE)?;
@@ -507,7 +546,6 @@ fn configure_recovery_action_run_restore(exe: &Path) -> Result<()> {
 }
 
 fn main() -> Result<()> {
-    init_logger(LevelFilter::Info)?;
     let arg = std::env::args().nth(1).unwrap_or_default();
     match arg.as_str() {
         "install" => { install_service()?; println!("Service installé. Éditez {} si besoin puis démarrez le service.", config_path().display()); }
@@ -517,6 +555,7 @@ fn main() -> Result<()> {
                 error!("Erreur démarrage service: {e:?}"); let _ = restore_all();
             }
         }
+        "console" => { run_console()?; }
         "apply-once" => {
             let cfg = load_config_or_init()?; init_logger(level_from_cfg(&cfg))?; snapshot_and_apply_all(cfg)?;
             println!("DNS appliqué sur toutes les interfaces.");

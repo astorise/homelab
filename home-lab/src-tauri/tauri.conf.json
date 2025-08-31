@@ -4,8 +4,8 @@
   "version": "0.1.0",
   "identifier": "name.astori.home-lab",
   "build": {
-    "beforeDevCommand": "npm run  dev",
-    "beforeBuildCommand": "npm run  build",
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build",
     "frontendDist": "../dist",
     "devUrl": "http://localhost:5173"
   },

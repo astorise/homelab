@@ -5,7 +5,10 @@
   "type": "module",
   "scripts": {
     "tauri": "tauri",
-    "dev": "vite",
+    "dev": "vite --host localhost --port 5173 --strictPort",
+    "tauri:mock": "set VITE_TAURI_MOCK=1&& tauri dev",
+    "tauri:no-svc": "set NO_DEV_SERVICES=1&& tauri dev",
+    "tauri:verbose": "set RUST_LOG=debug&& tauri dev",
     "build": "vite build",
     "preview": "vite preview"
   },

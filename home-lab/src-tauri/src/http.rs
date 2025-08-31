@@ -16,16 +16,33 @@ pub mod homehttp {
 use homehttp::homehttp::v1::home_http_client::HomeHttpClient;
 use homehttp::homehttp::v1::*;
 
-const PIPE_NAME: &str = r"\\.\pipe\home-http";
+#[cfg(debug_assertions)]
+const PIPE_NAME: &str = r"\\.\pipe\home-http-dev";
+#[cfg(not(debug_assertions))]
+// Supporte à la fois les pipes de dev et de prod
+const PIPE_DEV: &str = r"\\.\pipe\home-http-dev";
+const PIPE_REL: &str = r"\\.\pipe\home-http";
+#[cfg(debug_assertions)]
+const PIPE_DEV: &str = r"\\.\pipe\home-http-dev";
 
-async fn http_make_channel() -> Result<Channel> {
-    // L'URI est fictive (requise par Endpoint) ; on fournit un connecteur custom vers le pipe
+async fn connect_pipe(path: &str) -> Result<Channel> {
     let endpoint = Endpoint::try_from("http://pipe.invalid")?;
-    let ch = endpoint.connect_with_connector(service_fn(|_uri: Uri| async move {
-        let pipe = ClientOptions::new().open(PIPE_NAME)?;
-        Ok::<_, std::io::Error>(pipe)
+    let p = path.to_string();
+    let ch = endpoint.connect_with_connector(service_fn(move |_uri: Uri| {
+        let pp = p.clone();
+        async move {
+            let pipe = ClientOptions::new().open(pp)?;
+            Ok::<_, std::io::Error>(pipe)
+        }
     })).await?;
     Ok(ch)
+}
+
+async fn http_make_channel() -> Result<Channel> {
+    match connect_pipe(PIPE_DEV).await {
+        Ok(ch) => Ok(ch),
+        Err(_) => connect_pipe(PIPE_REL).await,
+    }
 }
 
 fn map_err<E: std::fmt::Display>(e: E) -> String { e.to_string() }
