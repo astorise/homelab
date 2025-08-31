@@ -35,14 +35,13 @@
       "icons/icon.ico"
     ],
     "resources":  {
-       "resources/conf":"conf",
+      "resources/conf":"conf",
       "resources/logs":"logs",
-      "icons":"icons",
-      "bin/home-dns.exe":"home-dns.exe",
-      "bin/home-http.exe":"home-http.exe"
+      "icons":"icons"
     },
     "externalBin": [
-     
+      "bin/home-dns.exe",
+      "bin/home-http.exe"
     ],
     "windows": {
       "nsis": {

@@ -8,8 +8,15 @@
     ; Si, pour une raison X, la ressource n'a pas été copiée :
     CopyFiles /SILENT "$INSTDIR\http.yaml" "$INSTDIR\conf\http.yaml"
   ${EndIf}
-  nsExec::Exec '"$INSTDIR\\home-dns.exe" install'
-  nsExec::Exec '"$INSTDIR\\home-http.exe" install'
+  DetailPrint "Installing Windows services..."
+  nsExec::ExecToStack '"$INSTDIR\\home-dns.exe" install'
+  Pop $0
+  Pop $1
+  DetailPrint "home-dns.exe install => rc=$0 out=$1"
+  nsExec::ExecToStack '"$INSTDIR\\home-http.exe" install'
+  Pop $0
+  Pop $1
+  DetailPrint "home-http.exe install => rc=$0 out=$1"
     ; Exécution après installation
   ; Forcer l’élévation (si pas déjà perMachine)
   ; et lancer WSL sans distribution
@@ -17,8 +24,15 @@
 !macroend
 
 !macro NSIS_HOOK_POSTUNINSTALL
-  nsExec::Exec '"$INSTDIR\\home-dns.exe" uninstall'
-  nsExec::Exec '"$INSTDIR\\home-http.exe" uninstall'
+  DetailPrint "Uninstalling Windows services..."
+  nsExec::ExecToStack '"$INSTDIR\\home-dns.exe" uninstall'
+  Pop $0
+  Pop $1
+  DetailPrint "home-dns.exe uninstall => rc=$0 out=$1"
+  nsExec::ExecToStack '"$INSTDIR\\home-http.exe" uninstall'
+  Pop $0
+  Pop $1
+  DetailPrint "home-http.exe uninstall => rc=$0 out=$1"
 !macroend
 
 
