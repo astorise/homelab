@@ -35,7 +35,6 @@
       "icons/icon.ico"
     ],
     "resources":  {
-      "resources/conf":"conf",
       "resources/logs":"logs",
       "icons":"icons",
       "bin/home-dns.exe":"home-dns.exe",

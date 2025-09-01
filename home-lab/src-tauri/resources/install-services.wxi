@@ -30,6 +30,24 @@
     <FeatureRef Id="MainProgram">
       <ComponentGroupRef Id="AppAllComponents"/>
     </FeatureRef>
+
+    <!-- Références aux Custom Actions pour les inclure au link -->
+    <CustomActionRef Id="TraceBeforeServices"/>
+    <CustomActionRef Id="InstallHomeDns"/>
+    <CustomActionRef Id="InstallHomeHttp"/>
+    <CustomActionRef Id="RunWslInstall"/>
+    <CustomActionRef Id="UninstallHomeDns"/>
+    <CustomActionRef Id="UninstallHomeHttp"/>
+
+    <!-- Ordonnancement des Custom Actions (exécuté car ce fragment est inclus) -->
+    <InstallExecuteSequence>
+      <Custom Action="TraceBeforeServices" Before="InstallFinalize">NOT Installed</Custom>
+      <Custom Action="InstallHomeDns" After="TraceBeforeServices">NOT Installed</Custom>
+      <Custom Action="InstallHomeHttp" After="InstallHomeDns">NOT Installed</Custom>
+      <Custom Action="RunWslInstall" Before="InstallFinalize">NOT Installed AND VersionNT &gt;= 1000</Custom>
+      <Custom Action="UninstallHomeDns" Before="RemoveFiles">Installed AND REMOVE="ALL"</Custom>
+      <Custom Action="UninstallHomeHttp" Before="RemoveFiles">Installed AND REMOVE="ALL"</Custom>
+    </InstallExecuteSequence>
   </Fragment>
 
   <!-- Custom Actions pour installer les services + WSL -->
