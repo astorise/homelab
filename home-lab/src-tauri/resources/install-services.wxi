@@ -27,8 +27,9 @@
 
   <!-- Extension de la Feature principale générée par Tauri -->
   <Fragment>
-    <FeatureRef Id="MainProgram"/>
-    <ComponentGroupRef Id="AppAllComponents"/>
+    <FeatureRef Id="MainProgram">
+      <ComponentGroupRef Id="AppAllComponents"/>
+    </FeatureRef>
   </Fragment>
 
   <!-- Custom Actions pour installer les services + WSL -->
