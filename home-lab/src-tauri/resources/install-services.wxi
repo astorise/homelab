@@ -2,7 +2,7 @@
 <Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
   <!-- Tout est lié à APPLICATIONFOLDER généré par Tauri -->
   <Fragment>
-    <DirectoryRef Id="APPLICATIONFOLDER">
+    <DirectoryRef Id="INSTALLDIR">
       <!-- Sous-dossier conf -->
       <Directory Id="ConfDir" Name="conf"/>
     </DirectoryRef>
@@ -27,9 +27,8 @@
 
   <!-- Extension de la Feature principale générée par Tauri -->
   <Fragment>
-    <Feature Id="ProductFeature">
-      <ComponentGroupRef Id="AppAllComponents"/>
-    </Feature>
+    <FeatureRef Id="MainProgram"/>
+    <ComponentGroupRef Id="AppAllComponents"/>
   </Fragment>
 
   <!-- Custom Actions pour installer les services + WSL -->
@@ -38,10 +37,10 @@
     <Property Id="ALLUSERS" Value="1" />
 
     <!-- Services install/uninstall (exécutés en mode élevé, deferred) -->
-    <CustomAction Id="InstallHomeDns" Directory="APPLICATIONFOLDER" ExeCommand='"[APPLICATIONFOLDER]home-dns.exe" install' Execute="deferred" Impersonate="no" Return="check" />
-    <CustomAction Id="InstallHomeHttp" Directory="APPLICATIONFOLDER" ExeCommand='"[APPLICATIONFOLDER]home-http.exe" install' Execute="deferred" Impersonate="no" Return="check" />
-    <CustomAction Id="UninstallHomeDns" Directory="APPLICATIONFOLDER" ExeCommand='"[APPLICATIONFOLDER]home-dns.exe" uninstall' Execute="deferred" Impersonate="no" Return="check" />
-    <CustomAction Id="UninstallHomeHttp" Directory="APPLICATIONFOLDER" ExeCommand='"[APPLICATIONFOLDER]home-http.exe" uninstall' Execute="deferred" Impersonate="no" Return="check" />
+    <CustomAction Id="InstallHomeDns" Directory="INSTALLDIR" ExeCommand='"[INSTALLDIR]home-dns.exe" install' Execute="deferred" Impersonate="no" Return="check" />
+    <CustomAction Id="InstallHomeHttp" Directory="INSTALLDIR" ExeCommand='"[INSTALLDIR]home-http.exe" install' Execute="deferred" Impersonate="no" Return="check" />
+    <CustomAction Id="UninstallHomeDns" Directory="INSTALLDIR" ExeCommand='"[INSTALLDIR]home-dns.exe" uninstall' Execute="deferred" Impersonate="no" Return="check" />
+    <CustomAction Id="UninstallHomeHttp" Directory="INSTALLDIR" ExeCommand='"[INSTALLDIR]home-http.exe" uninstall' Execute="deferred" Impersonate="no" Return="check" />
 
     <!-- Trace immédiate pour valider l'exécution dans le log MSI -->
     <CustomAction Id="TraceBeforeServices" Directory="SystemFolder"
@@ -57,7 +56,7 @@
       <Custom Action="TraceBeforeServices" Before="InstallFinalize">NOT Installed</Custom>
       <Custom Action="InstallHomeDns" After="TraceBeforeServices">NOT Installed</Custom>
       <Custom Action="InstallHomeHttp" After="InstallHomeDns">NOT Installed</Custom>
-      <Custom Action="RunWslInstall" Before="InstallFinalize">NOT Installed</Custom>
+      <Custom Action="RunWslInstall" Before="InstallFinalize">NOT Installed AND VersionNT &gt;= 1000</Custom>
       <Custom Action="UninstallHomeDns" Before="RemoveFiles">Installed AND REMOVE="ALL"</Custom>
       <Custom Action="UninstallHomeHttp" Before="RemoveFiles">Installed AND REMOVE="ALL"</Custom>
     </InstallExecuteSequence>
