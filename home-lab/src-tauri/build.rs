@@ -1,5 +1,22 @@
 fn main() {
-    // Conserve la génération Tauri
+    // Assurer que les ressources référencées par Tauri existent AVANT tauri_build::build()
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+
+    // --- Préparer les binaires services pour le bundling (NSIS/MSI) ---
+    // Copie src-tauri/bin/*.exe -> src-tauri/resources/bin/
+    let src_bin = std::path::Path::new(&manifest_dir).join("bin");
+    let dst_bin = std::path::Path::new(&manifest_dir).join("resources").join("bin");
+    let _ = std::fs::create_dir_all(&dst_bin);
+    for name in ["home-dns.exe", "home-http.exe"] {
+        let src = src_bin.join(name);
+        let dst = dst_bin.join(name);
+        println!("cargo:rerun-if-changed={}", src.display());
+        if src.exists() {
+            let _ = std::fs::copy(&src, &dst);
+        }
+    }
+
+    // Conserve la génération Tauri (lit tauri.conf.json et ses resources)
     tauri_build::build();
 
     // --- Génération gRPC (Prost/Tonic) ---
@@ -7,7 +24,6 @@ fn main() {
     let protoc = protoc_bin_vendored::protoc_bin_path().expect("protoc introuvable");
     std::env::set_var("PROTOC", protoc);
 
-    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
     let proto_dir = std::path::Path::new(&manifest_dir).join("proto");
 
     let files = [
@@ -27,19 +43,4 @@ fn main() {
             &[proto_dir.as_path()],
         )
         .expect("échec compilation des .proto");
-
-    // --- Préparer les binaires services pour le bundling (NSIS/MSI) ---
-    // Copie src-tauri/bin/*.exe -> src-tauri/resources/bin/
-    let src_bin = std::path::Path::new(&manifest_dir).join("bin");
-    let dst_bin = std::path::Path::new(&manifest_dir).join("resources").join("bin");
-    let _ = std::fs::create_dir_all(&dst_bin);
-    for name in ["home-dns.exe", "home-http.exe"] {
-        let src = src_bin.join(name);
-        let dst = dst_bin.join(name);
-        println!("cargo:rerun-if-changed={}", src.display());
-        if src.exists() {
-            let _ = std::fs::copy(&src, &dst);
-        }
-    }
 }
-
