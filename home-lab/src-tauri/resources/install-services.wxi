@@ -3,45 +3,46 @@
   <!-- Windows Services for home-dns and home-http -->
   <Fragment>
     <DirectoryRef Id="INSTALLDIR">
-      <Directory Id="BinDir" Name="bin"/>
+      <!-- Use a distinct folder to avoid MSI file path collisions with Tauri resources -->
+      <Directory Id="SvcDir" Name="svc">
+        <!-- home-dns service -->
+        <Component Id="CmpHomeDnsSvc" Guid="*" Win64="yes">
+          <File Id="FileHomeDnsExe" Source="$(var.SourceDir)bin\home-dns.exe" KeyPath="yes" Vital="yes"/>
+          <ServiceInstall Id="SvcInstallHomeDns"
+                          Name="HomeDnsService"
+                          DisplayName="Home DNS Service"
+                          Description="DNS config + rollback + gRPC IPC over named pipe \\.\\pipe\\home-dns"
+                          Type="ownProcess"
+                          Start="auto"
+                          ErrorControl="normal"
+                          Arguments="run"/>
+          <ServiceControl Id="SvcCtrlHomeDns"
+                          Name="HomeDnsService"
+                          Start="install"
+                          Stop="both"
+                          Remove="uninstall"
+                          Wait="yes"/>
+        </Component>
 
-      <!-- home-dns service -->
-      <Component Id="CmpHomeDnsSvc" Guid="*" Directory="BinDir" Win64="yes">
-        <File Id="FileHomeDnsExe" Source="$(var.SourceDir)bin\home-dns.exe" KeyPath="yes" Vital="yes"/>
-        <ServiceInstall Id="SvcInstallHomeDns"
-                        Name="HomeDnsService"
-                        DisplayName="Home DNS Service"
-                        Description="DNS config + rollback + gRPC IPC over named pipe \\.\\pipe\\home-dns"
-                        Type="ownProcess"
-                        Start="auto"
-                        ErrorControl="normal"
-                        Arguments="run"/>
-        <ServiceControl Id="SvcCtrlHomeDns"
-                        Name="HomeDnsService"
-                        Start="install"
-                        Stop="both"
-                        Remove="uninstall"
-                        Wait="yes"/>
-      </Component>
-
-      <!-- home-http service -->
-      <Component Id="CmpHomeHttpSvc" Guid="*" Directory="BinDir" Win64="yes">
-        <File Id="FileHomeHttpExe" Source="$(var.SourceDir)bin\home-http.exe" KeyPath="yes" Vital="yes"/>
-        <ServiceInstall Id="SvcInstallHomeHttp"
-                        Name="homehttp"
-                        DisplayName="Home Http (HTTP/SNI to WSL)"
-                        Description="HTTP http + TLS SNI pass-through to WSL with gRPC IPC over named pipe \\.\\pipe\\home-http"
-                        Type="ownProcess"
-                        Start="auto"
-                        ErrorControl="normal"
-                        Arguments="run"/>
-        <ServiceControl Id="SvcCtrlHomeHttp"
-                        Name="homehttp"
-                        Start="install"
-                        Stop="both"
-                        Remove="uninstall"
-                        Wait="yes"/>
-      </Component>
+        <!-- home-http service -->
+        <Component Id="CmpHomeHttpSvc" Guid="*" Win64="yes">
+          <File Id="FileHomeHttpExe" Source="$(var.SourceDir)bin\home-http.exe" KeyPath="yes" Vital="yes"/>
+          <ServiceInstall Id="SvcInstallHomeHttp"
+                          Name="homehttp"
+                          DisplayName="Home Http (HTTP/SNI to WSL)"
+                          Description="HTTP http + TLS SNI pass-through to WSL with gRPC IPC over named pipe \\.\\pipe\\home-http"
+                          Type="ownProcess"
+                          Start="auto"
+                          ErrorControl="normal"
+                          Arguments="run"/>
+          <ServiceControl Id="SvcCtrlHomeHttp"
+                          Name="homehttp"
+                          Start="install"
+                          Stop="both"
+                          Remove="uninstall"
+                          Wait="yes"/>
+        </Component>
+      </Directory>
     </DirectoryRef>
 
     <!-- Expose a ComponentGroup that we can reference from the product feature -->
