@@ -51,4 +51,10 @@
       <ComponentRef Id="CmpHomeHttpSvc"/>
     </ComponentGroup>
   </Fragment>
+  <Fragment>
+    <FeatureRef Id="MainProgram">
+      <ComponentRef Id="CmpHomeDnsSvc"/>
+      <ComponentRef Id="CmpHomeHttpSvc"/>
+    </FeatureRef>
+  </Fragment>
 </Wix>

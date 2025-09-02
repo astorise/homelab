@@ -49,9 +49,6 @@
       "wix": {
         "fragmentPaths": [
           "resources/install-services.wxi"
-        ],
-        "componentGroupRefs": [
-          "AppServices"
         ]
       }
     }
