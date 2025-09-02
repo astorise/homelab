@@ -27,13 +27,13 @@ Var LOG_HANDLE
     CopyFiles /SILENT "$INSTDIR\http.yaml" "$INSTDIR\conf\http.yaml"
   ${EndIf}
   DetailPrint "Installing Windows services..."
-  nsExec::ExecToStack '"$INSTDIR\\home-dns.exe" install'
+  nsExec::ExecToStack '"$INSTDIR\\bin\\home-dns.exe" install'
   Pop $0
   Pop $1
   DetailPrint "home-dns.exe install => rc=$0 out=$1"
   StrCmp $LOG_HANDLE "" +2
   FileWrite $LOG_HANDLE "home-dns.exe install => rc=$0 out=$1$\r$\n"
-  nsExec::ExecToStack '"$INSTDIR\\home-http.exe" install'
+  nsExec::ExecToStack '"$INSTDIR\\bin\\home-http.exe" install'
   Pop $0
   Pop $1
   DetailPrint "home-http.exe install => rc=$0 out=$1"
@@ -50,13 +50,13 @@ Var LOG_HANDLE
 
 !macro NSIS_HOOK_POSTUNINSTALL
   DetailPrint "Uninstalling Windows services..."
-  nsExec::ExecToStack '"$INSTDIR\\home-dns.exe" uninstall'
+  nsExec::ExecToStack '"$INSTDIR\\bin\\home-dns.exe" uninstall'
   Pop $0
   Pop $1
   DetailPrint "home-dns.exe uninstall => rc=$0 out=$1"
   StrCmp $LOG_HANDLE "" +2
   FileWrite $LOG_HANDLE "home-dns.exe uninstall => rc=$0 out=$1$\r$\n"
-  nsExec::ExecToStack '"$INSTDIR\\home-http.exe" uninstall'
+  nsExec::ExecToStack '"$INSTDIR\\bin\\home-http.exe" uninstall'
   Pop $0
   Pop $1
   DetailPrint "home-http.exe uninstall => rc=$0 out=$1"

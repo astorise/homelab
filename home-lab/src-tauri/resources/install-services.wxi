@@ -1,83 +1,53 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
-  <!-- Tout est lié à APPLICATIONFOLDER généré par Tauri -->
+  <!-- Windows Services for home-dns and home-http -->
   <Fragment>
     <DirectoryRef Id="INSTALLDIR">
-      <!-- Sous-dossier conf -->
-      <Directory Id="ConfDir" Name="conf"/>
+      <Directory Id="BinDir" Name="bin"/>
+
+      <!-- home-dns service -->
+      <Component Id="CmpHomeDnsSvc" Guid="*" Directory="BinDir" Win64="yes">
+        <File Id="FileHomeDnsExe" Source="$(var.SourceDir)bin\home-dns.exe" KeyPath="yes" Vital="yes"/>
+        <ServiceInstall Id="SvcInstallHomeDns"
+                        Name="HomeDnsService"
+                        DisplayName="Home DNS Service"
+                        Description="DNS config + rollback + gRPC IPC over named pipe \\.\\pipe\\home-dns"
+                        Type="ownProcess"
+                        Start="auto"
+                        ErrorControl="normal"
+                        Arguments="run"/>
+        <ServiceControl Id="SvcCtrlHomeDns"
+                        Name="HomeDnsService"
+                        Start="install"
+                        Stop="both"
+                        Remove="uninstall"
+                        Wait="yes"/>
+      </Component>
+
+      <!-- home-http service -->
+      <Component Id="CmpHomeHttpSvc" Guid="*" Directory="BinDir" Win64="yes">
+        <File Id="FileHomeHttpExe" Source="$(var.SourceDir)bin\home-http.exe" KeyPath="yes" Vital="yes"/>
+        <ServiceInstall Id="SvcInstallHomeHttp"
+                        Name="homehttp"
+                        DisplayName="Home Http (HTTP/SNI to WSL)"
+                        Description="HTTP http + TLS SNI pass-through to WSL with gRPC IPC over named pipe \\.\\pipe\\home-http"
+                        Type="ownProcess"
+                        Start="auto"
+                        ErrorControl="normal"
+                        Arguments="run"/>
+        <ServiceControl Id="SvcCtrlHomeHttp"
+                        Name="homehttp"
+                        Start="install"
+                        Stop="both"
+                        Remove="uninstall"
+                        Wait="yes"/>
+      </Component>
     </DirectoryRef>
 
-    <!-- Fichiers de config (préservés aux upgrades) -->
-    <Component Id="CmpDnsYaml" Guid="*" Directory="ConfDir" NeverOverwrite="yes">
-      <CreateFolder/>
-      <File Id="FileDnsYaml" Source="$(var.SourceDir)conf\dns.yaml" KeyPath="yes" Vital="yes"/>
-    </Component>
-
-    <Component Id="CmpHttpYaml" Guid="*" Directory="ConfDir" NeverOverwrite="yes">
-      <CreateFolder/>
-      <File Id="FileHttpYaml" Source="$(var.SourceDir)conf\http.yaml" KeyPath="yes" Vital="yes"/>
-    </Component>
-
-    <!-- Groupe pour raccorder à la Feature -->
-    <ComponentGroup Id="AppAllComponents">
-      <ComponentRef Id="CmpDnsYaml"/>
-      <ComponentRef Id="CmpHttpYaml"/>
+    <!-- Expose a ComponentGroup that we can reference from the product feature -->
+    <ComponentGroup Id="AppServices">
+      <ComponentRef Id="CmpHomeDnsSvc"/>
+      <ComponentRef Id="CmpHomeHttpSvc"/>
     </ComponentGroup>
-  </Fragment>
-
-  <!-- Extension de la Feature principale générée par Tauri -->
-  <Fragment>
-    <FeatureRef Id="MainProgram">
-      <ComponentGroupRef Id="AppAllComponents"/>
-    </FeatureRef>
-
-    <!-- Références aux Custom Actions pour les inclure au link -->
-    <CustomActionRef Id="TraceBeforeServices"/>
-    <CustomActionRef Id="InstallHomeDns"/>
-    <CustomActionRef Id="InstallHomeHttp"/>
-    <CustomActionRef Id="RunWslInstall"/>
-    <CustomActionRef Id="UninstallHomeDns"/>
-    <CustomActionRef Id="UninstallHomeHttp"/>
-
-    <!-- Ordonnancement des Custom Actions (exécuté car ce fragment est inclus) -->
-    <InstallExecuteSequence>
-      <Custom Action="TraceBeforeServices" Before="InstallFinalize">NOT Installed</Custom>
-      <Custom Action="InstallHomeDns" After="TraceBeforeServices">NOT Installed</Custom>
-      <Custom Action="InstallHomeHttp" After="InstallHomeDns">NOT Installed</Custom>
-      <Custom Action="RunWslInstall" Before="InstallFinalize">NOT Installed AND VersionNT &gt;= 1000</Custom>
-      <Custom Action="UninstallHomeDns" Before="RemoveFiles">Installed AND REMOVE="ALL"</Custom>
-      <Custom Action="UninstallHomeHttp" Before="RemoveFiles">Installed AND REMOVE="ALL"</Custom>
-    </InstallExecuteSequence>
-  </Fragment>
-
-  <!-- Custom Actions pour installer les services + WSL -->
-  <Fragment>
-    <!-- Forcer le scope machine -->
-    <Property Id="ALLUSERS" Value="1" />
-
-    <!-- Services install/uninstall (exécutés en mode élevé, deferred) -->
-    <CustomAction Id="InstallHomeDns" Directory="INSTALLDIR" ExeCommand='"[INSTALLDIR]home-dns.exe" install' Execute="deferred" Impersonate="no" Return="check" />
-    <CustomAction Id="InstallHomeHttp" Directory="INSTALLDIR" ExeCommand='"[INSTALLDIR]home-http.exe" install' Execute="deferred" Impersonate="no" Return="check" />
-    <CustomAction Id="UninstallHomeDns" Directory="INSTALLDIR" ExeCommand='"[INSTALLDIR]home-dns.exe" uninstall' Execute="deferred" Impersonate="no" Return="check" />
-    <CustomAction Id="UninstallHomeHttp" Directory="INSTALLDIR" ExeCommand='"[INSTALLDIR]home-http.exe" uninstall' Execute="deferred" Impersonate="no" Return="check" />
-
-    <!-- Trace immédiate pour valider l'exécution dans le log MSI -->
-    <CustomAction Id="TraceBeforeServices" Directory="SystemFolder"
-                  ExeCommand='cmd /C echo MSI Trace: entering service install phase >> "[INSTALLDIR]installer-msi.log"'
-                  Execute="immediate" Return="ignore" />
-
-    <!-- Action silencieuse via PowerShell pour WSL -->
-    <CustomAction Id="RunWslInstall" Directory="SystemFolder" ExeCommand='powershell -ExecutionPolicy Bypass -WindowStyle Hidden -Command "wsl --install --no-distribution"' Execute="deferred" Impersonate="no" Return="check" />
-
-    <!-- Ordonnancement -->
-    <InstallExecuteSequence>
-      <!-- Ordre: trace -> dns -> http, le tout avant InstallFinalize -->
-      <Custom Action="TraceBeforeServices" Before="InstallFinalize">NOT Installed</Custom>
-      <Custom Action="InstallHomeDns" After="TraceBeforeServices">NOT Installed</Custom>
-      <Custom Action="InstallHomeHttp" After="InstallHomeDns">NOT Installed</Custom>
-      <Custom Action="RunWslInstall" Before="InstallFinalize">NOT Installed AND VersionNT &gt;= 1000</Custom>
-      <Custom Action="UninstallHomeDns" Before="RemoveFiles">Installed AND REMOVE="ALL"</Custom>
-      <Custom Action="UninstallHomeHttp" Before="RemoveFiles">Installed AND REMOVE="ALL"</Custom>
-    </InstallExecuteSequence>
   </Fragment>
 </Wix>

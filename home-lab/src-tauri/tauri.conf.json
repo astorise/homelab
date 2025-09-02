@@ -35,10 +35,10 @@
       "icons/icon.ico"
     ],
     "resources":  {
-      "resources/logs":"logs",
-      "icons":"icons",
-      "bin/home-dns.exe":"home-dns.exe",
-      "bin/home-http.exe":"home-http.exe"
+      "resources/logs": "logs",
+      "resources/conf": "conf",
+      "resources/bin": "bin",
+      "icons": "icons"
     },
  
     "windows": {
@@ -49,6 +49,9 @@
       "wix": {
         "fragmentPaths": [
           "resources/install-services.wxi"
+        ],
+        "componentGroupRefs": [
+          "AppServices"
         ]
       }
     }
