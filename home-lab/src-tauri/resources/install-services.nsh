@@ -27,18 +27,37 @@ Var LOG_HANDLE
     CopyFiles /SILENT "$INSTDIR\http.yaml" "$INSTDIR\conf\http.yaml"
   ${EndIf}
   DetailPrint "Installing Windows services..."
-  nsExec::ExecToStack '"$INSTDIR\\bin\\home-dns.exe" install'
+  nsExec::ExecToStack '"$INSTDIR\bin\home-dns.exe" install'
   Pop $0
   Pop $1
   DetailPrint "home-dns.exe install => rc=$0 out=$1"
+  ${If} $0 != 0
+    DetailPrint "[WARN] home-dns.exe install returned $0"
+  ${EndIf}
   StrCmp $LOG_HANDLE "" +2
   FileWrite $LOG_HANDLE "home-dns.exe install => rc=$0 out=$1$\r$\n"
-  nsExec::ExecToStack '"$INSTDIR\\bin\\home-http.exe" install'
+  nsExec::ExecToStack '"$INSTDIR\bin\home-http.exe" install'
   Pop $0
   Pop $1
   DetailPrint "home-http.exe install => rc=$0 out=$1"
+  ${If} $0 != 0
+    DetailPrint "[WARN] home-http.exe install returned $0"
+  ${EndIf}
   StrCmp $LOG_HANDLE "" +2
   FileWrite $LOG_HANDLE "home-http.exe install => rc=$0 out=$1$\r$\n"
+  ; Try starting services right after install (best effort)
+  nsExec::ExecToStack 'sc.exe start HomeDnsService'
+  Pop $0
+  Pop $1
+  DetailPrint "sc start HomeDnsService => rc=$0 out=$1"
+  StrCmp $LOG_HANDLE "" +2
+  FileWrite $LOG_HANDLE "sc start HomeDnsService => rc=$0 out=$1$\r$\n"
+  nsExec::ExecToStack 'sc.exe start homehttp'
+  Pop $0
+  Pop $1
+  DetailPrint "sc start homehttp => rc=$0 out=$1"
+  StrCmp $LOG_HANDLE "" +2
+  FileWrite $LOG_HANDLE "sc start homehttp => rc=$0 out=$1$\r$\n"
     ; Exécution après installation
   ; Forcer l’élévation (si pas déjà perMachine)
   ; et lancer WSL sans distribution
@@ -50,13 +69,13 @@ Var LOG_HANDLE
 
 !macro NSIS_HOOK_POSTUNINSTALL
   DetailPrint "Uninstalling Windows services..."
-  nsExec::ExecToStack '"$INSTDIR\\bin\\home-dns.exe" uninstall'
+  nsExec::ExecToStack '"$INSTDIR\bin\home-dns.exe" uninstall'
   Pop $0
   Pop $1
   DetailPrint "home-dns.exe uninstall => rc=$0 out=$1"
   StrCmp $LOG_HANDLE "" +2
   FileWrite $LOG_HANDLE "home-dns.exe uninstall => rc=$0 out=$1$\r$\n"
-  nsExec::ExecToStack '"$INSTDIR\\bin\\home-http.exe" uninstall'
+  nsExec::ExecToStack '"$INSTDIR\bin\home-http.exe" uninstall'
   Pop $0
   Pop $1
   DetailPrint "home-http.exe uninstall => rc=$0 out=$1"
