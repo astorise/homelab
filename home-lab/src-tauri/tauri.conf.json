@@ -48,7 +48,7 @@
       },
       "wix": {
         "fragmentPaths": [
-          "resources/install-services.wxi"
+          "resources/install-services.wxs"
         ]
       }
     }
