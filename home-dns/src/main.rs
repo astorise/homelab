@@ -412,6 +412,7 @@ fn service_main(_args: Vec<OsString>) {
 }
 
 fn run_service() -> Result<()> {
+    info!("run_service: begin");
     let status_handle = service_control_handler::register(SERVICE_NAME, |event| match event {
         ServiceControl::Stop | ServiceControl::Shutdown => { STOP_REQUESTED.store(true, Ordering::SeqCst); ServiceControlHandlerResult::NoError }
         _ => ServiceControlHandlerResult::NotImplemented,
@@ -431,15 +432,25 @@ fn run_service() -> Result<()> {
     };
 
     set_status(ServiceState::StartPending);
+    info!("service control handler registered, state=StartPending");
 
+    let t0 = std::time::Instant::now();
     let cfg = load_config_or_init()?; let level = level_from_cfg(&cfg); init_logger(level)?;
     info!("Service starting (level={:?})", level);
+    info!("logger initialized in {:?}", t0.elapsed());
 
+    info!("restoring previous DNS state if any...");
+    let t_restore = std::time::Instant::now();
     let _ = restore_all();
+    info!("restore_all done in {:?}", t_restore.elapsed());
+    info!("snapshot_and_apply_all starting...");
+    let t_apply = std::time::Instant::now();
     let cfg = snapshot_and_apply_all(cfg)?;
+    info!("snapshot_and_apply_all finished in {:?}", t_apply.elapsed());
     let shared = SharedState { cfg: Arc::new(Mutex::new(cfg)), stopping: Arc::new(AtomicBool::new(false)) };
 
     let shared_clone = shared.clone();
+    info!("creating tokio runtime...");
     let rt = Runtime::new()?;
     rt.spawn(async move {
         let incoming = PipeIncoming::new(PIPE_NAME).map(|res| res.map(PipeConn));
@@ -455,7 +466,7 @@ fn run_service() -> Result<()> {
     });
 
     set_status(ServiceState::Running);
-    info!("Service running");
+    info!("Service running (startup total {:?})", t0.elapsed());
 
     while !STOP_REQUESTED.load(Ordering::SeqCst) && !shared.stopping.load(Ordering::SeqCst) {
         thread::sleep(Duration::from_millis(500));

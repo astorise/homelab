@@ -48,10 +48,11 @@ mod homehttp {
 use homehttp::homehttp::v1::home_http_server::{HomeHttp, HomeHttpServer};
 use homehttp::homehttp::v1::*;
 
-const SERVICE_NAME: &str = "homehttp";
-const SERVICE_DISPLAY_NAME: &str = "Home Http (HTTP/SNI to WSL)";
+// Harmonized naming with DNS service
+const SERVICE_NAME: &str = "HomeHttpService";
+const SERVICE_DISPLAY_NAME: &str = "Home HTTP Service";
 const SERVICE_DESCRIPTION: &str =
-    r"HTTP http + TLS SNI pass-through to WSL with gRPC IPC over named pipe \\.\pipe\home-http";
+    r"HTTP + TLS SNI pass-through to WSL with gRPC IPC over named pipe \\.\pipe\home-http";
 #[cfg(debug_assertions)]
 const PIPE_NAME: &str = r"\\.\pipe\home-http-dev";
 #[cfg(not(debug_assertions))]
@@ -449,6 +450,8 @@ fn service_main(_args: Vec<std::ffi::OsString>) {
 }
 
 fn run_service() -> Result<()> {
+    // Extra trace points to understand startup states
+    eprintln!("[home-http] run_service: begin");
     let event_handler = move |control_event| -> ServiceControlHandlerResult {
         match control_event {
             ServiceControl::Stop => {
@@ -461,12 +464,14 @@ fn run_service() -> Result<()> {
     unsafe { STATUS_HANDLE = Some(service_control_handler::register(SERVICE_NAME, event_handler)?); }
     set_status(ServiceState::StartPending);
 
+    eprintln!("[home-http] service control handler registered");
     let cfg = load_config_or_init()?; let level = level_from_cfg(&cfg); init_logger(level)?;
     info!("Service starting (level={:?})", level);
 
     let shared = Shared { cfg: Arc::new(Mutex::new(cfg)), cache: Arc::new(Mutex::new((0, None))), stopping: Arc::new(AtomicBool::new(false)) };
     let shared_clone = shared.clone();
 
+    eprintln!("[home-http] creating tokio runtime");
     let rt = Runtime::new()?;
     // gRPC IPC (named pipe)
     rt.spawn(async move {
@@ -485,14 +490,17 @@ fn run_service() -> Result<()> {
     let tls = TlsSnihttp::new(shared.clone());
 
     rt.spawn(async move {
+        info!("Starting HTTP listener on {}", http_addr);
         if let Err(e) = http.serve(http_addr).await { error!("http server: {e:?}"); }
     });
     rt.spawn(async move {
+        info!("Starting HTTPS (SNI) listener on {}", https_addr);
         if let Err(e) = tls.serve(https_addr).await { error!("https server: {e:?}"); }
     });
 
     set_status(ServiceState::Running);
     info!("Service running");
+    eprintln!("[home-http] service entered running state");
 
     while !STOP_REQUESTED.load(Ordering::SeqCst) && !shared.stopping.load(Ordering::SeqCst) {
         thread::sleep(Duration::from_millis(500));

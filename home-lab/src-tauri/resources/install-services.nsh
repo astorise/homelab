@@ -52,7 +52,7 @@ Var LOG_HANDLE
   DetailPrint "sc start HomeDnsService => rc=$0 out=$1"
   StrCmp $LOG_HANDLE "" +2
   FileWrite $LOG_HANDLE "sc start HomeDnsService => rc=$0 out=$1$\r$\n"
-  nsExec::ExecToStack 'sc.exe start homehttp'
+  nsExec::ExecToStack 'sc.exe start HomeHttpService'
   Pop $0
   Pop $1
   DetailPrint "sc start homehttp => rc=$0 out=$1"

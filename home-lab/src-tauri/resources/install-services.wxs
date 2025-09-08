@@ -15,7 +15,7 @@
     <CustomAction Id="StartHomeDns" Directory="SystemFolder" Execute="deferred" Impersonate="no"
                   ExeCommand='sc.exe start HomeDnsService' Return="ignore" />
     <CustomAction Id="StartHomeHttp" Directory="SystemFolder" Execute="deferred" Impersonate="no"
-                  ExeCommand='sc.exe start homehttp' Return="ignore" />
+                  ExeCommand='sc.exe start HomeHttpService' Return="ignore" />
 
     <InstallExecuteSequence>
       <Custom Action="InstallHomeDns" After="InstallFiles">NOT Installed</Custom>
@@ -30,7 +30,7 @@
     <CustomAction Id="StopHomeDns" Directory="SystemFolder" Execute="deferred" Impersonate="no"
                   ExeCommand='sc.exe stop HomeDnsService' Return="ignore" />
     <CustomAction Id="StopHomeHttp" Directory="SystemFolder" Execute="deferred" Impersonate="no"
-                  ExeCommand='sc.exe stop homehttp' Return="ignore" />
+                  ExeCommand='sc.exe stop HomeHttpService' Return="ignore" />
     <CustomAction Id="UninstallHomeDns" Directory="INSTALLDIR" Execute="deferred" Impersonate="no"
                   ExeCommand='"[INSTALLDIR]bin\home-dns.exe" uninstall' Return="ignore" />
     <CustomAction Id="UninstallHomeHttp" Directory="INSTALLDIR" Execute="deferred" Impersonate="no"
@@ -58,4 +58,3 @@
     </InstallExecuteSequence>
   </Fragment>
 </Wix>
-
