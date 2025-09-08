@@ -38,6 +38,10 @@ use windows_service::service::*;
 use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
 use windows_service::{define_windows_service, service_manager::*};
 
+// Build metadata (set in build.rs)
+const BUILD_GIT_SHA: &str = env!("BUILD_GIT_SHA");
+const BUILD_GIT_TAG: &str = env!("BUILD_GIT_TAG");
+const BUILD_TIME: &str = env!("BUILD_TIME");
 mod homehttp {
     pub mod homehttp {
         pub mod v1 {
@@ -467,6 +471,7 @@ fn run_service() -> Result<()> {
     eprintln!("[home-http] service control handler registered");
     let cfg = load_config_or_init()?; let level = level_from_cfg(&cfg); init_logger(level)?;
     info!("Service starting (level={:?})", level);
+    info!("build tag={} sha={} at {}", BUILD_GIT_TAG, BUILD_GIT_SHA, BUILD_TIME);
 
     let shared = Shared { cfg: Arc::new(Mutex::new(cfg)), cache: Arc::new(Mutex::new((0, None))), stopping: Arc::new(AtomicBool::new(false)) };
     let shared_clone = shared.clone();

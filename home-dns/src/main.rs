@@ -25,6 +25,10 @@ use windows_service::service::*;
 use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
 use windows_service::service_manager::*;
 
+// Build metadata (set in build.rs)
+const BUILD_GIT_SHA: &str = env!("BUILD_GIT_SHA");
+const BUILD_GIT_TAG: &str = env!("BUILD_GIT_TAG");
+const BUILD_TIME: &str = env!("BUILD_TIME");
 mod homedns {
     pub mod homedns {
         pub mod v1 {
@@ -437,6 +441,7 @@ fn run_service() -> Result<()> {
     let t0 = std::time::Instant::now();
     let cfg = load_config_or_init()?; let level = level_from_cfg(&cfg); init_logger(level)?;
     info!("Service starting (level={:?})", level);
+    info!("build tag={} sha={} at {}", BUILD_GIT_TAG, BUILD_GIT_SHA, BUILD_TIME);
     info!("logger initialized in {:?}", t0.elapsed());
 
     info!("restoring previous DNS state if any...");

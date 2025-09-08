@@ -38,7 +38,8 @@
       "resources/logs": "logs",
       "resources/conf": "conf",
       "resources/bin": "bin",
-      "icons": "icons"
+      "icons": "icons",
+      "resources/version.txt": "version.txt"
     },
  
     "windows": {
