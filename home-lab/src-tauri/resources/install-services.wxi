@@ -57,4 +57,21 @@
       <ComponentRef Id="CmpHomeHttpSvc"/>
     </FeatureRef>
   </Fragment>
+  <Fragment>
+    <CustomAction Id="TraceBeforeServices" Directory="SystemFolder"
+                  ExeCommand='cmd /C echo MSI Trace: before InstallServices >> "[INSTALLDIR]installer-msi.log"'
+                  Execute="immediate" Return="ignore" />
+    <CustomAction Id="TraceAfterServices" Directory="SystemFolder"
+                  ExeCommand='cmd /C echo MSI Trace: after InstallServices >> "[INSTALLDIR]installer-msi.log"'
+                  Execute="immediate" Return="ignore" />
+    <CustomAction Id="TraceBeforeStartServices" Directory="SystemFolder"
+                  ExeCommand='cmd /C echo MSI Trace: before StartServices >> "[INSTALLDIR]installer-msi.log"'
+                  Execute="immediate" Return="ignore" />
+
+    <InstallExecuteSequence>
+      <Custom Action="TraceBeforeServices" Before="InstallServices">NOT Installed</Custom>
+      <Custom Action="TraceAfterServices" After="InstallServices">NOT Installed</Custom>
+      <Custom Action="TraceBeforeStartServices" Before="StartServices">NOT Installed</Custom>
+    </InstallExecuteSequence>
+  </Fragment>
 </Wix>
