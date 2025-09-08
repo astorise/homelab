@@ -403,12 +403,10 @@ define_windows_service!(ffi_service_main, service_main);
 static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 fn service_main(_args: Vec<OsString>) {
-    if let Err(e) = init_logger(LevelFilter::Info) {
-        eprintln!("logger init failed: {e:?}");
-        return;
-    }
+    // Le logger est initialisé dans run_service() selon la config.
+    // L'initialiser ici provoquait une double initialisation et un échec au démarrage du service.
     if let Err(e) = run_service() {
-        error!("[home-dns] FATAL: {e:?}");
+        eprintln!("[home-dns] FATAL: {e:?}");
         let _ = restore_all();
     }
 }
