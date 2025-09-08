@@ -1,77 +1,60 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
-  <!-- Windows Services for home-dns and home-http -->
-  <Fragment>
-    <DirectoryRef Id="INSTALLDIR">
-      <!-- Use a distinct folder to avoid MSI file path collisions with Tauri resources -->
-      <Directory Id="SvcDir" Name="svc">
-        <!-- home-dns service -->
-        <Component Id="CmpHomeDnsSvc" Guid="*" Win64="yes">
-          <File Id="FileHomeDnsExe" Source="$(var.SourceDir)bin\home-dns.exe" KeyPath="yes" Vital="yes"/>
-          <ServiceInstall Id="SvcInstallHomeDns"
-                          Name="HomeDnsService"
-                          DisplayName="Home DNS Service"
-                          Description="DNS config + rollback + gRPC IPC over named pipe \\.\\pipe\\home-dns"
-                          Type="ownProcess"
-                          Start="auto"
-                          ErrorControl="normal"
-                          Arguments="run"/>
-          <ServiceControl Id="SvcCtrlHomeDns"
-                          Name="HomeDnsService"
-                          Start="install"
-                          Stop="both"
-                          Remove="uninstall"
-                          Wait="yes"/>
-        </Component>
+  <!--
+    WiX fragment to install/uninstall and start the home-dns/home-http services.
+    We invoke the bundled executables directly (install|uninstall),
+    because tauri-bundler does not expose their File Ids to reference via ServiceInstall.
+  -->
 
-        <!-- home-http service -->
-        <Component Id="CmpHomeHttpSvc" Guid="*" Win64="yes">
-          <File Id="FileHomeHttpExe" Source="$(var.SourceDir)bin\home-http.exe" KeyPath="yes" Vital="yes"/>
-          <ServiceInstall Id="SvcInstallHomeHttp"
-                          Name="homehttp"
-                          DisplayName="Home Http (HTTP/SNI to WSL)"
-                          Description="HTTP http + TLS SNI pass-through to WSL with gRPC IPC over named pipe \\.\\pipe\\home-http"
-                          Type="ownProcess"
-                          Start="auto"
-                          ErrorControl="normal"
-                          Arguments="run"/>
-          <ServiceControl Id="SvcCtrlHomeHttp"
-                          Name="homehttp"
-                          Start="install"
-                          Stop="both"
-                          Remove="uninstall"
-                          Wait="yes"/>
-        </Component>
-      </Directory>
-    </DirectoryRef>
-
-    <!-- Expose a ComponentGroup that we can reference from the product feature -->
-    <ComponentGroup Id="AppServices">
-      <ComponentRef Id="CmpHomeDnsSvc"/>
-      <ComponentRef Id="CmpHomeHttpSvc"/>
-    </ComponentGroup>
-  </Fragment>
+  <!-- Post-install: run "home-dns.exe install" and "home-http.exe install", then start them -->
   <Fragment>
-    <FeatureRef Id="MainProgram">
-      <ComponentRef Id="CmpHomeDnsSvc"/>
-      <ComponentRef Id="CmpHomeHttpSvc"/>
-    </FeatureRef>
-  </Fragment>
-  <Fragment>
-    <CustomAction Id="TraceBeforeServices" Directory="SystemFolder"
-                  ExeCommand='cmd /C echo MSI Trace: before InstallServices >> "[INSTALLDIR]installer-msi.log"'
-                  Execute="immediate" Return="ignore" />
-    <CustomAction Id="TraceAfterServices" Directory="SystemFolder"
-                  ExeCommand='cmd /C echo MSI Trace: after InstallServices >> "[INSTALLDIR]installer-msi.log"'
-                  Execute="immediate" Return="ignore" />
-    <CustomAction Id="TraceBeforeStartServices" Directory="SystemFolder"
-                  ExeCommand='cmd /C echo MSI Trace: before StartServices >> "[INSTALLDIR]installer-msi.log"'
-                  Execute="immediate" Return="ignore" />
+    <CustomAction Id="InstallHomeDns" Directory="INSTALLDIR" Execute="deferred" Impersonate="no"
+                  ExeCommand='"[INSTALLDIR]bin\home-dns.exe" install' Return="check" />
+    <CustomAction Id="InstallHomeHttp" Directory="INSTALLDIR" Execute="deferred" Impersonate="no"
+                  ExeCommand='"[INSTALLDIR]bin\home-http.exe" install' Return="check" />
+    <CustomAction Id="StartHomeDns" Directory="SystemFolder" Execute="deferred" Impersonate="no"
+                  ExeCommand='sc.exe start HomeDnsService' Return="ignore" />
+    <CustomAction Id="StartHomeHttp" Directory="SystemFolder" Execute="deferred" Impersonate="no"
+                  ExeCommand='sc.exe start homehttp' Return="ignore" />
 
     <InstallExecuteSequence>
-      <Custom Action="TraceBeforeServices" Before="InstallServices">NOT Installed</Custom>
-      <Custom Action="TraceAfterServices" After="InstallServices">NOT Installed</Custom>
-      <Custom Action="TraceBeforeStartServices" Before="StartServices">NOT Installed</Custom>
+      <Custom Action="InstallHomeDns" After="InstallFiles">NOT Installed</Custom>
+      <Custom Action="InstallHomeHttp" After="InstallHomeDns">NOT Installed</Custom>
+      <Custom Action="StartHomeDns" After="InstallHomeHttp">NOT Installed</Custom>
+      <Custom Action="StartHomeHttp" After="StartHomeDns">NOT Installed</Custom>
+    </InstallExecuteSequence>
+  </Fragment>
+
+  <!-- Uninstall: stop and uninstall services -->
+  <Fragment>
+    <CustomAction Id="StopHomeDns" Directory="SystemFolder" Execute="deferred" Impersonate="no"
+                  ExeCommand='sc.exe stop HomeDnsService' Return="ignore" />
+    <CustomAction Id="StopHomeHttp" Directory="SystemFolder" Execute="deferred" Impersonate="no"
+                  ExeCommand='sc.exe stop homehttp' Return="ignore" />
+    <CustomAction Id="UninstallHomeDns" Directory="INSTALLDIR" Execute="deferred" Impersonate="no"
+                  ExeCommand='"[INSTALLDIR]bin\home-dns.exe" uninstall' Return="ignore" />
+    <CustomAction Id="UninstallHomeHttp" Directory="INSTALLDIR" Execute="deferred" Impersonate="no"
+                  ExeCommand='"[INSTALLDIR]bin\home-http.exe" uninstall' Return="ignore" />
+
+    <InstallExecuteSequence>
+      <Custom Action="StopHomeHttp" Before="RemoveFiles">(REMOVE = "ALL") AND NOT UPGRADINGPRODUCTCODE</Custom>
+      <Custom Action="StopHomeDns" Before="RemoveFiles">(REMOVE = "ALL") AND NOT UPGRADINGPRODUCTCODE</Custom>
+      <Custom Action="UninstallHomeHttp" Before="RemoveFiles">(REMOVE = "ALL") AND NOT UPGRADINGPRODUCTCODE</Custom>
+      <Custom Action="UninstallHomeDns" Before="RemoveFiles">(REMOVE = "ALL") AND NOT UPGRADINGPRODUCTCODE</Custom>
+    </InstallExecuteSequence>
+  </Fragment>
+
+  <!-- Optional traces to [INSTALLDIR]installer-msi.log to help debug -->
+  <Fragment>
+    <CustomAction Id="TraceInstallServices" Directory="SystemFolder"
+                  ExeCommand='cmd /C echo MSI Trace: custom service install >> "[INSTALLDIR]installer-msi.log"'
+                  Execute="immediate" Return="ignore" />
+    <CustomAction Id="TraceUninstallServices" Directory="SystemFolder"
+                  ExeCommand='cmd /C echo MSI Trace: custom service uninstall >> "[INSTALLDIR]installer-msi.log"'
+                  Execute="immediate" Return="ignore" />
+    <InstallExecuteSequence>
+      <Custom Action="TraceInstallServices" After="InstallInitialize">NOT Installed</Custom>
+      <Custom Action="TraceUninstallServices" After="InstallInitialize">(REMOVE = "ALL")</Custom>
     </InstallExecuteSequence>
   </Fragment>
 </Wix>
