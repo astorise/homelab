@@ -381,20 +381,21 @@ impl PipeIncoming {
         std::thread::spawn(move || {
             let rt = Runtime::new().expect("tokio rt");
             rt.block_on(async move {
+                // Create one server at a time and await connection before creating the next.
+                // This avoids unbounded pipe instances piling up (memory/CPU leak).
+                let mut first = true;
                 loop {
                     let created = ServerOptions::new()
-                        .first_pipe_instance(true)
+                        .first_pipe_instance(first)
                         .create(&name)
                         .or_else(|_| ServerOptions::new().first_pipe_instance(false).create(&name));
                     match created {
                         Ok(server) => {
-                            let txc = tx.clone();
-                            tokio::spawn(async move {
-                                match server.connect().await {
-                                    Ok(()) => { let _ = txc.send(Ok(server)).await; }
-                                    Err(e) => { let _ = txc.send(Err(e)).await; }
-                                }
-                            });
+                            first = false; // subsequent instances are not first
+                            match server.connect().await {
+                                Ok(()) => { let _ = tx.send(Ok(server)).await; }
+                                Err(e) => { let _ = tx.send(Err(e)).await; tokio::time::sleep(Duration::from_millis(200)).await; }
+                            }
                         }
                         Err(e) => {
                             let _ = tx.send(Err(e)).await;
@@ -549,7 +550,12 @@ fn run_console() -> Result<()> {
 
 fn install_service() -> Result<()> {
     let cfg = load_config_or_init()?; init_logger(level_from_cfg(&cfg))?;
-    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CREATE_SERVICE)?;
+    // Try to open if already installed to keep install idempotent.
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE)?;
+    if let Ok(_svc) = manager.open_service(SERVICE_NAME, ServiceAccess::QUERY_STATUS) {
+        info!("Service already installed");
+        return Ok(());
+    }
     let exe_path = std::env::current_exe()?;
     let service_info = ServiceInfo {
         name: OsString::from(SERVICE_NAME),

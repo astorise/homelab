@@ -249,19 +249,23 @@ impl PipeIncoming {
         let (tx, rx) = mpsc::channel(16);
         let name = name.to_string();
         tokio::spawn(async move {
+            // Create one pipe instance at a time and await connect
+            // to avoid unbounded pending instances (memory/CPU leak).
+            let mut first = true;
             loop {
-                let try_first = ServerOptions::new().first_pipe_instance(true).create(&name)
+                let created = ServerOptions::new()
+                    .first_pipe_instance(first)
+                    .create(&name)
                     .or_else(|_| ServerOptions::new().first_pipe_instance(false).create(&name));
-                match try_first {
+                match created {
                     Ok(pipe) => {
-                        let txc = tx.clone();
-                        tokio::spawn(async move {
-                            if let Err(e) = pipe.connect().await {
-                                let _ = txc.send(Err(e)).await;
-                            } else {
-                                let _ = txc.send(Ok(pipe)).await;
-                            }
-                        });
+                        first = false;
+                        if let Err(e) = pipe.connect().await {
+                            let _ = tx.send(Err(e)).await;
+                            tokio::time::sleep(Duration::from_millis(200)).await;
+                        } else {
+                            let _ = tx.send(Ok(pipe)).await;
+                        }
                     }
                     Err(e) => {
                         let _ = tx.send(Err(e)).await;
@@ -509,7 +513,12 @@ fn run_service() -> Result<()> {
 
 fn install_service() -> Result<()> {
     let exe_path = std::env::current_exe()?;
-    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CREATE_SERVICE)?;
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE)?;
+    // Idempotent install: if service exists, do nothing.
+    if let Ok(_svc) = manager.open_service(SERVICE_NAME, ServiceAccess::QUERY_STATUS) {
+        info!("Service already installed");
+        return Ok(());
+    }
     let service_info = ServiceInfo {
         name: SERVICE_NAME.into(),
         display_name: SERVICE_DISPLAY_NAME.into(),
