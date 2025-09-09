@@ -580,7 +580,23 @@ fn uninstall_service() -> Result<()> {
     init_logger(LevelFilter::Info)?;
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
     let service = manager.open_service(SERVICE_NAME, ServiceAccess::STOP | ServiceAccess::QUERY_STATUS | ServiceAccess::DELETE)?;
-    let _ = service.stop(); service.delete()?; info!("Service uninstalled"); Ok(())
+    let _ = service.stop();
+    for _ in 0..20 {
+        if let Ok(st) = service.query_status() {
+            if st.current_state == ServiceState::Stopped { break; }
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    service.delete()?;
+    drop(service);
+    for _ in 0..20 {
+        match manager.open_service(SERVICE_NAME, ServiceAccess::QUERY_STATUS) {
+            Ok(s) => { drop(s); std::thread::sleep(Duration::from_millis(250)); }
+            Err(_) => break,
+        }
+    }
+    info!("Service uninstalled");
+    Ok(())
 }
 
 fn configure_recovery_action_run_restore(exe: &Path) -> Result<()> {

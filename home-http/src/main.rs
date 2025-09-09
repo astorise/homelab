@@ -538,8 +538,25 @@ fn install_service() -> Result<()> {
 
 fn uninstall_service() -> Result<()> {
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
-    let service = manager.open_service(SERVICE_NAME, ServiceAccess::DELETE | ServiceAccess::STOP | ServiceAccess::QUERY_STATUS)?;
-    service.delete()?; Ok(())
+    let service = manager.open_service(SERVICE_NAME, ServiceAccess::STOP | ServiceAccess::QUERY_STATUS | ServiceAccess::DELETE)?;
+    // Request stop and wait a bit for it
+    let _ = service.stop();
+    for _ in 0..20 {
+        if let Ok(st) = service.query_status() {
+            if st.current_state == ServiceState::Stopped { break; }
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    service.delete()?;
+    drop(service);
+    // Wait until SCM no longer returns the service; tolerate races
+    for _ in 0..20 {
+        match manager.open_service(SERVICE_NAME, ServiceAccess::QUERY_STATUS) {
+            Ok(s) => { drop(s); std::thread::sleep(Duration::from_millis(250)); }
+            Err(_) => break,
+        }
+    }
+    Ok(())
 }
 
 fn usage() { eprintln!("Usage: home-http [run|install|uninstall|console]"); }

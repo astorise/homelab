@@ -86,7 +86,25 @@ Var LOG_HANDLE
     DetailPrint "[uninstall] Logging to $LOG_FILE"
   ${EndIf}
 
-  DetailPrint "Stopping Windows services..."
+  DetailPrint "Invoking service uninstallers..."
+  ${If} ${FileExists} "$INSTDIR\bin\home-http.exe"
+    nsExec::ExecToStack '"$INSTDIR\bin\home-http.exe" uninstall'
+    Pop $0
+    Pop $1
+    DetailPrint "home-http.exe uninstall => rc=$0 out=$1"
+    StrCmp $LOG_HANDLE "" +2
+    FileWrite $LOG_HANDLE "home-http.exe uninstall => rc=$0 out=$1$\r$\n"
+  ${EndIf}
+  ${If} ${FileExists} "$INSTDIR\bin\home-dns.exe"
+    nsExec::ExecToStack '"$INSTDIR\bin\home-dns.exe" uninstall'
+    Pop $0
+    Pop $1
+    DetailPrint "home-dns.exe uninstall => rc=$0 out=$1"
+    StrCmp $LOG_HANDLE "" +2
+    FileWrite $LOG_HANDLE "home-dns.exe uninstall => rc=$0 out=$1$\r$\n"
+  ${EndIf}
+
+  DetailPrint "Stopping Windows services (fallback)..."
   nsExec::ExecToStack 'sc.exe stop HomeHttpService'
   Pop $0
   Pop $1

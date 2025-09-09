@@ -42,12 +42,12 @@
                   ExeCommand='sc.exe delete HomeHttpService' Return="ignore" />
 
     <InstallExecuteSequence>
-      <Custom Action="StopHomeHttp" Before="RemoveFiles">(REMOVE = "ALL") AND NOT UPGRADINGPRODUCTCODE</Custom>
-      <Custom Action="StopHomeDns" Before="RemoveFiles">(REMOVE = "ALL") AND NOT UPGRADINGPRODUCTCODE</Custom>
-      <Custom Action="UninstallHomeHttp" Before="RemoveFiles">(REMOVE = "ALL") AND NOT UPGRADINGPRODUCTCODE</Custom>
-      <Custom Action="UninstallHomeDns" Before="RemoveFiles">(REMOVE = "ALL") AND NOT UPGRADINGPRODUCTCODE</Custom>
-      <Custom Action="DeleteHomeHttp" Before="RemoveFiles">(REMOVE = "ALL") AND NOT UPGRADINGPRODUCTCODE</Custom>
-      <Custom Action="DeleteHomeDns" Before="RemoveFiles">(REMOVE = "ALL") AND NOT UPGRADINGPRODUCTCODE</Custom>
+      <Custom Action="StopHomeHttp" Before="RemoveFiles">(REMOVE = "ALL")</Custom>
+      <Custom Action="StopHomeDns" Before="RemoveFiles">(REMOVE = "ALL")</Custom>
+      <Custom Action="UninstallHomeHttp" Before="RemoveFiles">(REMOVE = "ALL")</Custom>
+      <Custom Action="UninstallHomeDns" Before="RemoveFiles">(REMOVE = "ALL")</Custom>
+      <Custom Action="DeleteHomeHttp" Before="RemoveFiles">(REMOVE = "ALL")</Custom>
+      <Custom Action="DeleteHomeDns" Before="RemoveFiles">(REMOVE = "ALL")</Custom>
     </InstallExecuteSequence>
   </Fragment>
 
