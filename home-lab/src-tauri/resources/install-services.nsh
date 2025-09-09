@@ -68,21 +68,63 @@ Var LOG_HANDLE
 !macroend
 
 !macro NSIS_HOOK_POSTUNINSTALL
-  DetailPrint "Uninstalling Windows services..."
-  nsExec::ExecToStack '"$INSTDIR\bin\home-dns.exe" uninstall'
-  Pop $0
-  Pop $1
-  DetailPrint "home-dns.exe uninstall => rc=$0 out=$1"
-  StrCmp $LOG_HANDLE "" +2
-  FileWrite $LOG_HANDLE "home-dns.exe uninstall => rc=$0 out=$1$\r$\n"
-  nsExec::ExecToStack '"$INSTDIR\bin\home-http.exe" uninstall'
-  Pop $0
-  Pop $1
-  DetailPrint "home-http.exe uninstall => rc=$0 out=$1"
-  StrCmp $LOG_HANDLE "" +2
-  FileWrite $LOG_HANDLE "home-http.exe uninstall => rc=$0 out=$1$\r$\n"
+  ; Post-uninstall: just close the log if opened in PREUNINSTALL
   StrCmp $LOG_HANDLE "" +2
   FileClose $LOG_HANDLE
+!macroend
+
+
+; Ensure services are stopped and deleted BEFORE files are removed
+!macro NSIS_HOOK_PREUNINSTALL
+  SetDetailsPrint both
+  StrCpy $LOG_FILE "$INSTDIR\installer.log"
+  ClearErrors
+  FileOpen $LOG_HANDLE $LOG_FILE a
+  ${If} ${Errors}
+    DetailPrint "[uninstall] Unable to open $LOG_FILE for appending"
+  ${Else}
+    DetailPrint "[uninstall] Logging to $LOG_FILE"
+  ${EndIf}
+
+  DetailPrint "Stopping Windows services..."
+  nsExec::ExecToStack 'sc.exe stop HomeHttpService'
+  Pop $0
+  Pop $1
+  DetailPrint "sc stop HomeHttpService => rc=$0 out=$1"
+  StrCmp $LOG_HANDLE "" +2
+  FileWrite $LOG_HANDLE "sc stop HomeHttpService => rc=$0 out=$1$\r$\n"
+
+  nsExec::ExecToStack 'sc.exe stop HomeDnsService'
+  Pop $0
+  Pop $1
+  DetailPrint "sc stop HomeDnsService => rc=$0 out=$1"
+  StrCmp $LOG_HANDLE "" +2
+  FileWrite $LOG_HANDLE "sc stop HomeDnsService => rc=$0 out=$1$\r$\n"
+
+  ; Best-effort: restore DNS settings explicitly (service also restores on stop)
+  ${If} ${FileExists} "$INSTDIR\bin\home-dns.exe"
+    nsExec::ExecToStack '"$INSTDIR\bin\home-dns.exe" restore'
+    Pop $0
+    Pop $1
+    DetailPrint "home-dns.exe restore => rc=$0 out=$1"
+    StrCmp $LOG_HANDLE "" +2
+    FileWrite $LOG_HANDLE "home-dns.exe restore => rc=$0 out=$1$\r$\n"
+  ${EndIf}
+
+  DetailPrint "Deleting Windows services..."
+  nsExec::ExecToStack 'sc.exe delete HomeHttpService'
+  Pop $0
+  Pop $1
+  DetailPrint "sc delete HomeHttpService => rc=$0 out=$1"
+  StrCmp $LOG_HANDLE "" +2
+  FileWrite $LOG_HANDLE "sc delete HomeHttpService => rc=$0 out=$1$\r$\n"
+
+  nsExec::ExecToStack 'sc.exe delete HomeDnsService'
+  Pop $0
+  Pop $1
+  DetailPrint "sc delete HomeDnsService => rc=$0 out=$1"
+  StrCmp $LOG_HANDLE "" +2
+  FileWrite $LOG_HANDLE "sc delete HomeDnsService => rc=$0 out=$1$\r$\n"
 !macroend
 
 

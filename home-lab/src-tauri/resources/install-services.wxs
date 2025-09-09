@@ -35,12 +35,19 @@
                   ExeCommand='"[INSTALLDIR]bin\home-dns.exe" uninstall' Return="ignore" />
     <CustomAction Id="UninstallHomeHttp" Directory="INSTALLDIR" Execute="deferred" Impersonate="no"
                   ExeCommand='"[INSTALLDIR]bin\home-http.exe" uninstall' Return="ignore" />
+    <!-- Fallback removal via SC in case binaries are missing or uninstall fails -->
+    <CustomAction Id="DeleteHomeDns" Directory="SystemFolder" Execute="deferred" Impersonate="no"
+                  ExeCommand='sc.exe delete HomeDnsService' Return="ignore" />
+    <CustomAction Id="DeleteHomeHttp" Directory="SystemFolder" Execute="deferred" Impersonate="no"
+                  ExeCommand='sc.exe delete HomeHttpService' Return="ignore" />
 
     <InstallExecuteSequence>
       <Custom Action="StopHomeHttp" Before="RemoveFiles">(REMOVE = "ALL") AND NOT UPGRADINGPRODUCTCODE</Custom>
       <Custom Action="StopHomeDns" Before="RemoveFiles">(REMOVE = "ALL") AND NOT UPGRADINGPRODUCTCODE</Custom>
       <Custom Action="UninstallHomeHttp" Before="RemoveFiles">(REMOVE = "ALL") AND NOT UPGRADINGPRODUCTCODE</Custom>
       <Custom Action="UninstallHomeDns" Before="RemoveFiles">(REMOVE = "ALL") AND NOT UPGRADINGPRODUCTCODE</Custom>
+      <Custom Action="DeleteHomeHttp" Before="RemoveFiles">(REMOVE = "ALL") AND NOT UPGRADINGPRODUCTCODE</Custom>
+      <Custom Action="DeleteHomeDns" Before="RemoveFiles">(REMOVE = "ALL") AND NOT UPGRADINGPRODUCTCODE</Custom>
     </InstallExecuteSequence>
   </Fragment>
 
