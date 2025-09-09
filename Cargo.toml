@@ -3,6 +3,7 @@ members = [
   "home-dns",
   "home-http",
   "home-lab/src-tauri",
+  "pipe-test"
 ]
 resolver = "3"
 
@@ -19,3 +20,4 @@ windows-service = "0.8.0"
 [profile.release]
 lto = "thin"
 codegen-units = 1
+

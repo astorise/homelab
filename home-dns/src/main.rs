@@ -382,14 +382,24 @@ impl PipeIncoming {
             let rt = Runtime::new().expect("tokio rt");
             rt.block_on(async move {
                 loop {
-                    match ServerOptions::new().first_pipe_instance(true).create(&name) {
+                    let created = ServerOptions::new()
+                        .first_pipe_instance(true)
+                        .create(&name)
+                        .or_else(|_| ServerOptions::new().first_pipe_instance(false).create(&name));
+                    match created {
                         Ok(server) => {
-                            match server.connect().await {
-                                Ok(()) => { if tx.send(Ok(server)).await.is_err() { break; } }
-                                Err(e) => { let _ = tx.send(Err(e)).await; break; }
-                            }
+                            let txc = tx.clone();
+                            tokio::spawn(async move {
+                                match server.connect().await {
+                                    Ok(()) => { let _ = txc.send(Ok(server)).await; }
+                                    Err(e) => { let _ = txc.send(Err(e)).await; }
+                                }
+                            });
                         }
-                        Err(e) => { let _ = tx.blocking_send(Err(e)); break; }
+                        Err(e) => {
+                            let _ = tx.send(Err(e)).await;
+                            tokio::time::sleep(Duration::from_millis(200)).await;
+                        }
                     }
                 }
             });
