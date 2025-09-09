@@ -1,11 +1,12 @@
 [package]
 name = "home-http"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 [build-dependencies]
-protoc-bin-vendored = "3.2"
-tonic-build = "0.12"
+protoc-bin-vendored = "3"
+prost-build = "0.12"
+tonic-build = "0.11"
 chrono = "0.4"
 
 [dependencies]
@@ -22,11 +23,11 @@ parking_lot = "0.12"
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 thiserror = "2.0"
-tonic = { version = "0.12", features = ["transport"] }
-prost = "0.13"
+tonic = { version = "0.11", features = ["transport"] }
+prost = "0.12"
 chrono = "0.4"
-tokio = { version = "1", features = ["full"] }
-windows-service = "0.8"
+tokio = { workspace = true, features = ["full"] }
+windows-service = { workspace = true }
 sysinfo = "0.37"
 
 

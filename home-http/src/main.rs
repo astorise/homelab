@@ -100,20 +100,19 @@ fn init_logger(level: LevelFilter) -> Result<()> {
         eprintln!("cannot create log directory {}: {e}", dir.display());
         e
     })?;
-    Logger::try_with_env_or_str(format!("{level}"))?
+    let logger = Logger::try_with_env_or_str(format!("{level}"))?
         .log_to_file(
             FileSpec::default()
-                .directory(dir)
+                .directory(&dir)
                 .basename("home-http")
                 .suffix("log"),
         )
         .duplicate_to_stderr(Duplicate::Error)
-        .rotate(Criterion::Age(Age::Day), Naming::Timestamps, Cleanup::KeepLogFiles(14))
-        .start()
-        .map_err(|e| {
-            eprintln!("failed to start logger: {e}");
-            e
-        })?;
+        .rotate(Criterion::Age(Age::Day), Naming::Timestamps, Cleanup::KeepLogFiles(14));
+    match logger.start() {
+        Ok(_) => {}
+        Err(e) => { eprintln!("failed to start logger (continuing): {e}"); }
+    }
     Ok(())
 }
 
@@ -425,25 +424,7 @@ fn parse_sni(mut buf: &[u8]) -> Result<String> {
 }
 
 // ---- Service Windows ----
-static mut STATUS_HANDLE: Option<windows_service::service_control_handler::ServiceStatusHandle> = None;
 static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
-
-#[allow(static_mut_refs)]
-fn set_status(state: ServiceState) {
-    unsafe {
-        if let Some(h) = &STATUS_HANDLE {
-            let _ = h.set_service_status(ServiceStatus {
-                service_type: ServiceType::OWN_PROCESS,
-                current_state: state,
-                controls_accepted: ServiceControlAccept::STOP,
-                exit_code: ServiceExitCode::Win32(0),
-                checkpoint: 0,
-                wait_hint: Duration::from_secs(10),
-                process_id: None,
-            });
-        }
-    }
-}
 
 define_windows_service!(ffi_service_main, service_main);
 #[allow(dead_code)]
@@ -454,8 +435,6 @@ fn service_main(_args: Vec<std::ffi::OsString>) {
 }
 
 fn run_service() -> Result<()> {
-    // Extra trace points to understand startup states
-    eprintln!("[home-http] run_service: begin");
     let event_handler = move |control_event| -> ServiceControlHandlerResult {
         match control_event {
             ServiceControl::Stop => {
@@ -465,7 +444,18 @@ fn run_service() -> Result<()> {
             _ => ServiceControlHandlerResult::NotImplemented,
         }
     };
-    unsafe { STATUS_HANDLE = Some(service_control_handler::register(SERVICE_NAME, event_handler)?); }
+    let status_handle = service_control_handler::register(SERVICE_NAME, event_handler)?;
+    let set_status = |state: ServiceState| {
+        let _ = status_handle.set_service_status(ServiceStatus {
+            service_type: ServiceType::OWN_PROCESS,
+            current_state: state,
+            controls_accepted: ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,
+            exit_code: ServiceExitCode::Win32(0),
+            checkpoint: 0,
+            wait_hint: Duration::from_secs(10),
+            process_id: None,
+        });
+    };
     set_status(ServiceState::StartPending);
 
     eprintln!("[home-http] service control handler registered");
@@ -550,7 +540,12 @@ fn main() -> Result<()> {
     if args.len() <= 1 { usage(); return Ok(()); }
     match args[1].as_str() {
         "run" => {
-            #[cfg(windows)] { return run_service(); }
+            #[cfg(windows)] {
+                if let Err(e) = windows_service::service_dispatcher::start(SERVICE_NAME, ffi_service_main) {
+                    eprintln!("service dispatcher start error: {e:?}");
+                }
+                return Ok(());
+            }
             #[cfg(not(windows))] { anyhow::bail!("Windows only"); }
         }
         "install" => { install_service()?; println!("Service installé. Modifiez {} puis démarrez le service.", config_path().display()); }

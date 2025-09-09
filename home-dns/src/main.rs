@@ -99,16 +99,18 @@ fn init_logger(level: LevelFilter) -> Result<()> {
         eprintln!("cannot create log directory {}: {e}", dir.display());
         e
     })?;
-    Logger::try_with_str(match level { LevelFilter::Debug => "debug", _ => "info" })?
-        .log_to_file(FileSpec::default().directory(dir).basename("home-dns").suffix("log"))
+    let logger = Logger::try_with_str(match level { LevelFilter::Debug => "debug", _ => "info" })?
+        .log_to_file(FileSpec::default().directory(&dir).basename("home-dns").suffix("log"))
         .format(flexi_logger::detailed_format)
         .duplicate_to_stderr(Duplicate::Info)
-        .rotate(Criterion::AgeOrSize(Age::Day, 5_000_000), Naming::Timestamps, Cleanup::KeepLogFiles(7))
-        .start()
-        .map_err(|e| {
-            eprintln!("failed to start logger: {e}");
-            e
-        })?;
+        .rotate(Criterion::AgeOrSize(Age::Day, 5_000_000), Naming::Timestamps, Cleanup::KeepLogFiles(7));
+    match logger.start() {
+        Ok(_) => {}
+        Err(e) => {
+            // If a logger is already set in this process, continue without failing service startup.
+            eprintln!("failed to start logger (continuing): {e}");
+        }
+    }
     Ok(())
 }
 
@@ -416,7 +418,7 @@ fn service_main(_args: Vec<OsString>) {
 }
 
 fn run_service() -> Result<()> {
-    info!("run_service: begin");
+    // Register with the SCM and report StartPending immediately.
     let status_handle = service_control_handler::register(SERVICE_NAME, |event| match event {
         ServiceControl::Stop | ServiceControl::Shutdown => { STOP_REQUESTED.store(true, Ordering::SeqCst); ServiceControlHandlerResult::NoError }
         _ => ServiceControlHandlerResult::NotImplemented,
@@ -429,33 +431,27 @@ fn run_service() -> Result<()> {
             controls_accepted: ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,
             exit_code: ServiceExitCode::Win32(0),
             checkpoint: 0,
-            wait_hint: Duration::from_millis(3000),
+            wait_hint: Duration::from_secs(10),
             process_id: None,
         };
         let _ = status_handle.set_service_status(status);
     };
 
     set_status(ServiceState::StartPending);
-    info!("service control handler registered, state=StartPending");
 
+    // Lightweight init first
     let t0 = std::time::Instant::now();
-    let cfg = load_config_or_init()?; let level = level_from_cfg(&cfg); init_logger(level)?;
+    let cfg = load_config_or_init()?;
+    let level = level_from_cfg(&cfg);
+    let _ = init_logger(level);
     info!("Service starting (level={:?})", level);
     info!("build tag={} sha={} at {}", BUILD_GIT_TAG, BUILD_GIT_SHA, BUILD_TIME);
-    info!("logger initialized in {:?}", t0.elapsed());
 
-    info!("restoring previous DNS state if any...");
-    let t_restore = std::time::Instant::now();
-    let _ = restore_all();
-    info!("restore_all done in {:?}", t_restore.elapsed());
-    info!("snapshot_and_apply_all starting...");
-    let t_apply = std::time::Instant::now();
-    let cfg = snapshot_and_apply_all(cfg)?;
-    info!("snapshot_and_apply_all finished in {:?}", t_apply.elapsed());
-    let shared = SharedState { cfg: Arc::new(Mutex::new(cfg)), stopping: Arc::new(AtomicBool::new(false)) };
+    // Create shared state with current config
+    let shared = SharedState { cfg: Arc::new(Mutex::new(cfg.clone())), stopping: Arc::new(AtomicBool::new(false)) };
 
+    // Start gRPC server
     let shared_clone = shared.clone();
-    info!("creating tokio runtime...");
     let rt = Runtime::new()?;
     rt.spawn(async move {
         let incoming = PipeIncoming::new(PIPE_NAME).map(|res| res.map(PipeConn));
@@ -470,9 +466,30 @@ fn run_service() -> Result<()> {
         }
     });
 
+    // Report Running to SCM as soon as core loop is ready
     set_status(ServiceState::Running);
-    info!("Service running (startup total {:?})", t0.elapsed());
+    info!("Service running (core ready in {:?})", t0.elapsed());
 
+    // Heavy tasks in background: restore then snapshot/apply
+    let shared_bg = shared.clone();
+    thread::spawn(move || {
+        let t_restore = std::time::Instant::now();
+        info!("restoring previous DNS state if any...");
+        let _ = restore_all();
+        info!("restore_all done in {:?}", t_restore.elapsed());
+        info!("snapshot_and_apply_all starting...");
+        match snapshot_and_apply_all(cfg) {
+            Ok(new_cfg) => {
+                *shared_bg.cfg.lock() = new_cfg;
+                info!("snapshot_and_apply_all finished");
+            }
+            Err(e) => {
+                error!("snapshot/apply failed: {e:?}");
+            }
+        }
+    });
+
+    // Wait for stop
     while !STOP_REQUESTED.load(Ordering::SeqCst) && !shared.stopping.load(Ordering::SeqCst) {
         thread::sleep(Duration::from_millis(500));
     }
