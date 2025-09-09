@@ -99,7 +99,10 @@ fn init_logger(level: LevelFilter) -> Result<()> {
         eprintln!("cannot create log directory {}: {e}", dir.display());
         e
     })?;
-    let logger = Logger::try_with_str(match level { LevelFilter::Debug => "debug", _ => "info" })?
+    let logger = match Logger::try_with_str(match level { LevelFilter::Debug => "debug", _ => "info" }) {
+        Ok(l) => l,
+        Err(e) => { eprintln!("failed to configure logger (continuing): {e}"); return Ok(()); }
+    }
         .log_to_file(FileSpec::default().directory(&dir).basename("home-dns").suffix("log"))
         .format(flexi_logger::detailed_format)
         .duplicate_to_stderr(Duplicate::Info)
@@ -601,7 +604,7 @@ fn uninstall_service() -> Result<()> {
 
 fn configure_recovery_action_run_restore(exe: &Path) -> Result<()> {
     let exe_str = exe.display().to_string();
-    let cmd = format!(r#"sc.exe failure \"{}\" actions= run/0 reset= 0 command= \"\"{}\" restore\""#, SERVICE_NAME, exe_str);
+    let cmd = format!(r#"sc.exe failure \"{}\" actions=run/0 reset=0 command=\"\"{}\" restore\""#, SERVICE_NAME, exe_str);
     debug!("Configuring SCM recovery: {}", cmd);
     let status = Command::new("cmd").args(["/C", &cmd]).status()?;
     if !status.success() { anyhow::bail!("sc.exe failure a échoué"); } Ok(())

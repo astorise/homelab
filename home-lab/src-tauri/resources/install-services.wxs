@@ -59,8 +59,12 @@
     <CustomAction Id="TraceUninstallServices" Directory="SystemFolder"
                   ExeCommand='cmd /C echo MSI Trace: custom service uninstall >> "[INSTALLDIR]installer-msi.log"'
                   Execute="immediate" Return="ignore" />
+    <CustomAction Id="TraceAfterInstallFiles" Directory="INSTALLDIR"
+                  ExeCommand='cmd /C echo MSI Trace: after InstallFiles >> "[INSTALLDIR]installer-msi.log"'
+                  Execute="immediate" Return="ignore" />
     <InstallExecuteSequence>
       <Custom Action="TraceInstallServices" After="InstallInitialize">NOT Installed</Custom>
+      <Custom Action="TraceAfterInstallFiles" After="InstallFiles">NOT Installed</Custom>
       <Custom Action="TraceUninstallServices" After="InstallInitialize">(REMOVE = "ALL")</Custom>
     </InstallExecuteSequence>
   </Fragment>

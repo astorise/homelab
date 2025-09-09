@@ -55,9 +55,9 @@ Var LOG_HANDLE
   nsExec::ExecToStack 'sc.exe start HomeHttpService'
   Pop $0
   Pop $1
-  DetailPrint "sc start homehttp => rc=$0 out=$1"
+  DetailPrint "sc start HomeHttpService => rc=$0 out=$1"
   StrCmp $LOG_HANDLE "" +2
-  FileWrite $LOG_HANDLE "sc start homehttp => rc=$0 out=$1$\r$\n"
+  FileWrite $LOG_HANDLE "sc start HomeHttpService => rc=$0 out=$1$\r$\n"
     ; Exécution après installation
   ; Forcer l’élévation (si pas déjà perMachine)
   ; et lancer WSL sans distribution
