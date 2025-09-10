@@ -11,6 +11,7 @@
     "tauri:no-svc": "set NO_DEV_SERVICES=1&& tauri dev",
     "tauri:verbose": "set RUST_LOG=debug&& tauri dev",
     "build": "vite build",
+    "tauri:msi:services": "powershell -NoProfile -ExecutionPolicy Bypass -File ..\\scripts\\tauri-msi-relink.ps1 -Build -Relink",
     "preview": "vite preview"
   },
   "devDependencies": {

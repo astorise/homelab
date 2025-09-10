@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+﻿use anyhow::{Context, Result};
 use flexi_logger::{Age, Cleanup, Criterion, Duplicate, FileSpec, Logger, Naming};
 use homedns::homedns::v1::home_dns_server::{HomeDns, HomeDnsServer};
 use homedns::homedns::v1::*;
@@ -160,7 +160,7 @@ fn get_all_adapters() -> Result<Vec<PsAdapter>> {
     let ps = r#"Get-NetAdapter | Select-Object -Property Name,MacAddress,Status | ConvertTo-Json -Compress"#;
     let out = Command::new("powershell").args(["-NoProfile","-ExecutionPolicy","Bypass","-Command", ps])
         .stdout(Stdio::piped()).stderr(Stdio::piped()).output().context("Get-NetAdapter")?;
-    if !out.status.success() { anyhow::bail!("Get-NetAdapter a échoué: {}", String::from_utf8_lossy(&out.stderr)); }
+    if !out.status.success() { anyhow::bail!("Get-NetAdapter a Ã©chouÃ©: {}", String::from_utf8_lossy(&out.stderr)); }
     let stdout = String::from_utf8_lossy(&out.stdout);
     let adapters: Vec<PsAdapter> = if stdout.trim_start().starts_with('[') {
         serde_json::from_str(stdout.trim()).context("parse JSON adapters")?
@@ -175,7 +175,7 @@ fn read_current_dns(alias: &str, family: &str) -> Result<(bool, Vec<String>)> {
 if ($x -eq $null -or $x.ServerAddresses -eq $null -or $x.ServerAddresses.Count -eq 0) {{\"DHCP\";\"\"}} else {{\"STATIC\"; [string]::Join(\",\", $x.ServerAddresses)}}"#, alias, family);
     let out = Command::new("powershell").args(["-NoProfile","-ExecutionPolicy","Bypass","-Command",&ps])
         .stdout(Stdio::piped()).stderr(Stdio::piped()).output().context("Get-DnsClientServerAddress")?;
-    if !out.status.success() { anyhow::bail!("Get-DnsClientServerAddress a échoué: {}", String::from_utf8_lossy(&out.stderr)); }
+    if !out.status.success() { anyhow::bail!("Get-DnsClientServerAddress a Ã©chouÃ©: {}", String::from_utf8_lossy(&out.stderr)); }
     let stdout = String::from_utf8_lossy(&out.stdout);
     let mut lines = stdout.lines().map(|s| s.trim()).filter(|s| !s.is_empty());
     let mode = lines.next().unwrap_or("STATIC");
@@ -190,14 +190,14 @@ fn set_dns_with_powershell(alias: &str, family: &str, servers: &[String]) -> Res
     let cmd = format!(r#"Set-DnsClientServerAddress -InterfaceAlias \"{}\" -AddressFamily {} -ServerAddresses {}"#, alias, family, joined);
     debug!("Apply DNS [{}] {} => {}", alias, family, joined);
     let status = Command::new("powershell").args(["-NoProfile","-ExecutionPolicy","Bypass","-Command",&cmd]).status()?;
-    if !status.success() { anyhow::bail!("Set-DnsClientServerAddress({family}) a échoué"); } Ok(())
+    if !status.success() { anyhow::bail!("Set-DnsClientServerAddress({family}) a Ã©chouÃ©"); } Ok(())
 }
 
 fn reset_dns_to_dhcp(alias: &str, family: &str) -> Result<()> {
     let cmd = format!(r#"Set-DnsClientServerAddress -InterfaceAlias \"{}\" -AddressFamily {} -ResetServerAddresses"#, alias, family);
     debug!("Reset DNS [{}] {} to DHCP", alias, family);
     let status = Command::new("powershell").args(["-NoProfile","-ExecutionPolicy","Bypass","-Command",&cmd]).status()?;
-    if !status.success() { anyhow::bail!("ResetServerAddresses({family}) a échoué"); } Ok(())
+    if !status.success() { anyhow::bail!("ResetServerAddresses({family}) a Ã©chouÃ©"); } Ok(())
 }
 
 fn snapshot_and_apply_all(mut cfg: DnsConfig) -> Result<DnsConfig> {
@@ -423,8 +423,8 @@ define_windows_service!(ffi_service_main, service_main);
 static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 fn service_main(_args: Vec<OsString>) {
-    // Le logger est initialisé dans run_service() selon la config.
-    // L'initialiser ici provoquait une double initialisation et un échec au démarrage du service.
+    // Le logger est initialisÃ© dans run_service() selon la config.
+    // L'initialiser ici provoquait une double initialisation et un Ã©chec au dÃ©marrage du service.
     if let Err(e) = run_service() {
         eprintln!("[home-dns] FATAL: {e:?}");
         let _ = restore_all();
@@ -523,8 +523,8 @@ fn run_console() -> Result<()> {
     let cfg = match snapshot_and_apply_all(cfg) {
         Ok(c) => c,
         Err(e) => {
-            warn!("snapshot/apply failed in console mode: {e:?} — continuing without applying");
-            // Charge config sans l'appliquer pour que le gRPC démarre quand même
+            warn!("snapshot/apply failed in console mode: {e:?} â€” continuing without applying");
+            // Charge config sans l'appliquer pour que le gRPC dÃ©marre quand mÃªme
             load_config_or_init()?
         }
     };
@@ -574,7 +574,7 @@ fn install_service() -> Result<()> {
     };
     let service = manager.create_service(&service_info, ServiceAccess::CHANGE_CONFIG | ServiceAccess::START)?;
     let _ = service.set_description(SERVICE_DESCRIPTION);
-    configure_recovery_action_run_restore(&exe_path)?;
+    let _ = configure_recovery_action_run_restore(&exe_path);
     info!("Service installed");
     Ok(())
 }
@@ -607,29 +607,30 @@ fn configure_recovery_action_run_restore(exe: &Path) -> Result<()> {
     let cmd = format!(r#"sc.exe failure \"{}\" actions=run/0 reset=0 command=\"\"{}\" restore\""#, SERVICE_NAME, exe_str);
     debug!("Configuring SCM recovery: {}", cmd);
     let status = Command::new("cmd").args(["/C", &cmd]).status()?;
-    if !status.success() { anyhow::bail!("sc.exe failure a échoué"); } Ok(())
+    if !status.success() { anyhow::bail!("sc.exe failure a Ã©chouÃ©"); } Ok(())
 }
 
 fn main() -> Result<()> {
     let arg = std::env::args().nth(1).unwrap_or_default();
     match arg.as_str() {
-        "install" => { install_service()?; println!("Service installé. Éditez {} si besoin puis démarrez le service.", config_path().display()); }
-        "uninstall" => { uninstall_service()?; println!("Service désinstallé."); }
+        "install" => { install_service()?; println!("Service installÃ©. Ã‰ditez {} si besoin puis dÃ©marrez le service.", config_path().display()); }
+        "uninstall" => { uninstall_service()?; println!("Service dÃ©sinstallÃ©."); }
         "run" => {
             if let Err(e) = windows_service::service_dispatcher::start(SERVICE_NAME, ffi_service_main) {
-                error!("Erreur démarrage service: {e:?}"); let _ = restore_all();
+                error!("Erreur dÃ©marrage service: {e:?}"); let _ = restore_all();
             }
         }
         "console" => { run_console()?; }
         "apply-once" => {
             let cfg = load_config_or_init()?; init_logger(level_from_cfg(&cfg))?; snapshot_and_apply_all(cfg)?;
-            println!("DNS appliqué sur toutes les interfaces.");
+            println!("DNS appliquÃ© sur toutes les interfaces.");
         }
         "restore" => {
             let cfg = load_config_or_init()?; init_logger(level_from_cfg(&cfg))?; restore_all()?;
-            println!("DNS restaurés (toutes interfaces connues via dns.yaml).");
+            println!("DNS restaurÃ©s (toutes interfaces connues via dns.yaml).");
         }
         _ => { eprintln!("Usage: home-dns [install|uninstall|run|apply-once|restore]"); }
     }
     Ok(())
 }
+

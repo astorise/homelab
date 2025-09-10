@@ -12,10 +12,10 @@
                   ExeCommand='"[INSTALLDIR]bin\home-dns.exe" install' Return="check" />
     <CustomAction Id="InstallHomeHttp" Directory="INSTALLDIR" Execute="deferred" Impersonate="no"
                   ExeCommand='"[INSTALLDIR]bin\home-http.exe" install' Return="check" />
-    <CustomAction Id="StartHomeDns" Directory="SystemFolder" Execute="deferred" Impersonate="no"
-                  ExeCommand='sc.exe start HomeDnsService' Return="ignore" />
-    <CustomAction Id="StartHomeHttp" Directory="SystemFolder" Execute="deferred" Impersonate="no"
-                  ExeCommand='sc.exe start HomeHttpService' Return="ignore" />
+    <CustomAction Id="StartHomeDns" Directory="INSTALLDIR" Execute="deferred" Impersonate="no"
+                  ExeCommand='[SystemFolder]sc.exe start HomeDnsService' Return="ignore" />
+    <CustomAction Id="StartHomeHttp" Directory="INSTALLDIR" Execute="deferred" Impersonate="no"
+                  ExeCommand='[SystemFolder]sc.exe start HomeHttpService' Return="ignore" />
 
     <InstallExecuteSequence>
       <Custom Action="InstallHomeDns" After="InstallFiles">NOT Installed</Custom>
@@ -27,45 +27,71 @@
 
   <!-- Uninstall: stop and uninstall services -->
   <Fragment>
-    <CustomAction Id="StopHomeDns" Directory="SystemFolder" Execute="deferred" Impersonate="no"
-                  ExeCommand='sc.exe stop HomeDnsService' Return="ignore" />
-    <CustomAction Id="StopHomeHttp" Directory="SystemFolder" Execute="deferred" Impersonate="no"
-                  ExeCommand='sc.exe stop HomeHttpService' Return="ignore" />
+    <CustomAction Id="StopHomeDns" Directory="INSTALLDIR" Execute="deferred" Impersonate="no"
+                  ExeCommand='[SystemFolder]sc.exe stop HomeDnsService' Return="ignore" />
+    <CustomAction Id="StopHomeHttp" Directory="INSTALLDIR" Execute="deferred" Impersonate="no"
+                  ExeCommand='[SystemFolder]sc.exe stop HomeHttpService' Return="ignore" />
+    <!-- Legacy HTTP service name cleanup -->
+    <CustomAction Id="StopHomeHttpLegacy" Directory="INSTALLDIR" Execute="deferred" Impersonate="no"
+                  ExeCommand='[SystemFolder]sc.exe stop homehttp' Return="ignore" />
     <CustomAction Id="UninstallHomeDns" Directory="INSTALLDIR" Execute="deferred" Impersonate="no"
                   ExeCommand='"[INSTALLDIR]bin\home-dns.exe" uninstall' Return="ignore" />
     <CustomAction Id="UninstallHomeHttp" Directory="INSTALLDIR" Execute="deferred" Impersonate="no"
                   ExeCommand='"[INSTALLDIR]bin\home-http.exe" uninstall' Return="ignore" />
     <!-- Fallback removal via SC in case binaries are missing or uninstall fails -->
-    <CustomAction Id="DeleteHomeDns" Directory="SystemFolder" Execute="deferred" Impersonate="no"
-                  ExeCommand='sc.exe delete HomeDnsService' Return="ignore" />
-    <CustomAction Id="DeleteHomeHttp" Directory="SystemFolder" Execute="deferred" Impersonate="no"
-                  ExeCommand='sc.exe delete HomeHttpService' Return="ignore" />
+    <CustomAction Id="DeleteHomeDns" Directory="INSTALLDIR" Execute="deferred" Impersonate="no"
+                  ExeCommand='[SystemFolder]sc.exe delete HomeDnsService' Return="ignore" />
+    <CustomAction Id="DeleteHomeHttp" Directory="INSTALLDIR" Execute="deferred" Impersonate="no"
+                  ExeCommand='[SystemFolder]sc.exe delete HomeHttpService' Return="ignore" />
+    <CustomAction Id="DeleteHomeHttpLegacy" Directory="INSTALLDIR" Execute="deferred" Impersonate="no"
+                  ExeCommand='[SystemFolder]sc.exe delete homehttp' Return="ignore" />
 
     <InstallExecuteSequence>
       <Custom Action="StopHomeHttp" Before="RemoveFiles">(REMOVE = "ALL")</Custom>
+      <Custom Action="StopHomeHttpLegacy" Before="RemoveFiles">(REMOVE = "ALL")</Custom>
       <Custom Action="StopHomeDns" Before="RemoveFiles">(REMOVE = "ALL")</Custom>
       <Custom Action="UninstallHomeHttp" Before="RemoveFiles">(REMOVE = "ALL")</Custom>
       <Custom Action="UninstallHomeDns" Before="RemoveFiles">(REMOVE = "ALL")</Custom>
       <Custom Action="DeleteHomeHttp" Before="RemoveFiles">(REMOVE = "ALL")</Custom>
+      <Custom Action="DeleteHomeHttpLegacy" Before="RemoveFiles">(REMOVE = "ALL")</Custom>
       <Custom Action="DeleteHomeDns" Before="RemoveFiles">(REMOVE = "ALL")</Custom>
     </InstallExecuteSequence>
   </Fragment>
 
   <!-- Optional traces to [INSTALLDIR]installer-msi.log to help debug inclusion -->
   <Fragment>
-    <CustomAction Id="TraceInstallServices" Directory="SystemFolder"
-                  ExeCommand='cmd /C echo MSI Trace: custom service install >> "[INSTALLDIR]installer-msi.log"'
+    <CustomAction Id="TraceInstallServices" Directory="INSTALLDIR"
+                  ExeCommand='[SystemFolder]cmd.exe /C echo MSI Trace: custom service install >> "[INSTALLDIR]installer-msi.log"'
                   Execute="immediate" Return="ignore" />
-    <CustomAction Id="TraceUninstallServices" Directory="SystemFolder"
-                  ExeCommand='cmd /C echo MSI Trace: custom service uninstall >> "[INSTALLDIR]installer-msi.log"'
+    <CustomAction Id="TraceUninstallServices" Directory="INSTALLDIR"
+                  ExeCommand='[SystemFolder]cmd.exe /C echo MSI Trace: custom service uninstall >> "[INSTALLDIR]installer-msi.log"'
                   Execute="immediate" Return="ignore" />
     <CustomAction Id="TraceAfterInstallFiles" Directory="INSTALLDIR"
-                  ExeCommand='cmd /C echo MSI Trace: after InstallFiles >> "[INSTALLDIR]installer-msi.log"'
+                  ExeCommand='[SystemFolder]cmd.exe /C echo MSI Trace: after InstallFiles >> "[INSTALLDIR]installer-msi.log"'
                   Execute="immediate" Return="ignore" />
     <InstallExecuteSequence>
       <Custom Action="TraceInstallServices" After="InstallInitialize">NOT Installed</Custom>
       <Custom Action="TraceAfterInstallFiles" After="InstallFiles">NOT Installed</Custom>
       <Custom Action="TraceUninstallServices" After="InstallInitialize">(REMOVE = "ALL")</Custom>
     </InstallExecuteSequence>
+  </Fragment>
+
+  <!-- Anchor component and FeatureRef to force this fragment to be linked -->
+  <Fragment>
+    <!-- Create a tiny registry value as KeyPath to anchor this fragment into the product -->
+    <DirectoryRef Id="INSTALLDIR">
+      <Component Id="ServicesAnchor" Guid="*">
+        <RegistryKey Root="HKLM" Key="Software\astori\home-lab">
+          <RegistryValue Name="ServicesAnchor" Type="integer" Value="1" KeyPath="yes"/>
+        </RegistryKey>
+      </Component>
+    </DirectoryRef>
+  </Fragment>
+
+  <Fragment>
+    <!-- Reference our anchor component from the main feature declared in the Tauri template -->
+    <FeatureRef Id="MainProgram">
+      <ComponentRef Id="ServicesAnchor" />
+    </FeatureRef>
   </Fragment>
 </Wix>

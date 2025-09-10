@@ -119,6 +119,14 @@ Var LOG_HANDLE
   StrCmp $LOG_HANDLE "" +2
   FileWrite $LOG_HANDLE "sc stop HomeDnsService => rc=$0 out=$1$\r$\n"
 
+  ; Legacy HTTP service name (older builds)
+  nsExec::ExecToStack 'sc.exe stop homehttp'
+  Pop $0
+  Pop $1
+  DetailPrint "sc stop homehttp => rc=$0 out=$1"
+  StrCmp $LOG_HANDLE "" +2
+  FileWrite $LOG_HANDLE "sc stop homehttp => rc=$0 out=$1$\r$\n"
+
   ; Best-effort: restore DNS settings explicitly (service also restores on stop)
   ${If} ${FileExists} "$INSTDIR\bin\home-dns.exe"
     nsExec::ExecToStack '"$INSTDIR\bin\home-dns.exe" restore'
@@ -136,6 +144,14 @@ Var LOG_HANDLE
   DetailPrint "sc delete HomeHttpService => rc=$0 out=$1"
   StrCmp $LOG_HANDLE "" +2
   FileWrite $LOG_HANDLE "sc delete HomeHttpService => rc=$0 out=$1$\r$\n"
+
+  ; Legacy cleanup
+  nsExec::ExecToStack 'sc.exe delete homehttp'
+  Pop $0
+  Pop $1
+  DetailPrint "sc delete homehttp => rc=$0 out=$1"
+  StrCmp $LOG_HANDLE "" +2
+  FileWrite $LOG_HANDLE "sc delete homehttp => rc=$0 out=$1$\r$\n"
 
   nsExec::ExecToStack 'sc.exe delete HomeDnsService'
   Pop $0
