@@ -18,10 +18,11 @@
                   ExeCommand='[SystemFolder]sc.exe start HomeHttpService' Return="ignore" />
 
     <InstallExecuteSequence>
-      <Custom Action="InstallHomeDns" After="InstallFiles">NOT Installed</Custom>
-      <Custom Action="InstallHomeHttp" After="InstallHomeDns">NOT Installed</Custom>
-      <Custom Action="StartHomeDns" After="InstallHomeHttp">NOT Installed</Custom>
-      <Custom Action="StartHomeHttp" After="StartHomeDns">NOT Installed</Custom>
+      <!-- Run install/start on fresh install AND on repair/upgrade (idempotent) -->
+      <Custom Action="InstallHomeDns" After="InstallFiles"><![CDATA[NOT (REMOVE = "ALL")]]></Custom>
+      <Custom Action="InstallHomeHttp" After="InstallHomeDns"><![CDATA[NOT (REMOVE = "ALL")]]></Custom>
+      <Custom Action="StartHomeDns" After="InstallHomeHttp"><![CDATA[NOT (REMOVE = "ALL")]]></Custom>
+      <Custom Action="StartHomeHttp" After="StartHomeDns"><![CDATA[NOT (REMOVE = "ALL")]]></Custom>
     </InstallExecuteSequence>
   </Fragment>
 
