@@ -114,6 +114,11 @@ jobs:
         with:
           projectPath: ./home-lab
 
+      - name: Relink MSI to include service actions
+        shell: pwsh
+        run: |
+          ./scripts/tauri-msi-relink.ps1 -Relink
+
       - name: Upload NSIS setup
         uses: actions/upload-artifact@v4
         with:
@@ -127,3 +132,10 @@ jobs:
           name: msi-package
           path: target/release/bundle/msi/*.msi
           if-no-files-found: error
+
+      - name: Upload MSI (services relinked)
+        uses: actions/upload-artifact@v4
+        with:
+          name: msi-package-services
+          path: target/release/bundle/msi/*_services.msi
+          if-no-files-found: warn
