@@ -451,25 +451,35 @@ fn run_service() -> Result<()> {
         let _ = status_handle.set_service_status(status);
     };
 
+    // Move to Running state as early as possible; remaining init is background.
     set_status(ServiceState::StartPending);
-
-    // Lightweight init first
     let t0 = std::time::Instant::now();
-    let cfg = load_config_or_init()?;
-    let level = level_from_cfg(&cfg);
-    let _ = init_logger(level);
-    info!("Service starting (level={:?})", level);
-    info!("build tag={} sha={} at {}", BUILD_GIT_TAG, BUILD_GIT_SHA, BUILD_TIME);
+    set_status(ServiceState::Running);
+    info!("Service running (early), proceeding with background init...");
 
-    // Create shared state with current config
-    let shared = SharedState { cfg: Arc::new(Mutex::new(cfg.clone())), stopping: Arc::new(AtomicBool::new(false)) };
+    // Background init: config, logger, gRPC server
+    let shared = SharedState { cfg: Arc::new(Mutex::new(DnsConfig{ servers_v4: vec![], servers_v6: vec![], backups: HashMap::new(), log_level: Some("info".into()), records: HashMap::new() })), stopping: Arc::new(AtomicBool::new(false)) };
+    let shared_clone_for_grpc = shared.clone();
+    let shared_clone_for_cfg = shared.clone();
 
-    // Start gRPC server
-    let shared_clone = shared.clone();
+    // Init logger + config in a thread to avoid blocking SCM
+    std::thread::spawn(move || {
+        let cfg = match load_config_or_init() {
+            Ok(c) => c,
+            Err(e) => { eprintln!("[home-dns] config load failed (using defaults): {e:#}"); DnsConfig{ servers_v4: vec![], servers_v6: vec![], backups: HashMap::new(), log_level: Some("info".into()), records: HashMap::new() } },
+        };
+        let level = level_from_cfg(&cfg);
+        let _ = init_logger(level);
+        info!("Service starting (level={:?})", level);
+        info!("build tag={} sha={} at {}", BUILD_GIT_TAG, BUILD_GIT_SHA, BUILD_TIME);
+        *shared_clone_for_cfg.cfg.lock() = cfg;
+    });
+
+    // Start gRPC server on a tokio runtime (non-blocking)
     let rt = Runtime::new()?;
     rt.spawn(async move {
         let incoming = PipeIncoming::new(PIPE_NAME).map(|res| res.map(PipeConn));
-        let svc = HomeDnsServer::new(HomeDnsSvc{ state: shared_clone });
+        let svc = HomeDnsServer::new(HomeDnsSvc{ state: shared_clone_for_grpc });
         info!("gRPC IPC listening on named pipe {}", PIPE_NAME);
         if let Err(e) = tonic::transport::Server::builder()
             .add_service(svc)
@@ -479,10 +489,7 @@ fn run_service() -> Result<()> {
             error!("gRPC server error: {e:?}");
         }
     });
-
-    // Report Running to SCM as soon as core loop is ready
-    set_status(ServiceState::Running);
-    info!("Service running (core ready in {:?})", t0.elapsed());
+    info!("Background init scheduled (elapsed {:?})", t0.elapsed());
 
     // Heavy tasks in background: restore then snapshot/apply
     let shared_bg = shared.clone();
@@ -492,7 +499,8 @@ fn run_service() -> Result<()> {
         let _ = restore_all();
         info!("restore_all done in {:?}", t_restore.elapsed());
         info!("snapshot_and_apply_all starting...");
-        match snapshot_and_apply_all(cfg) {
+        let cfg0 = shared_bg.cfg.lock().clone();
+        match snapshot_and_apply_all(cfg0) {
             Ok(new_cfg) => {
                 *shared_bg.cfg.lock() = new_cfg;
                 info!("snapshot_and_apply_all finished");
