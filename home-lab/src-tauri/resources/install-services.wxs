@@ -32,13 +32,6 @@
                   ExeCommand='[SystemFolder]sc.exe stop HomeDnsService' Return="ignore" />
     <CustomAction Id="StopHomeHttp" Directory="INSTALLDIR" Execute="deferred" Impersonate="no"
                   ExeCommand='[SystemFolder]sc.exe stop HomeHttpService' Return="ignore" />
-    <!-- Legacy HTTP service name cleanup -->
-    <CustomAction Id="StopHomeHttpLegacy" Directory="INSTALLDIR" Execute="deferred" Impersonate="no"
-                  ExeCommand='[SystemFolder]sc.exe stop homehttp' Return="ignore" />
-    <CustomAction Id="UninstallHomeDns" Directory="INSTALLDIR" Execute="deferred" Impersonate="no"
-                  ExeCommand='"[INSTALLDIR]bin\home-dns.exe" uninstall' Return="ignore" />
-    <CustomAction Id="UninstallHomeHttp" Directory="INSTALLDIR" Execute="deferred" Impersonate="no"
-                  ExeCommand='"[INSTALLDIR]bin\home-http.exe" uninstall' Return="ignore" />
     <!-- Fallback removal via SC in case binaries are missing or uninstall fails -->
     <CustomAction Id="DeleteHomeDns" Directory="INSTALLDIR" Execute="deferred" Impersonate="no"
                   ExeCommand='[SystemFolder]sc.exe delete HomeDnsService' Return="ignore" />
@@ -85,6 +78,9 @@
         <RegistryKey Root="HKLM" Key="Software\astori\home-lab">
           <RegistryValue Name="ServicesAnchor" Type="integer" Value="1" KeyPath="yes"/>
         </RegistryKey>
+        <!-- Make sure uninstall always stops and deletes services, even if CAs didn't run -->
+        <ServiceControl Id="SvcCtl_StopDelete_HomeDns" Name="HomeDnsService" Stop="both" Remove="uninstall" Wait="yes" />
+        <ServiceControl Id="SvcCtl_StopDelete_HomeHttp" Name="HomeHttpService" Stop="both" Remove="uninstall" Wait="yes" />
       </Component>
     </DirectoryRef>
   </Fragment>
