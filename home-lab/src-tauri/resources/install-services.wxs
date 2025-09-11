@@ -26,29 +26,16 @@
     </InstallExecuteSequence>
   </Fragment>
 
-  <!-- Uninstall: stop and uninstall services -->
+  <!-- Uninstall: prefer binary uninstallers; rely on ServiceControl as safety net -->
   <Fragment>
-    <CustomAction Id="StopHomeDns" Directory="INSTALLDIR" Execute="deferred" Impersonate="no"
-                  ExeCommand='[SystemFolder]sc.exe stop HomeDnsService' Return="ignore" />
-    <CustomAction Id="StopHomeHttp" Directory="INSTALLDIR" Execute="deferred" Impersonate="no"
-                  ExeCommand='[SystemFolder]sc.exe stop HomeHttpService' Return="ignore" />
-    <!-- Fallback removal via SC in case binaries are missing or uninstall fails -->
-    <CustomAction Id="DeleteHomeDns" Directory="INSTALLDIR" Execute="deferred" Impersonate="no"
-                  ExeCommand='[SystemFolder]sc.exe delete HomeDnsService' Return="ignore" />
-    <CustomAction Id="DeleteHomeHttp" Directory="INSTALLDIR" Execute="deferred" Impersonate="no"
-                  ExeCommand='[SystemFolder]sc.exe delete HomeHttpService' Return="ignore" />
-    <CustomAction Id="DeleteHomeHttpLegacy" Directory="INSTALLDIR" Execute="deferred" Impersonate="no"
-                  ExeCommand='[SystemFolder]sc.exe delete homehttp' Return="ignore" />
+    <CustomAction Id="UninstallHomeDns" Directory="INSTALLDIR" Execute="deferred" Impersonate="no"
+                  ExeCommand='"[INSTALLDIR]bin\home-dns.exe" uninstall' Return="ignore" />
+    <CustomAction Id="UninstallHomeHttp" Directory="INSTALLDIR" Execute="deferred" Impersonate="no"
+                  ExeCommand='"[INSTALLDIR]bin\home-http.exe" uninstall' Return="ignore" />
 
     <InstallExecuteSequence>
-      <Custom Action="StopHomeHttp" Before="RemoveFiles">(REMOVE = "ALL")</Custom>
-      <Custom Action="StopHomeHttpLegacy" Before="RemoveFiles">(REMOVE = "ALL")</Custom>
-      <Custom Action="StopHomeDns" Before="RemoveFiles">(REMOVE = "ALL")</Custom>
       <Custom Action="UninstallHomeHttp" Before="RemoveFiles">(REMOVE = "ALL")</Custom>
       <Custom Action="UninstallHomeDns" Before="RemoveFiles">(REMOVE = "ALL")</Custom>
-      <Custom Action="DeleteHomeHttp" Before="RemoveFiles">(REMOVE = "ALL")</Custom>
-      <Custom Action="DeleteHomeHttpLegacy" Before="RemoveFiles">(REMOVE = "ALL")</Custom>
-      <Custom Action="DeleteHomeDns" Before="RemoveFiles">(REMOVE = "ALL")</Custom>
     </InstallExecuteSequence>
   </Fragment>
 

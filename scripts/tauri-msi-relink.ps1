@@ -25,6 +25,9 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+Write-Warning 'tauri-msi-relink.ps1 is deprecated. Tauri MSI already embeds service actions via resources/install-services.wxs.'
+Write-Host    'Use -Relink only if you know you need it. Default flow skips relinking.'
+
 function Get-WixTools {
   $base = Join-Path $env:LOCALAPPDATA 'tauri\WixTools314'
   $candle = Join-Path $base 'candle.exe'
@@ -133,11 +136,16 @@ function Ensure-ServicesIfMissing {
   }
 }
 
-if (-not ($Build -or $Relink -or $Install -or $Verify)) { $Build=$true; $Relink=$true; $Install=$true; $Verify=$true }
+# Default behavior: build, install, verify — but DO NOT relink
+if (-not ($Build -or $Relink -or $Install -or $Verify)) { $Build=$true; $Install=$true; $Verify=$true }
 
 $msiOut = $null
 if ($Build) { Build-TauriMsi }
 if ($Relink) { $msiOut = Relink-Msi }
+
+# Prefer the standard Tauri MSI artifact if we didn't relink or relink produced no path
+if (-not $msiOut) { $msiOut = Resolve-Path 'home-lab\\target\\release\\bundle\\msi\\home-lab_0.1.0_x64_en-US.msi' -ErrorAction SilentlyContinue }
+if (-not $msiOut) { $msiOut = Resolve-Path 'target\\release\\bundle\\msi\\home-lab_0.1.0_x64_en-US.msi' -ErrorAction SilentlyContinue }
 if ($Install) {
   if (-not $msiOut) { $msiOut = Resolve-Path 'target\release\bundle\msi\home-lab_0.1.0_x64_en-US_services.msi' -ErrorAction SilentlyContinue }
   Install-MsiWithLog $msiOut
