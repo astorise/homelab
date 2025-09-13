@@ -9,9 +9,9 @@
   <!-- Post-install: run "home-dns.exe install" and "home-http.exe install", then start them -->
   <Fragment>
     <CustomAction Id="InstallHomeDns" Directory="INSTALLDIR" Execute="deferred" Impersonate="no"
-                  ExeCommand='"[INSTALLDIR]bin\home-dns.exe" install' Return="check" />
+                  ExeCommand='bin\home-dns.exe install' Return="check" />
     <CustomAction Id="InstallHomeHttp" Directory="INSTALLDIR" Execute="deferred" Impersonate="no"
-                  ExeCommand='"[INSTALLDIR]bin\home-http.exe" install' Return="check" />
+                  ExeCommand='bin\home-http.exe install' Return="check" />
     <CustomAction Id="StartHomeDns" Directory="INSTALLDIR" Execute="deferred" Impersonate="no"
                   ExeCommand='[SystemFolder]sc.exe start HomeDnsService' Return="ignore" />
     <CustomAction Id="StartHomeHttp" Directory="INSTALLDIR" Execute="deferred" Impersonate="no"
@@ -29,9 +29,9 @@
   <!-- Uninstall: prefer binary uninstallers; rely on ServiceControl as safety net -->
   <Fragment>
     <CustomAction Id="UninstallHomeDns" Directory="INSTALLDIR" Execute="deferred" Impersonate="no"
-                  ExeCommand='"[INSTALLDIR]bin\home-dns.exe" uninstall' Return="ignore" />
+                  ExeCommand='bin\home-dns.exe uninstall' Return="ignore" />
     <CustomAction Id="UninstallHomeHttp" Directory="INSTALLDIR" Execute="deferred" Impersonate="no"
-                  ExeCommand='"[INSTALLDIR]bin\home-http.exe" uninstall' Return="ignore" />
+                  ExeCommand='bin\home-http.exe uninstall' Return="ignore" />
 
     <InstallExecuteSequence>
       <Custom Action="UninstallHomeHttp" Before="RemoveFiles">(REMOVE = "ALL")</Custom>

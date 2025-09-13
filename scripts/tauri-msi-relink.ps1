@@ -66,8 +66,13 @@ function Relink-Msi {
     Write-Host '=== Linking (light) main.wixobj + install-services.wixobj ==='
     & $($wix.Light) -nologo -v -ext WixUIExtension -loc locale.wxl -out $outRelinked main.wixobj install-services.wixobj | Write-Host
 
-    Write-Host "Relinked MSI => $outRelinked"
-    return $outRelinked
+    # Replace the original MSI with the relinked one to avoid duplicate artifacts
+    try {
+      Remove-Item -Force $outMsi -ErrorAction SilentlyContinue
+    } catch {}
+    Move-Item -Force $outRelinked $outMsi
+    Write-Host "Relinked MSI replaced original => $outMsi"
+    return $outMsi
   } finally { Pop-Location }
 }
 
