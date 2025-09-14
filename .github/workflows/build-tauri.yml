@@ -61,6 +61,9 @@ jobs:
   build-tauri-win:
     runs-on: windows-latest
     needs: [build-services, build-docker-image]
+    env:
+      WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+      WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
     steps:
       - uses: actions/checkout@v5
 
@@ -97,10 +100,10 @@ jobs:
           npx tauri -V
 
       - name: Prepare code signing certificate (if provided)
-        if: ${{ secrets.WINDOWS_CERTIFICATE != '' && secrets.WINDOWS_CERT_PASSWORD != '' }}
+        if: ${{ env.WINDOWS_CERTIFICATE != '' && env.WINDOWS_CERT_PASSWORD != '' }}
         shell: pwsh
         env:
-          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE: ${{ env.WINDOWS_CERTIFICATE }}
         run: |
           $bytes = [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE)
           $pfxPath = Join-Path $env:RUNNER_TEMP 'codesign.pfx'
@@ -108,7 +111,7 @@ jobs:
           echo "SIGN_PFX_PATH=$pfxPath" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Locate signtool (install SDK if missing)
-        if: ${{ secrets.WINDOWS_CERTIFICATE != '' && secrets.WINDOWS_CERT_PASSWORD != '' }}
+        if: ${{ env.WINDOWS_CERTIFICATE != '' && env.WINDOWS_CERT_PASSWORD != '' }}
         shell: pwsh
         run: |
           $signtool = (Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe" -ErrorAction SilentlyContinue | Sort-Object FullName -Descending | Select-Object -First 1).FullName
@@ -121,7 +124,7 @@ jobs:
           echo "SIGNTOOL=$signtool" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Sign service executables (pre-bundle)
-        if: ${{ secrets.WINDOWS_CERTIFICATE != '' && secrets.WINDOWS_CERT_PASSWORD != '' }}
+        if: ${{ env.WINDOWS_CERTIFICATE != '' && env.WINDOWS_CERT_PASSWORD != '' }}
         shell: pwsh
         run: |
           $files = @(
@@ -130,7 +133,7 @@ jobs:
           )
           foreach ($f in $files) {
             if (Test-Path $f) {
-              & "$env:SIGNTOOL" sign /fd SHA256 /f "$env:SIGN_PFX_PATH" /p "${{ secrets.WINDOWS_CERT_PASSWORD }}" /tr http://timestamp.digicert.com /td SHA256 "$f"
+              & "$env:SIGNTOOL" sign /fd SHA256 /f "$env:SIGN_PFX_PATH" /p "$env:WINDOWS_CERT_PASSWORD" /tr http://timestamp.digicert.com /td SHA256 "$f"
             }
           }
 
@@ -153,20 +156,20 @@ jobs:
           args: -b nsis,msi
 
       - name: Sign MSI package (post-bundle)
-        if: ${{ secrets.WINDOWS_CERTIFICATE != '' && secrets.WINDOWS_CERT_PASSWORD != '' }}
+        if: ${{ env.WINDOWS_CERTIFICATE != '' && env.WINDOWS_CERT_PASSWORD != '' }}
         shell: pwsh
         run: |
           $msi = Get-ChildItem -Path 'home-lab\target\release\bundle\msi' -Filter '*.msi' | Sort-Object LastWriteTime -Descending | Select-Object -First 1
           if (-not $msi) { throw 'MSI not found to sign' }
-          & "$env:SIGNTOOL" sign /fd SHA256 /f "$env:SIGN_PFX_PATH" /p "${{ secrets.WINDOWS_CERT_PASSWORD }}" /tr http://timestamp.digicert.com /td SHA256 $msi.FullName
+          & "$env:SIGNTOOL" sign /fd SHA256 /f "$env:SIGN_PFX_PATH" /p "$env:WINDOWS_CERT_PASSWORD" /tr http://timestamp.digicert.com /td SHA256 $msi.FullName
 
       - name: Sign NSIS setup (post-bundle)
-        if: ${{ secrets.WINDOWS_CERTIFICATE != '' && secrets.WINDOWS_CERT_PASSWORD != '' }}
+        if: ${{ env.WINDOWS_CERTIFICATE != '' && env.WINDOWS_CERT_PASSWORD != '' }}
         shell: pwsh
         run: |
           $exe = Get-ChildItem -Path 'home-lab\target\release\bundle\nsis' -Filter '*.exe' | Sort-Object LastWriteTime -Descending | Select-Object -First 1
           if ($exe) {
-            & "$env:SIGNTOOL" sign /fd SHA256 /f "$env:SIGN_PFX_PATH" /p "${{ secrets.WINDOWS_CERT_PASSWORD }}" /tr http://timestamp.digicert.com /td SHA256 $exe.FullName
+            & "$env:SIGNTOOL" sign /fd SHA256 /f "$env:SIGN_PFX_PATH" /p "$env:WINDOWS_CERT_PASSWORD" /tr http://timestamp.digicert.com /td SHA256 $exe.FullName
           } else {
             Write-Host 'No NSIS executable found to sign.'
           }
@@ -186,3 +189,6 @@ jobs:
           if-no-files-found: warn
 
       # Note: only one MSI is produced and uploaded
+
+
+
