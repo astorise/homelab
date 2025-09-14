@@ -87,4 +87,8 @@ if ($ExportCer -or $InstallTrusted) {
   }
 }
 
+Write-Host 'Copy to Clipboard (base64 PFX)'
+$b64 = [Convert]::ToBase64String([IO.File]::ReadAllBytes($PfxPath))
+Set-Clipboard -Value $b64
+
 Write-Host 'Done.'
