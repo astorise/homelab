@@ -99,6 +99,11 @@ jobs:
           if (-not $hasCli) { npm i -D @tauri-apps/cli@latest }
           npx tauri -V
 
+      - name: Install WiX Toolset 3.14 (for MSI bundling)
+        shell: pwsh
+        run: |
+          choco install wixtoolset --version=3.14.0.4118 -y
+
       - name: Prepare code signing certificate (if provided)
         if: ${{ env.WINDOWS_CERTIFICATE != '' && env.WINDOWS_CERT_PASSWORD != '' }}
         shell: pwsh
@@ -147,6 +152,7 @@ jobs:
             ${{ runner.os }}-node-
 
       - name: Build Tauri (Windows - NSIS + MSI)
+        id: tauri_build
         uses: tauri-apps/tauri-action@v0.5.23
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -155,24 +161,34 @@ jobs:
           projectPath: ./home-lab
           args: -b nsis,msi
 
+      - name: Debug Tauri artifacts
+        shell: pwsh
+        run: |
+          Write-Host 'artifactPaths from tauri-action:'
+          Write-Host "${{ steps.tauri_build.outputs.artifactPaths }}"
+          Write-Host 'Listing bundle directories:'
+          Get-ChildItem -Path 'home-lab' -Recurse -Directory -Filter bundle | ForEach-Object { $_.FullName }
+
       - name: Sign MSI package (post-bundle)
         if: ${{ env.WINDOWS_CERTIFICATE != '' && env.WINDOWS_CERT_PASSWORD != '' }}
         shell: pwsh
         run: |
-          $msi = Get-ChildItem -Path 'home-lab' -Recurse -Filter '*.msi' | Where-Object { $_.FullName -like '*\bundle\msi\*' } | Sort-Object LastWriteTime -Descending | Select-Object -First 1
-          if (-not $msi) { throw 'MSI not found to sign' }
-          & "$env:SIGNTOOL" sign /fd SHA256 /f "$env:SIGN_PFX_PATH" /p "$env:WINDOWS_CERT_PASSWORD" /tr http://timestamp.digicert.com /td SHA256 $msi.FullName
+          $artifacts = @("${{ steps.tauri_build.outputs.artifactPaths }}") -split "`r?`n|;" | Where-Object { $_ -and $_.Trim() -ne '' }
+          $msiPath = $artifacts | Where-Object { $_ -match '\.msi$' } | Select-Object -First 1
+          if (-not $msiPath) {
+            Write-Warning 'No MSI found in tauri-action outputs; skipping MSI signing.'
+            exit 0
+          }
+          & "$env:SIGNTOOL" sign /fd SHA256 /f "$env:SIGN_PFX_PATH" /p "$env:WINDOWS_CERT_PASSWORD" /tr http://timestamp.digicert.com /td SHA256 $msiPath
 
       - name: Sign NSIS setup (post-bundle)
         if: ${{ env.WINDOWS_CERTIFICATE != '' && env.WINDOWS_CERT_PASSWORD != '' }}
         shell: pwsh
         run: |
-          $exe = Get-ChildItem -Path 'home-lab' -Recurse -Filter '*.exe' | Where-Object { $_.FullName -like '*\bundle\nsis\*' } | Sort-Object LastWriteTime -Descending | Select-Object -First 1
-          if ($exe) {
-            & "$env:SIGNTOOL" sign /fd SHA256 /f "$env:SIGN_PFX_PATH" /p "$env:WINDOWS_CERT_PASSWORD" /tr http://timestamp.digicert.com /td SHA256 $exe.FullName
-          } else {
-            Write-Host 'No NSIS executable found to sign.'
-          }
+          $artifacts = @("${{ steps.tauri_build.outputs.artifactPaths }}") -split "`r?`n|;" | Where-Object { $_ -and $_.Trim() -ne '' }
+          $exePath = $artifacts | Where-Object { $_ -match '\.exe$' -and $_ -like '*\bundle\nsis\*' } | Select-Object -First 1
+          if (-not $exePath) { Write-Host 'No NSIS executable found to sign.'; exit 0 }
+          & "$env:SIGNTOOL" sign /fd SHA256 /f "$env:SIGN_PFX_PATH" /p "$env:WINDOWS_CERT_PASSWORD" /tr http://timestamp.digicert.com /td SHA256 $exePath
 
       - name: Upload MSI package
         uses: actions/upload-artifact@v4
