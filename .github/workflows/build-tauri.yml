@@ -99,10 +99,6 @@ jobs:
           if (-not $hasCli) { npm i -D @tauri-apps/cli@latest }
           npx tauri -V
 
-      - name: Install WiX Toolset 3.14 (for MSI bundling)
-        shell: pwsh
-        run: |
-          choco install wixtoolset --version=3.14.0.4118 -y
 
       - name: Prepare code signing certificate (if provided)
         if: ${{ env.WINDOWS_CERTIFICATE != '' && env.WINDOWS_CERT_PASSWORD != '' }}
