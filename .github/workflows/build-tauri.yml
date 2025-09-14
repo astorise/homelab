@@ -150,7 +150,7 @@ jobs:
         uses: tauri-apps/tauri-action@v0.5.23
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAURI_BUNDLE_DEBUG: "true"
+          TAURI_BUNDLE_DEBUG: "false"
         with:
           projectPath: ./home-lab
           args: -b nsis,msi
@@ -159,7 +159,7 @@ jobs:
         if: ${{ env.WINDOWS_CERTIFICATE != '' && env.WINDOWS_CERT_PASSWORD != '' }}
         shell: pwsh
         run: |
-          $msi = Get-ChildItem -Path 'home-lab\target\release\bundle\msi' -Filter '*.msi' | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          $msi = Get-ChildItem -Path 'home-lab' -Recurse -Filter '*.msi' | Where-Object { $_.FullName -like '*\bundle\msi\*' } | Sort-Object LastWriteTime -Descending | Select-Object -First 1
           if (-not $msi) { throw 'MSI not found to sign' }
           & "$env:SIGNTOOL" sign /fd SHA256 /f "$env:SIGN_PFX_PATH" /p "$env:WINDOWS_CERT_PASSWORD" /tr http://timestamp.digicert.com /td SHA256 $msi.FullName
 
@@ -167,7 +167,7 @@ jobs:
         if: ${{ env.WINDOWS_CERTIFICATE != '' && env.WINDOWS_CERT_PASSWORD != '' }}
         shell: pwsh
         run: |
-          $exe = Get-ChildItem -Path 'home-lab\target\release\bundle\nsis' -Filter '*.exe' | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          $exe = Get-ChildItem -Path 'home-lab' -Recurse -Filter '*.exe' | Where-Object { $_.FullName -like '*\bundle\nsis\*' } | Sort-Object LastWriteTime -Descending | Select-Object -First 1
           if ($exe) {
             & "$env:SIGNTOOL" sign /fd SHA256 /f "$env:SIGN_PFX_PATH" /p "$env:WINDOWS_CERT_PASSWORD" /tr http://timestamp.digicert.com /td SHA256 $exe.FullName
           } else {
@@ -178,14 +178,14 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: msi-package
-          path: home-lab/target/release/bundle/msi/*.msi
+          path: home-lab/**/bundle/msi/*.msi
           if-no-files-found: error
 
       - name: Upload NSIS setup
         uses: actions/upload-artifact@v4
         with:
           name: nsis-setup
-          path: home-lab/target/release/bundle/nsis/*.exe
+          path: home-lab/**/bundle/nsis/*.exe
           if-no-files-found: warn
 
       # Note: only one MSI is produced and uploaded
