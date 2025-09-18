@@ -141,7 +141,13 @@ jobs:
         if: ${{ env.WINDOWS_CERTIFICATE != '' && env.WINDOWS_CERT_PASSWORD != '' }}
         shell: pwsh
         run: |
-          $artifacts = @("${{ steps.tauri_build.outputs.artifactPaths }}") -split "`r?`n|;" | Where-Object { $_ -and $_.Trim() -ne '' }
+          $artifactRaw = '${{ steps.tauri_build.outputs.artifactPaths }}'
+          if ($artifactRaw.Trim().StartsWith('[')) {
+            $artifacts = $artifactRaw | ConvertFrom-Json
+          } else {
+            $artifacts = $artifactRaw -split "`r?`n|;"
+          }
+          $artifacts = @($artifacts) | Where-Object { $_ -and $_.Trim() -ne '' }
           $msiPath = $artifacts | Where-Object { $_ -match '\.msi$' } | Select-Object -First 1
           if (-not $msiPath) {
             Write-Warning 'No MSI found in tauri-action outputs; skipping MSI signing.'
@@ -153,8 +159,14 @@ jobs:
         if: ${{ env.WINDOWS_CERTIFICATE != '' && env.WINDOWS_CERT_PASSWORD != '' }}
         shell: pwsh
         run: |
-          $artifacts = @("${{ steps.tauri_build.outputs.artifactPaths }}") -split "`r?`n|;" | Where-Object { $_ -and $_.Trim() -ne '' }
-          $exePath = $artifacts | Where-Object { $_ -match '\.exe$' -and $_ -like '*\bundle\nsis\*' } | Select-Object -First 1
+          $artifactRaw = '${{ steps.tauri_build.outputs.artifactPaths }}'
+          if ($artifactRaw.Trim().StartsWith('[')) {
+            $artifacts = $artifactRaw | ConvertFrom-Json
+          } else {
+            $artifacts = $artifactRaw -split "`r?`n|;"
+          }
+          $artifacts = @($artifacts) | Where-Object { $_ -and $_.Trim() -ne '' }
+          $exePath = $artifacts | Where-Object { $_ -match '\.(?i)exe$' -and $_ -like '*\bundle\nsis\*' } | Select-Object -First 1
           if (-not $exePath) { Write-Host 'No NSIS executable found to sign.'; exit 0 }
           & "$env:SIGNTOOL" sign /fd SHA256 /f "$env:SIGN_PFX_PATH" /p "$env:WINDOWS_CERT_PASSWORD" /tr http://timestamp.digicert.com /td SHA256 $exePath
 
