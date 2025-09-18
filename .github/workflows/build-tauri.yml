@@ -99,53 +99,24 @@ jobs:
           if (-not $hasCli) { npm i -D @tauri-apps/cli@latest }
           npx tauri -V
 
-
-      - name: Prepare code signing certificate (if provided)
-        if: ${{ env.WINDOWS_CERTIFICATE != '' && env.WINDOWS_CERT_PASSWORD != '' }}
-        shell: pwsh
+      - name: import windows certificate
         env:
-          WINDOWS_CERTIFICATE: ${{ env.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
         run: |
-          $bytes = [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE)
-          $pfxPath = Join-Path $env:RUNNER_TEMP 'codesign.pfx'
-          [IO.File]::WriteAllBytes($pfxPath, $bytes)
-          echo "SIGN_PFX_PATH=$pfxPath" | Out-File -FilePath $env:GITHUB_ENV -Append
-
-      - name: Locate signtool (install SDK if missing)
-        if: ${{ env.WINDOWS_CERTIFICATE != '' && env.WINDOWS_CERT_PASSWORD != '' }}
-        shell: pwsh
-        run: |
-          $signtool = (Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe" -ErrorAction SilentlyContinue | Sort-Object FullName -Descending | Select-Object -First 1).FullName
-          if (-not $signtool) {
-            Write-Host 'signtool.exe not found, installing Windows SDK via choco...'
-            choco install windows-sdk-10.0 -y
-            $signtool = (Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe" -ErrorAction SilentlyContinue | Sort-Object FullName -Descending | Select-Object -First 1).FullName
-          }
-          if (-not $signtool) { throw 'signtool.exe still not found' }
-          echo "SIGNTOOL=$signtool" | Out-File -FilePath $env:GITHUB_ENV -Append
-
-      - name: Sign service executables (pre-bundle)
-        if: ${{ env.WINDOWS_CERTIFICATE != '' && env.WINDOWS_CERT_PASSWORD != '' }}
-        shell: pwsh
-        run: |
-          $files = @(
-            'home-lab\src-tauri\resources\bin\home-dns.exe',
-            'home-lab\src-tauri\resources\bin\home-http.exe'
-          )
-          foreach ($f in $files) {
-            if (Test-Path $f) {
-              & "$env:SIGNTOOL" sign /fd SHA256 /f "$env:SIGN_PFX_PATH" /p "$env:WINDOWS_CERT_PASSWORD" /tr http://timestamp.digicert.com /td SHA256 "$f"
-            }
-          }
-
-      # Optionnel : cache npm
-      - name: Enable npm cache
-        uses: actions/cache@v4
-        with:
-          path: ~/.npm
-          key: ${{ runner.os }}-node-${{ hashFiles('home-lab/**/package-lock.json') }}
-          restore-keys: |
-            ${{ runner.os }}-node-
+          New-Item -ItemType directory -Path certificate
+          Set-Content -Path certificate/tempCert.txt -Value $env:WINDOWS_CERTIFICATE
+          certutil -decode certificate/tempCert.txt certificate/certificate.pfx
+          Remove-Item -path certificate -include tempCert.txt
+          Import-PfxCertificate -FilePath certificate/certificate.pfx -CertStoreLocation Cert:\CurrentUser\My -Password (ConvertTo-SecureString -String $env:WINDOWS_CERTIFICATE_PASSWORD -Force -AsPlainText)
+            # Optionnel : cache npm
+            - name: Enable npm cache
+              uses: actions/cache@v4
+              with:
+                path: ~/.npm
+                key: ${{ runner.os }}-node-${{ hashFiles('home-lab/**/package-lock.json') }}
+                restore-keys: |
+                  ${{ runner.os }}-node-
 
       - name: Build Tauri (Windows - NSIS + MSI)
         id: tauri_build
