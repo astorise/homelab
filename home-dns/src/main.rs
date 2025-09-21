@@ -560,7 +560,10 @@ fn run_console() -> Result<()> {
 }
 
 fn install_service() -> Result<()> {
-    let cfg = load_config_or_init()?; init_logger(level_from_cfg(&cfg))?;
+    let cfg = load_config_or_init()?;
+    if let Err(e) = init_logger(level_from_cfg(&cfg)) {
+        eprintln!("[install] logger init failed (continuing): {e}");
+    }
     // Try to open if already installed to keep install idempotent.
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE)?;
     if let Ok(_svc) = manager.open_service(SERVICE_NAME, ServiceAccess::QUERY_STATUS) {
@@ -588,7 +591,9 @@ fn install_service() -> Result<()> {
 }
 
 fn uninstall_service() -> Result<()> {
-    init_logger(LevelFilter::Info)?;
+    if let Err(e) = init_logger(LevelFilter::Info) {
+        eprintln!("[uninstall] logger init failed (continuing): {e}");
+    }
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
     let service = manager.open_service(SERVICE_NAME, ServiceAccess::STOP | ServiceAccess::QUERY_STATUS | ServiceAccess::DELETE)?;
     let _ = service.stop();

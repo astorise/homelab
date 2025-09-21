@@ -64,11 +64,21 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Download services artifacts into Tauri bin
+      - name: Clear bundled services directory
+        shell: pwsh
+        run: |
+          `$bin = 'home-lab/src-tauri/resources/bin'
+          if (Test-Path `$bin) {
+            Get-ChildItem `$bin -Filter '*.exe' -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+          } else {
+            New-Item -ItemType Directory -Path `$bin | Out-Null
+          }
+
+      - name: Download services artifacts into resources/bin
         uses: actions/download-artifact@v5
         with:
           name: services-win
-          path: home-lab/src-tauri/bin
+          path: home-lab/src-tauri/resources/bin
 
       - name: Download Docker image into Tauri resources
         uses: actions/download-artifact@v5
