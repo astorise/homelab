@@ -67,11 +67,11 @@ jobs:
       - name: Clear bundled services directory
         shell: pwsh
         run: |
-          `$bin = 'home-lab/src-tauri/resources/bin'
-          if (Test-Path `$bin) {
-            Get-ChildItem `$bin -Filter '*.exe' -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+          $bin = 'home-lab/src-tauri/resources/bin'
+          if (Test-Path $bin) {
+            Get-ChildItem $bin -Filter '*.exe' -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
           } else {
-            New-Item -ItemType Directory -Path `$bin | Out-Null
+            New-Item -ItemType Directory -Path $bin | Out-Null
           }
 
       - name: Download services artifacts into resources/bin
