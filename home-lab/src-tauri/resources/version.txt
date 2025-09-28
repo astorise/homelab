@@ -1,6 +1,6 @@
 app=home-lab
 version=0.1.0
-tag=d490d32
-sha=d490d32
+tag=dd325cf
+sha=dd325cf
 run=
-built=2025-09-10T18:03:55.885Z
+built=2025-09-28T17:26:30.440Z
