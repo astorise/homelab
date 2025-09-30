@@ -3,44 +3,27 @@
   <!--
     WiX fragment to install/uninstall and start the home-dns/home-http services.
     We invoke the bundled executables directly (install|uninstall),
-    because tauri-bundler resource Files do not have stable Ids we can reference via ServiceInstall.
+    because tauri-bundler resource files do not have stable Ids we can reference via ServiceInstall.
   -->
 
-  <!-- Post-install: run "home-dns.exe install" and "home-http.exe install", then start them -->
   <Fragment>
+    <!-- Post-install: run "home-dns.exe install" and "home-http.exe install", then start them -->
     <CustomAction Id="InstallHomeDns" Directory="INSTALLDIR" Execute="deferred" Impersonate="no"
-                  ExeCommand='bin\home-dns.exe install' Return="check" />
+                  ExeCommand='"[INSTALLDIR]bin\home-dns.exe" install' Return="check" />
     <CustomAction Id="InstallHomeHttp" Directory="INSTALLDIR" Execute="deferred" Impersonate="no"
-                  ExeCommand='bin\home-http.exe install' Return="check" />
+                  ExeCommand='"[INSTALLDIR]bin\home-http.exe" install' Return="check" />
     <CustomAction Id="StartHomeDns" Directory="INSTALLDIR" Execute="deferred" Impersonate="no"
                   ExeCommand='[SystemFolder]sc.exe start HomeDnsService' Return="ignore" />
     <CustomAction Id="StartHomeHttp" Directory="INSTALLDIR" Execute="deferred" Impersonate="no"
                   ExeCommand='[SystemFolder]sc.exe start HomeHttpService' Return="ignore" />
 
-    <InstallExecuteSequence>
-      <!-- Run install/start on fresh install AND on repair/upgrade (idempotent) -->
-      <Custom Action="InstallHomeDns" After="InstallFiles"><![CDATA[NOT (REMOVE = "ALL")]]></Custom>
-      <Custom Action="InstallHomeHttp" After="InstallHomeDns"><![CDATA[NOT (REMOVE = "ALL")]]></Custom>
-      <Custom Action="StartHomeDns" After="InstallHomeHttp"><![CDATA[NOT (REMOVE = "ALL")]]></Custom>
-      <Custom Action="StartHomeHttp" After="StartHomeDns"><![CDATA[NOT (REMOVE = "ALL")]]></Custom>
-    </InstallExecuteSequence>
-  </Fragment>
-
-  <!-- Uninstall: prefer binary uninstallers; rely on ServiceControl as safety net -->
-  <Fragment>
+    <!-- Uninstall: prefer binary uninstallers; rely on ServiceControl as safety net -->
     <CustomAction Id="UninstallHomeDns" Directory="INSTALLDIR" Execute="deferred" Impersonate="no"
-                  ExeCommand='bin\home-dns.exe uninstall' Return="ignore" />
+                  ExeCommand='"[INSTALLDIR]bin\home-dns.exe" uninstall' Return="ignore" />
     <CustomAction Id="UninstallHomeHttp" Directory="INSTALLDIR" Execute="deferred" Impersonate="no"
-                  ExeCommand='bin\home-http.exe uninstall' Return="ignore" />
+                  ExeCommand='"[INSTALLDIR]bin\home-http.exe" uninstall' Return="ignore" />
 
-    <InstallExecuteSequence>
-      <Custom Action="UninstallHomeHttp" Before="RemoveFiles">(REMOVE = "ALL")</Custom>
-      <Custom Action="UninstallHomeDns" Before="RemoveFiles">(REMOVE = "ALL")</Custom>
-    </InstallExecuteSequence>
-  </Fragment>
-
-  <!-- Optional traces to [INSTALLDIR]installer-msi.log to help debug inclusion -->
-  <Fragment>
+    <!-- Optional traces to [INSTALLDIR]installer-msi.log to help debug inclusion -->
     <CustomAction Id="TraceInstallServices" Directory="INSTALLDIR"
                   ExeCommand='[SystemFolder]cmd.exe /C echo MSI Trace: custom service install >> "[INSTALLDIR]installer-msi.log"'
                   Execute="immediate" Return="ignore" />
@@ -50,32 +33,48 @@
     <CustomAction Id="TraceAfterInstallFiles" Directory="INSTALLDIR"
                   ExeCommand='[SystemFolder]cmd.exe /C echo MSI Trace: after InstallFiles >> "[INSTALLDIR]installer-msi.log"'
                   Execute="immediate" Return="ignore" />
+
     <InstallExecuteSequence>
       <Custom Action="TraceInstallServices" After="InstallInitialize">NOT Installed</Custom>
-      <Custom Action="TraceAfterInstallFiles" After="InstallFiles">NOT Installed</Custom>
       <Custom Action="TraceUninstallServices" After="InstallInitialize">(REMOVE = "ALL")</Custom>
+      <Custom Action="TraceAfterInstallFiles" Before="InstallHomeDns">NOT Installed</Custom>
+      <Custom Action="InstallHomeDns" After="InstallFiles"><![CDATA[NOT (REMOVE = "ALL")]]></Custom>
+      <Custom Action="InstallHomeHttp" After="InstallHomeDns"><![CDATA[NOT (REMOVE = "ALL")]]></Custom>
+      <Custom Action="StartHomeDns" After="InstallHomeHttp"><![CDATA[NOT (REMOVE = "ALL")]]></Custom>
+      <Custom Action="StartHomeHttp" After="StartHomeDns"><![CDATA[NOT (REMOVE = "ALL")]]></Custom>
+      <Custom Action="UninstallHomeHttp" Before="RemoveFiles">(REMOVE = "ALL")</Custom>
+      <Custom Action="UninstallHomeDns" Before="RemoveFiles">(REMOVE = "ALL")</Custom>
     </InstallExecuteSequence>
-  </Fragment>
 
-  <!-- Anchor component and FeatureRef to force this fragment to be linked -->
-  <Fragment>
-    <!-- Create a tiny registry value as KeyPath to anchor this fragment into the product -->
+    <!-- Anchor component and FeatureRef to force this fragment to be linked -->
     <DirectoryRef Id="INSTALLDIR">
       <Component Id="ServicesAnchor" Guid="*">
         <RegistryKey Root="HKLM" Key="Software\astori\home-lab">
           <RegistryValue Name="ServicesAnchor" Type="integer" Value="1" KeyPath="yes"/>
         </RegistryKey>
-        <!-- Make sure uninstall always stops and deletes services, even if CAs didn't run -->
+        <!-- Make sure uninstall always stops and deletes services, even if CAs did not run -->
         <ServiceControl Id="SvcCtl_StopDelete_HomeDns" Name="HomeDnsService" Stop="both" Remove="uninstall" Wait="yes" />
         <ServiceControl Id="SvcCtl_StopDelete_HomeHttp" Name="HomeHttpService" Stop="both" Remove="uninstall" Wait="yes" />
       </Component>
     </DirectoryRef>
-  </Fragment>
 
-  <Fragment>
-    <!-- Reference our anchor component from the main feature declared in the Tauri template -->
-    <FeatureRef Id="MainProgram">
+    <ComponentGroup Id="ServicesComponents">
       <ComponentRef Id="ServicesAnchor" />
-    </FeatureRef>
+    </ComponentGroup>
+
+    <Feature Id="ServicesFeature" Title="Service Integration" Level="1" Display="hidden" AllowAdvertise="no" Absent="disallow">
+      <ComponentGroupRef Id="ServicesComponents" />
+    </Feature>
+
+    <FeatureRef Id="ServicesFeature" />
+    <CustomActionRef Id="InstallHomeDns" />
+    <CustomActionRef Id="InstallHomeHttp" />
+    <CustomActionRef Id="StartHomeDns" />
+    <CustomActionRef Id="StartHomeHttp" />
+    <CustomActionRef Id="UninstallHomeDns" />
+    <CustomActionRef Id="UninstallHomeHttp" />
+    <CustomActionRef Id="TraceInstallServices" />
+    <CustomActionRef Id="TraceAfterInstallFiles" />
+    <CustomActionRef Id="TraceUninstallServices" />
   </Fragment>
 </Wix>

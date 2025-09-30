@@ -139,19 +139,43 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          try {
-            ./scripts/tauri-msi-relink.ps1 -Relink
-          } catch {
-            Write-Warning "MSI relink failed, keeping original bundle: $($_.Exception.Message)"
+          $wixRoot = Join-Path $env:LOCALAPPDATA 'tauri\WixTools314'
+          $candle = Join-Path $wixRoot 'candle.exe'
+          $light  = Join-Path $wixRoot 'light.exe'
+          $mainWxs = 'target/release/wix/x64/main.wxs'
+          $fragWxs = 'home-lab/src-tauri/resources/install-services.wxs'
+          $msiDir  = 'target/release/bundle/msi'
+          if (-not (Test-Path $candle) -or -not (Test-Path $light)) {
+            throw "WiX tools not found under $wixRoot"
           }
-          $msiDir = 'target/release/bundle/msi'
-          $servicesMsi = Get-ChildItem $msiDir -Filter '*_services.msi' -ErrorAction SilentlyContinue | Select-Object -First 1
-          if ($servicesMsi) {
-            $primaryMsi = Join-Path $msiDir 'home-lab_0.1.0_x64_en-US.msi'
-            Move-Item -Force $servicesMsi.FullName $primaryMsi
+          if (-not (Test-Path $mainWxs)) { throw "main.wxs missing at $mainWxs" }
+          if (-not (Test-Path $fragWxs)) { throw "Fragment missing at $fragWxs" }
+          $content = Get-Content $mainWxs -Raw
+          if ($content -notmatch 'ComponentGroupRef Id="ServicesComponents"') {
+            $content = [System.Text.RegularExpressions.Regex]::Replace(
+              $content,
+              '(<Feature\s+Id="MainProgram"[\s\S]*?)(\r?\n\s*</Feature>)',
+              { param($m)
+                  $head = $m.Groups[1].Value.TrimEnd()
+                  $tail = $m.Groups[2].Value
+                  if ($head -match 'ComponentGroupRef Id="ServicesComponents"') { return $m.Value }
+                  return $head + [Environment]::NewLine + '        <ComponentGroupRef Id="ServicesComponents" />' + $tail
+              },
+              1
+            )
+            Set-Content $mainWxs -Value $content
+            Write-Host 'Injected ComponentGroupRef into main.wxs'
           }
-          if (-not (Test-Path 'target/release/bundle/msi/home-lab_0.1.0_x64_en-US.msi')) {
+          & $candle -nologo -ext WixUIExtension -out 'target/release/wix/x64/install-services.wixobj' $fragWxs
+          $primaryMsi  = Join-Path $msiDir 'home-lab_0.1.0_x64_en-US.msi'
+          $relinkedMsi = Join-Path $msiDir 'home-lab_0.1.0_x64_en-US_services.msi'
+          & $light -nologo -v -ext WixUIExtension -loc 'target/release/wix/x64/locale.wxl' -out $relinkedMsi 'target/release/wix/x64/main.wixobj' 'target/release/wix/x64/install-services.wixobj'
+          if (-not (Test-Path $primaryMsi)) {
             throw 'MSI bundle missing after relink step'
+          }
+          if (Test-Path $relinkedMsi) {
+            Remove-Item $primaryMsi -ErrorAction SilentlyContinue
+            Move-Item $relinkedMsi $primaryMsi -Force
           }
           Remove-Item (Join-Path $msiDir '*_services.msi') -ErrorAction SilentlyContinue
           Get-ChildItem $msiDir | Format-Table -AutoSize
@@ -169,4 +193,5 @@ jobs:
           name: msi-package
           path: target/release/bundle/msi/*.msi
           if-no-files-found: error
+
 
