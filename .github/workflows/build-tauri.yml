@@ -144,10 +144,17 @@ jobs:
           } catch {
             Write-Warning "MSI relink failed, keeping original bundle: $($_.Exception.Message)"
           }
+          $msiDir = 'target/release/bundle/msi'
+          $servicesMsi = Get-ChildItem $msiDir -Filter '*_services.msi' -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($servicesMsi) {
+            $primaryMsi = Join-Path $msiDir 'home-lab_0.1.0_x64_en-US.msi'
+            Move-Item -Force $servicesMsi.FullName $primaryMsi
+          }
           if (-not (Test-Path 'target/release/bundle/msi/home-lab_0.1.0_x64_en-US.msi')) {
             throw 'MSI bundle missing after relink step'
           }
-          Get-ChildItem target/release/bundle/msi | Format-Table -AutoSize
+          Remove-Item (Join-Path $msiDir '*_services.msi') -ErrorAction SilentlyContinue
+          Get-ChildItem $msiDir | Format-Table -AutoSize
 
       - name: Upload NSIS setup
         uses: actions/upload-artifact@v4
