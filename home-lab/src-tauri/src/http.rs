@@ -15,7 +15,7 @@ pub mod homehttp {
 use homehttp::homehttp::v1::home_http_client::HomeHttpClient;
 use homehttp::homehttp::v1::*;
 
-// Pipes nommés: en dev "-dev", en prod sans suffixe. On essaie les deux.
+// Pipes nommes: en dev "-dev", en prod sans suffixe. On essaie les deux.
 const PIPE_DEV: &str = r"\\.\pipe\home-http-dev";
 const PIPE_REL: &str = r"\\.\pipe\home-http";
 
@@ -41,8 +41,17 @@ async fn http_make_channel() -> Result<Channel> {
     }
 }
 
-fn map_err<E: std::fmt::Display>(e: E) -> String { e.to_string() }
-
+fn map_err<E: std::fmt::Display + std::fmt::Debug>(e: E) -> String {
+    let mut msg = e.to_string();
+    if msg.trim().is_empty() || msg == "transport error" {
+        msg = format!("{:?}", e);
+    }
+    let lower = msg.to_ascii_lowercase();
+    if lower.contains("os error 2") || lower.contains("file specified") || lower.contains("no such file or directory") {
+        msg.push_str(" - pipe introuvable ? Verifiez que le service Windows correspondant est demarre.");
+    }
+    msg
+}
 #[derive(Serialize)]
 pub struct AckOut { pub ok: bool, pub message: String }
 
@@ -112,4 +121,3 @@ pub async fn http_remove_route(host: String) -> Result<AckOut, String> {
     let a = resp.into_inner();
     Ok(AckOut { ok: a.ok, message: a.message })
 }
-

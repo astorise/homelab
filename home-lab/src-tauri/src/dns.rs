@@ -16,12 +16,12 @@ pub mod homedns {
 use homedns::homedns::v1::home_dns_client::HomeDnsClient;
 use homedns::homedns::v1::*;
 
-// Pipes nommés: en dev "-dev", en prod sans suffixe. On essaie les deux.
+// Pipes nommes: en dev "-dev", en prod sans suffixe. On essaie les deux.
 const PIPE_DEV: &str = r"\\.\pipe\home-dns-dev";
 const PIPE_REL: &str = r"\\.\pipe\home-dns";
 
 async fn connect_pipe(path: &str) -> Result<Channel> {
-    // Endpoint URI factice; le connecteur ouvre le pipe nommé.
+    // Endpoint URI factice; le connecteur ouvre le pipe nomme.
     let ep = Endpoint::try_from("http://pipe.invalid")?
         .connect_timeout(Duration::from_secs(5))
         .tcp_nodelay(true);
@@ -45,8 +45,16 @@ async fn dns_make_channel() -> Result<Channel> {
     }
 }
 
-fn map_err<E: std::fmt::Display>(e: E) -> String {
-    e.to_string()
+fn map_err<E: std::fmt::Display + std::fmt::Debug>(e: E) -> String {
+    let mut msg = e.to_string();
+    if msg.trim().is_empty() || msg == "transport error" {
+        msg = format!("{:?}", e);
+    }
+    let lower = msg.to_ascii_lowercase();
+    if lower.contains("os error 2") || lower.contains("file specified") || lower.contains("no such file or directory") {
+        msg.push_str(" - pipe introuvable ? Verifiez que le service Windows correspondant est demarre.");
+    }
+    msg
 }
 
 #[derive(Serialize)]
@@ -188,4 +196,3 @@ pub async fn dns_remove_record(
         message: a.message,
     })
 }
-
