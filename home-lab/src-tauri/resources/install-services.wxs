@@ -1,4 +1,10 @@
 <?xml version="1.0" encoding="UTF-8"?>
+<?if $(sys.BUILDARCH) = "x86"?>
+  <?define ServicesComponentWin64 = "no" ?>
+<?else?>
+  <?define ServicesComponentWin64 = "yes" ?>
+<?endif?>
+
 <Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
   <!--
     WiX fragment to install/uninstall and start the home-dns/home-http services.
@@ -48,7 +54,7 @@
 
     <!-- Anchor component and FeatureRef to force this fragment to be linked -->
     <DirectoryRef Id="INSTALLDIR">
-      <Component Id="ServicesAnchor" Guid="*">
+      <Component Id="ServicesAnchor" Guid="*" Win64="$(var.ServicesComponentWin64)">
         <RegistryKey Root="HKLM" Key="Software\astori\home-lab">
           <RegistryValue Name="ServicesAnchor" Type="integer" Value="1" KeyPath="yes"/>
         </RegistryKey>
@@ -78,3 +84,4 @@
     <CustomActionRef Id="TraceUninstallServices" />
   </Fragment>
 </Wix>
+
