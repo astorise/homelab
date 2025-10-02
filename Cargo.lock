@@ -1796,6 +1796,7 @@ dependencies = [
  "tonic",
  "tonic-build",
  "windows-service",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -1824,6 +1825,7 @@ dependencies = [
  "tonic",
  "tonic-build",
  "windows-service",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

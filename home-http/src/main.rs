@@ -1,34 +1,40 @@
 #![cfg_attr(not(windows), allow(dead_code))]
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
+use bytes::Bytes;
 use flexi_logger::{Age, Cleanup, Criterion, Duplicate, FileSpec, Logger, Naming};
 use futures_util::StreamExt;
 use http::Uri;
-use hyper::{Request, Response};
+use http_body_util::{BodyExt, Full, combinators::BoxBody};
 use hyper::body::Incoming;
+use hyper::{Request, Response};
 use hyper_util::{
-    client::legacy::{connect::HttpConnector, Client},
+    client::legacy::{Client, connect::HttpConnector},
     rt::{TokioExecutor, TokioIo},
     server::conn::auto::Builder as ServerBuilder,
 };
-use http_body_util::{Full, BodyExt, combinators::BoxBody};
-use bytes::Bytes;
-use log::{error, info, warn, LevelFilter};
+use log::{LevelFilter, error, info, warn};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use std::ffi::{OsStr, OsString, c_void};
+use std::io;
+use std::mem;
+use std::os::windows::ffi::OsStrExt;
+use std::ptr;
 use std::{
     collections::HashMap,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc,
+        atomic::{AtomicBool, Ordering},
     },
     thread,
     time::Duration,
 };
+
 use tokio::{
-    io::{AsyncRead, AsyncWrite, ReadBuf, AsyncWriteExt},
+    io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf},
     net::{TcpListener, TcpStream},
     runtime::Runtime,
     sync::mpsc,
@@ -37,6 +43,11 @@ use tonic::transport::server::Connected;
 use windows_service::service::*;
 use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
 use windows_service::{define_windows_service, service_manager::*};
+use windows_sys::Win32::Foundation::LocalFree;
+use windows_sys::Win32::Security::Authorization::{
+    ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+};
+use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 
 // Build metadata (set in build.rs)
 const BUILD_GIT_SHA: &str = env!("BUILD_GIT_SHA");
@@ -78,19 +89,37 @@ struct HttpConfig {
     #[serde(default)]
     log_level: Option<String>,
 }
-fn default_http_port() -> u16 { 80 }
-fn default_https_port() -> u16 { 443 }
-fn default_resolve() -> String { "auto".into() }
-fn default_refresh() -> u64 { 30 }
+fn default_http_port() -> u16 {
+    80
+}
+fn default_https_port() -> u16 {
+    443
+}
+fn default_resolve() -> String {
+    "auto".into()
+}
+fn default_refresh() -> u64 {
+    30
+}
 
-fn program_data_dir() -> PathBuf { PathBuf::from(r"C:\ProgramData\home-http") }
-fn logs_dir() -> PathBuf { program_data_dir().join("logs") }
-fn config_path() -> PathBuf { program_data_dir().join("http.yaml") }
+fn program_data_dir() -> PathBuf {
+    PathBuf::from(r"C:\ProgramData\home-http")
+}
+fn logs_dir() -> PathBuf {
+    program_data_dir().join("logs")
+}
+fn config_path() -> PathBuf {
+    program_data_dir().join("http.yaml")
+}
 
 fn level_from_cfg(cfg: &HttpConfig) -> LevelFilter {
     match cfg.log_level.as_deref().unwrap_or("info") {
-        "trace" => LevelFilter::Trace, "debug" => LevelFilter::Debug, "warn" => LevelFilter::Warn,
-        "error" => LevelFilter::Error, "off" => LevelFilter::Off, _ => LevelFilter::Info
+        "trace" => LevelFilter::Trace,
+        "debug" => LevelFilter::Debug,
+        "warn" => LevelFilter::Warn,
+        "error" => LevelFilter::Error,
+        "off" => LevelFilter::Off,
+        _ => LevelFilter::Info,
     }
 }
 
@@ -108,10 +137,16 @@ fn init_logger(level: LevelFilter) -> Result<()> {
                 .suffix("log"),
         )
         .duplicate_to_stderr(Duplicate::Error)
-        .rotate(Criterion::Age(Age::Day), Naming::Timestamps, Cleanup::KeepLogFiles(14));
+        .rotate(
+            Criterion::Age(Age::Day),
+            Naming::Timestamps,
+            Cleanup::KeepLogFiles(14),
+        );
     match logger.start() {
         Ok(_) => {}
-        Err(e) => { eprintln!("failed to start logger (continuing): {e}"); }
+        Err(e) => {
+            eprintln!("failed to start logger (continuing): {e}");
+        }
     }
     Ok(())
 }
@@ -121,13 +156,19 @@ fn load_config_or_init() -> Result<HttpConfig> {
     if !p.exists() {
         std::fs::create_dir_all(program_data_dir())?;
         let cfg = HttpConfig {
-            http: 80, https: 443, wsl_resolve: "auto".into(), wsl_ip: None, wsl_refresh_secs: 30,
-            routes: HashMap::new(), log_level: Some("info".into()),
+            http: 80,
+            https: 443,
+            wsl_resolve: "auto".into(),
+            wsl_ip: None,
+            wsl_refresh_secs: 30,
+            routes: HashMap::new(),
+            log_level: Some("info".into()),
         };
         save_config(&cfg)?;
         return Ok(cfg);
     }
-    let s = std::fs::read_to_string(&p).with_context(|| format!("lecture config: {}", p.display()))?;
+    let s =
+        std::fs::read_to_string(&p).with_context(|| format!("lecture config: {}", p.display()))?;
     let cfg: HttpConfig = serde_yaml::from_str(&s).context("YAML invalide")?;
     Ok(cfg)
 }
@@ -150,13 +191,22 @@ fn wsl_ip(cfg: &HttpConfig, cache: &Arc<Mutex<(u64, Option<String>)>>) -> String
     {
         let mut guard = cache.lock();
         if let Some(ip) = &guard.1 {
-            if now - guard.0 < cfg.wsl_refresh_secs { return ip.clone(); }
+            if now - guard.0 < cfg.wsl_refresh_secs {
+                return ip.clone();
+            }
         }
-        let out = std::process::Command::new("wsl.exe").args(["-e","sh","-lc","hostname -I"]).output();
+        let out = std::process::Command::new("wsl.exe")
+            .args(["-e", "sh", "-lc", "hostname -I"])
+            .output();
         if let Ok(out) = out {
             if out.status.success() {
-                if let Some(ip) = String::from_utf8_lossy(&out.stdout).split_whitespace().find(|t| t.parse::<std::net::Ipv4Addr>().is_ok()) {
-                    guard.0 = now; guard.1 = Some(ip.to_string()); return ip.to_string();
+                if let Some(ip) = String::from_utf8_lossy(&out.stdout)
+                    .split_whitespace()
+                    .find(|t| t.parse::<std::net::Ipv4Addr>().is_ok())
+                {
+                    guard.0 = now;
+                    guard.1 = Some(ip.to_string());
+                    return ip.to_string();
                 }
             }
         }
@@ -171,50 +221,98 @@ struct Shared {
     cache: Arc<Mutex<(u64, Option<String>)>>,
     stopping: Arc<AtomicBool>,
 }
-struct HomeHttpSvc { shared: Shared }
+struct HomeHttpSvc {
+    shared: Shared,
+}
 
 #[tonic::async_trait]
 impl HomeHttp for HomeHttpSvc {
-    async fn stop_service(&self, _req: tonic::Request<Empty>) -> std::result::Result<tonic::Response<Acknowledge>, tonic::Status> {
+    async fn stop_service(
+        &self,
+        _req: tonic::Request<Empty>,
+    ) -> std::result::Result<tonic::Response<Acknowledge>, tonic::Status> {
         self.shared.stopping.store(true, Ordering::SeqCst);
-        Ok(tonic::Response::new(Acknowledge{ ok: true, message: "stopping".into() }))
-    }
-    async fn reload_config(&self, _req: tonic::Request<Empty>) -> std::result::Result<tonic::Response<Acknowledge>, tonic::Status> {
-        let new_cfg = load_config_or_init().map_err(to_status)?;
-        *self.shared.cfg.lock() = new_cfg;
-        Ok(tonic::Response::new(Acknowledge{ ok: true, message: "reloaded".into() }))
-    }
-    async fn get_status(&self, _req: tonic::Request<Empty>) -> std::result::Result<tonic::Response<StatusResponse>, tonic::Status> {
-        let cfg = self.shared.cfg.lock().clone();
-        Ok(tonic::Response::new(StatusResponse{
-            state: if self.shared.stopping.load(Ordering::SeqCst) { "stopping".into() } else { "running".into() },
-            log_level: cfg.log_level.unwrap_or_else(|| "info".into())
+        Ok(tonic::Response::new(Acknowledge {
+            ok: true,
+            message: "stopping".into(),
         }))
     }
-    async fn add_route(&self, req: tonic::Request<AddRouteRequest>) -> std::result::Result<tonic::Response<Acknowledge>, tonic::Status> {
+    async fn reload_config(
+        &self,
+        _req: tonic::Request<Empty>,
+    ) -> std::result::Result<tonic::Response<Acknowledge>, tonic::Status> {
+        let new_cfg = load_config_or_init().map_err(to_status)?;
+        *self.shared.cfg.lock() = new_cfg;
+        Ok(tonic::Response::new(Acknowledge {
+            ok: true,
+            message: "reloaded".into(),
+        }))
+    }
+    async fn get_status(
+        &self,
+        _req: tonic::Request<Empty>,
+    ) -> std::result::Result<tonic::Response<StatusResponse>, tonic::Status> {
+        let cfg = self.shared.cfg.lock().clone();
+        Ok(tonic::Response::new(StatusResponse {
+            state: if self.shared.stopping.load(Ordering::SeqCst) {
+                "stopping".into()
+            } else {
+                "running".into()
+            },
+            log_level: cfg.log_level.unwrap_or_else(|| "info".into()),
+        }))
+    }
+    async fn add_route(
+        &self,
+        req: tonic::Request<AddRouteRequest>,
+    ) -> std::result::Result<tonic::Response<Acknowledge>, tonic::Status> {
         let r = req.into_inner();
-        let port_u16: u16 = r.port.try_into().map_err(|_| tonic::Status::invalid_argument("port out of range for u16"))?;
+        let port_u16: u16 = r
+            .port
+            .try_into()
+            .map_err(|_| tonic::Status::invalid_argument("port out of range for u16"))?;
         let mut cfg = self.shared.cfg.lock().clone();
         cfg.routes.insert(r.host.to_lowercase(), port_u16);
         save_config(&cfg).map_err(to_status)?;
         *self.shared.cfg.lock() = cfg;
-        Ok(tonic::Response::new(Acknowledge{ ok: true, message: "added".into() }))
+        Ok(tonic::Response::new(Acknowledge {
+            ok: true,
+            message: "added".into(),
+        }))
     }
-    async fn remove_route(&self, req: tonic::Request<RemoveRouteRequest>) -> std::result::Result<tonic::Response<Acknowledge>, tonic::Status> {
+    async fn remove_route(
+        &self,
+        req: tonic::Request<RemoveRouteRequest>,
+    ) -> std::result::Result<tonic::Response<Acknowledge>, tonic::Status> {
         let r = req.into_inner();
         let mut cfg = self.shared.cfg.lock().clone();
         cfg.routes.remove(&r.host.to_lowercase());
         save_config(&cfg).map_err(to_status)?;
         *self.shared.cfg.lock() = cfg;
-        Ok(tonic::Response::new(Acknowledge{ ok: true, message: "removed".into() }))
+        Ok(tonic::Response::new(Acknowledge {
+            ok: true,
+            message: "removed".into(),
+        }))
     }
-    async fn list_routes(&self, _req: tonic::Request<Empty>) -> std::result::Result<tonic::Response<ListRoutesResponse>, tonic::Status> {
+    async fn list_routes(
+        &self,
+        _req: tonic::Request<Empty>,
+    ) -> std::result::Result<tonic::Response<ListRoutesResponse>, tonic::Status> {
         let cfg = self.shared.cfg.lock().clone();
-        let routes = cfg.routes.into_iter().map(|(h,p)| list_routes_response::Route{ host: h, port: p as u32 }).collect();
-        Ok(tonic::Response::new(ListRoutesResponse{ routes }))
+        let routes = cfg
+            .routes
+            .into_iter()
+            .map(|(h, p)| list_routes_response::Route {
+                host: h,
+                port: p as u32,
+            })
+            .collect();
+        Ok(tonic::Response::new(ListRoutesResponse { routes }))
     }
 }
-fn to_status(e: anyhow::Error) -> tonic::Status { tonic::Status::internal(format!("{e:#}")) }
+fn to_status(e: anyhow::Error) -> tonic::Status {
+    tonic::Status::internal(format!("{e:#}"))
+}
 
 // ---- Named pipe incoming (tonic Connected impl pour 0.12) ----
 use std::pin::Pin;
@@ -224,16 +322,26 @@ use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 struct PipeConn(NamedPipeServer);
 impl Connected for PipeConn {
     type ConnectInfo = ();
-    fn connect_info(&self) -> Self::ConnectInfo { () }
+    fn connect_info(&self) -> Self::ConnectInfo {
+        ()
+    }
 }
 impl Unpin for PipeConn {}
 impl AsyncRead for PipeConn {
-    fn poll_read(self: Pin<&mut Self>, cx: &mut TaskContext<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
         Pin::new(&mut self.get_mut().0).poll_read(cx, buf)
     }
 }
 impl AsyncWrite for PipeConn {
-    fn poll_write(self: Pin<&mut Self>, cx: &mut TaskContext<'_>, data: &[u8]) -> Poll<std::io::Result<usize>> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        data: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
         Pin::new(&mut self.get_mut().0).poll_write(cx, data)
     }
     fn poll_flush(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
@@ -243,7 +351,64 @@ impl AsyncWrite for PipeConn {
         Pin::new(&mut self.get_mut().0).poll_shutdown(cx)
     }
 }
-struct PipeIncoming { rx: mpsc::Receiver<Result<NamedPipeServer, std::io::Error>> }
+const PIPE_SDDL: &str = "D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;LS)(A;;GA;;;NS)(A;;GRGW;;;AU)";
+
+struct PipeSecurity {
+    attrs: SECURITY_ATTRIBUTES,
+    sd: *mut c_void,
+}
+
+impl PipeSecurity {
+    fn new() -> io::Result<Self> {
+        let mut wide: Vec<u16> = OsStr::new(PIPE_SDDL).encode_wide().collect();
+        wide.push(0);
+        let mut sd_ptr: *mut c_void = ptr::null_mut();
+        let ok = unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                wide.as_ptr(),
+                SDDL_REVISION_1 as u32,
+                &mut sd_ptr,
+                ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let attrs = SECURITY_ATTRIBUTES {
+            nLength: mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: sd_ptr,
+            bInheritHandle: 0,
+        };
+        Ok(Self { attrs, sd: sd_ptr })
+    }
+
+    fn as_mut_ptr(&mut self) -> *mut c_void {
+        &mut self.attrs as *mut _ as *mut c_void
+    }
+}
+
+impl Drop for PipeSecurity {
+    fn drop(&mut self) {
+        if !self.sd.is_null() {
+            unsafe {
+                LocalFree(self.sd);
+            }
+            self.sd = ptr::null_mut();
+        }
+    }
+}
+
+fn create_pipe_server(name: &str, first: bool) -> io::Result<NamedPipeServer> {
+    let mut security = PipeSecurity::new()?;
+    unsafe {
+        ServerOptions::new()
+            .first_pipe_instance(first)
+            .create_with_security_attributes_raw(name, security.as_mut_ptr())
+    }
+}
+struct PipeIncoming {
+    rx: mpsc::Receiver<Result<NamedPipeServer, std::io::Error>>,
+}
 impl PipeIncoming {
     fn new(name: &str) -> Self {
         let (tx, rx) = mpsc::channel(16);
@@ -253,10 +418,8 @@ impl PipeIncoming {
             // to avoid unbounded pending instances (memory/CPU leak).
             let mut first = true;
             loop {
-                let created = ServerOptions::new()
-                    .first_pipe_instance(first)
-                    .create(&name)
-                    .or_else(|_| ServerOptions::new().first_pipe_instance(false).create(&name));
+                let created =
+                    create_pipe_server(&name, first).or_else(|_| create_pipe_server(&name, false));
                 match created {
                     Ok(pipe) => {
                         first = false;
@@ -286,7 +449,10 @@ impl futures_util::stream::Stream for PipeIncoming {
 
 // ---- HTTP http (Hyper 1.x) ----
 #[derive(Clone)]
-struct HttpHttp { client: Client<HttpConnector, Full<Bytes>>, shared: Shared }
+struct HttpHttp {
+    client: Client<HttpConnector, Full<Bytes>>,
+    shared: Shared,
+}
 impl HttpHttp {
     fn new(shared: Shared) -> Self {
         let client = Client::builder(TokioExecutor::new()).build_http();
@@ -301,7 +467,12 @@ impl HttpHttp {
             tokio::spawn(async move {
                 let svc = hyper::service::service_fn(move |req: Request<Incoming>| {
                     let me = me.clone();
-                    async move { me.handle(req).await.map_err(|e| { warn!("http handler error from {}: {e:?}", peer); e }) }
+                    async move {
+                        me.handle(req).await.map_err(|e| {
+                            warn!("http handler error from {}: {e:?}", peer);
+                            e
+                        })
+                    }
                 });
                 let io = TokioIo::new(io);
                 if let Err(e) = ServerBuilder::new(TokioExecutor::new())
@@ -313,18 +484,33 @@ impl HttpHttp {
             });
         }
     }
-    async fn handle(&self, req: Request<Incoming>) -> Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error> {
-        let host_hdr = req.headers().get(http::header::HOST).and_then(|v| v.to_str().ok()).unwrap_or("");
-        let host = host_hdr.split(':').next().unwrap_or(host_hdr).to_lowercase();
+    async fn handle(
+        &self,
+        req: Request<Incoming>,
+    ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error> {
+        let host_hdr = req
+            .headers()
+            .get(http::header::HOST)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        let host = host_hdr
+            .split(':')
+            .next()
+            .unwrap_or(host_hdr)
+            .to_lowercase();
         let port = self.shared.cfg.lock().routes.get(&host).copied();
         let Some(port) = port else {
-    let body = Full::from(Bytes::from_static(b"bad gateway: no route"))
-        .map_err(|never| match never {})  // Infallible -> hyper::Error
-        .boxed();                         // -> BoxBody<Bytes, hyper::Error>
-    return Ok(Response::builder().status(502).body(body).unwrap());
-};
+            let body = Full::from(Bytes::from_static(b"bad gateway: no route"))
+                .map_err(|never| match never {}) // Infallible -> hyper::Error
+                .boxed(); // -> BoxBody<Bytes, hyper::Error>
+            return Ok(Response::builder().status(502).body(body).unwrap());
+        };
         let ip = wsl_ip(&self.shared.cfg.lock(), &self.shared.cache);
-        let path_q = req.uri().path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
+        let path_q = req
+            .uri()
+            .path_and_query()
+            .map(|pq| pq.as_str())
+            .unwrap_or("/");
         let new_uri: Uri = format!("http://{}:{}{}", ip, port, path_q).parse().unwrap();
 
         // Convert server Incoming -> bytes -> Full
@@ -335,16 +521,16 @@ impl HttpHttp {
 
         // Http avec client hyper
         let resp = match self.client.request(out_req).await {
-    Ok(r) => r,
-    Err(e) => {
-        // Convertit l’erreur client en 502 côté http
-        let msg = format!("upstream error: {e}");
-        let body = Full::from(Bytes::from(msg))
-            .map_err(|never| match never {}) // Infallible -> hyper::Error
-            .boxed();
-        return Ok(Response::builder().status(502).body(body).unwrap());
-    }
-};
+            Ok(r) => r,
+            Err(e) => {
+                // Convertit l’erreur client en 502 côté http
+                let msg = format!("upstream error: {e}");
+                let body = Full::from(Bytes::from(msg))
+                    .map_err(|never| match never {}) // Infallible -> hyper::Error
+                    .boxed();
+                return Ok(Response::builder().status(502).body(body).unwrap());
+            }
+        };
         let (parts, body_in) = resp.into_parts();
         let body = body_in.boxed(); // Incoming -> BoxBody<Bytes, hyper::Error>
         Ok(Response::from_parts(parts, body))
@@ -352,8 +538,14 @@ impl HttpHttp {
 }
 
 // ---- TLS SNI pass-through ----
-struct TlsSnihttp { shared: Shared }
-impl TlsSnihttp { fn new(shared: Shared) -> Self { Self { shared } } }
+struct TlsSnihttp {
+    shared: Shared,
+}
+impl TlsSnihttp {
+    fn new(shared: Shared) -> Self {
+        Self { shared }
+    }
+}
 impl TlsSnihttp {
     async fn serve(&self, addr: SocketAddr) -> Result<()> {
         let listener = TcpListener::bind(addr).await?;
@@ -374,53 +566,94 @@ async fn handle_tls_conn(inb: &mut TcpStream, _peer: SocketAddr, shared: Shared)
     inb.set_nodelay(true)?;
     let mut buf = vec![0u8; MAX_CLIENT_HELLO];
     let n = inb.peek(&mut buf).await?;
-    if n < 5 { return Err(anyhow!("client hello too short")); }
+    if n < 5 {
+        return Err(anyhow!("client hello too short"));
+    }
     let host = parse_sni(&buf[..n]).context("parse sni")?.to_lowercase();
-    let port = shared.cfg.lock().routes.get(&host).copied().context("no route for host")?;
+    let port = shared
+        .cfg
+        .lock()
+        .routes
+        .get(&host)
+        .copied()
+        .context("no route for host")?;
     let ip = wsl_ip(&shared.cfg.lock(), &shared.cache);
     let mut outb = TcpStream::connect((ip.as_str(), port)).await?;
     outb.set_nodelay(true)?;
     let (mut ri, mut wi) = inb.split();
     let (mut ro, mut wo) = outb.split();
-    let c2s = async { tokio::io::copy(&mut ri, &mut wo).await?; wo.shutdown().await.map_err(|e| anyhow!(e)) };
-    let s2c = async { tokio::io::copy(&mut ro, &mut wi).await?; wi.shutdown().await.map_err(|e| anyhow!(e)) };
-    tokio::try_join!(c2s, s2c)?; Ok(())
+    let c2s = async {
+        tokio::io::copy(&mut ri, &mut wo).await?;
+        wo.shutdown().await.map_err(|e| anyhow!(e))
+    };
+    let s2c = async {
+        tokio::io::copy(&mut ro, &mut wi).await?;
+        wi.shutdown().await.map_err(|e| anyhow!(e))
+    };
+    tokio::try_join!(c2s, s2c)?;
+    Ok(())
 }
 fn parse_sni(mut buf: &[u8]) -> Result<String> {
-    if buf.len() < 5 || buf[0] != 22 { anyhow::bail!("not handshake"); }
+    if buf.len() < 5 || buf[0] != 22 {
+        anyhow::bail!("not handshake");
+    }
     buf = &buf[5..];
-    if buf.len() < 4 || buf[0] != 1 { anyhow::bail!("not clienthello"); }
+    if buf.len() < 4 || buf[0] != 1 {
+        anyhow::bail!("not clienthello");
+    }
     let hs_len = u32::from_be_bytes([0, buf[1], buf[2], buf[3]]) as usize;
-    if buf.len() < 4 + hs_len { anyhow::bail!("hello truncated"); }
-    let mut p = &buf[4..4+hs_len];
-    if p.len() < 34 { anyhow::bail!("short"); }
+    if buf.len() < 4 + hs_len {
+        anyhow::bail!("hello truncated");
+    }
+    let mut p = &buf[4..4 + hs_len];
+    if p.len() < 34 {
+        anyhow::bail!("short");
+    }
     p = &p[34..];
-    if p.is_empty() { anyhow::bail!("sid"); }
-    let sid_len = p[0] as usize; p = &p[1+sid_len..];
-    if p.len() < 2 { anyhow::bail!("cs"); }
-    let cs_len = u16::from_be_bytes([p[0], p[1]]) as usize; p = &p[2+cs_len..];
-    if p.is_empty() { anyhow::bail!("cm"); }
-    let cm_len = p[0] as usize; p = &p[1+cm_len..];
-    if p.len() < 2 { anyhow::bail!("no ext"); }
-    let ext_len = u16::from_be_bytes([p[0], p[1]]) as usize; p = &p[2..2+ext_len];
+    if p.is_empty() {
+        anyhow::bail!("sid");
+    }
+    let sid_len = p[0] as usize;
+    p = &p[1 + sid_len..];
+    if p.len() < 2 {
+        anyhow::bail!("cs");
+    }
+    let cs_len = u16::from_be_bytes([p[0], p[1]]) as usize;
+    p = &p[2 + cs_len..];
+    if p.is_empty() {
+        anyhow::bail!("cm");
+    }
+    let cm_len = p[0] as usize;
+    p = &p[1 + cm_len..];
+    if p.len() < 2 {
+        anyhow::bail!("no ext");
+    }
+    let ext_len = u16::from_be_bytes([p[0], p[1]]) as usize;
+    p = &p[2..2 + ext_len];
     let mut q = p;
     while q.len() >= 4 {
         let typ = u16::from_be_bytes([q[0], q[1]]);
         let len = u16::from_be_bytes([q[2], q[3]]) as usize;
         q = &q[4..];
-        let body = &q[..len]; q = &q[len..];
+        let body = &q[..len];
+        q = &q[len..];
         if typ == 0 {
             let mut r = body;
-            if r.len() < 2 { anyhow::bail!("sni list len"); }
+            if r.len() < 2 {
+                anyhow::bail!("sni list len");
+            }
             let list_len = u16::from_be_bytes([r[0], r[1]]) as usize;
-            r = &r[2..2+list_len];
+            r = &r[2..2 + list_len];
             let mut e = r;
             while e.len() >= 3 {
                 let name_type = e[0];
                 let nl = u16::from_be_bytes([e[1], e[2]]) as usize;
                 e = &e[3..];
-                let name = &e[..nl]; e = &e[nl..];
-                if name_type == 0 { return Ok(std::str::from_utf8(name)?.to_string()); }
+                let name = &e[..nl];
+                e = &e[nl..];
+                if name_type == 0 {
+                    return Ok(std::str::from_utf8(name)?.to_string());
+                }
             }
         }
     }
@@ -432,7 +665,7 @@ static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 define_windows_service!(ffi_service_main, service_main);
 #[allow(dead_code)]
-fn service_main(_args: Vec<std::ffi::OsString>) {
+fn service_main(_args: Vec<OsString>) {
     if let Err(e) = run_service() {
         eprintln!("service error: {e:?}");
     }
@@ -463,11 +696,20 @@ fn run_service() -> Result<()> {
     set_status(ServiceState::StartPending);
 
     eprintln!("[home-http] service control handler registered");
-    let cfg = load_config_or_init()?; let level = level_from_cfg(&cfg); init_logger(level)?;
+    let cfg = load_config_or_init()?;
+    let level = level_from_cfg(&cfg);
+    init_logger(level)?;
     info!("Service starting (level={:?})", level);
-    info!("build tag={} sha={} at {}", BUILD_GIT_TAG, BUILD_GIT_SHA, BUILD_TIME);
+    info!(
+        "build tag={} sha={} at {}",
+        BUILD_GIT_TAG, BUILD_GIT_SHA, BUILD_TIME
+    );
 
-    let shared = Shared { cfg: Arc::new(Mutex::new(cfg)), cache: Arc::new(Mutex::new((0, None))), stopping: Arc::new(AtomicBool::new(false)) };
+    let shared = Shared {
+        cfg: Arc::new(Mutex::new(cfg)),
+        cache: Arc::new(Mutex::new((0, None))),
+        stopping: Arc::new(AtomicBool::new(false)),
+    };
     let shared_clone = shared.clone();
 
     eprintln!("[home-http] creating tokio runtime");
@@ -475,9 +717,15 @@ fn run_service() -> Result<()> {
     // gRPC IPC (named pipe)
     rt.spawn(async move {
         let incoming = PipeIncoming::new(PIPE_NAME).map(|res| res.map(PipeConn));
-        let svc = HomeHttpServer::new(HomeHttpSvc { shared: shared_clone });
+        let svc = HomeHttpServer::new(HomeHttpSvc {
+            shared: shared_clone,
+        });
         info!("gRPC IPC listening on named pipe {}", PIPE_NAME);
-        if let Err(e) = tonic::transport::Server::builder().add_service(svc).serve_with_incoming(incoming).await {
+        if let Err(e) = tonic::transport::Server::builder()
+            .add_service(svc)
+            .serve_with_incoming(incoming)
+            .await
+        {
             error!("gRPC server error: {e:?}");
         }
     });
@@ -490,11 +738,15 @@ fn run_service() -> Result<()> {
 
     rt.spawn(async move {
         info!("Starting HTTP listener on {}", http_addr);
-        if let Err(e) = http.serve(http_addr).await { error!("http server: {e:?}"); }
+        if let Err(e) = http.serve(http_addr).await {
+            error!("http server: {e:?}");
+        }
     });
     rt.spawn(async move {
         info!("Starting HTTPS (SNI) listener on {}", https_addr);
-        if let Err(e) = tls.serve(https_addr).await { error!("https server: {e:?}"); }
+        if let Err(e) = tls.serve(https_addr).await {
+            error!("https server: {e:?}");
+        }
     });
 
     set_status(ServiceState::Running);
@@ -513,7 +765,10 @@ fn run_service() -> Result<()> {
 
 fn install_service() -> Result<()> {
     let exe_path = std::env::current_exe()?;
-    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE)?;
+    let manager = ServiceManager::local_computer(
+        None::<&str>,
+        ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE,
+    )?;
     // Idempotent install: if service exists, do nothing.
     if let Ok(_svc) = manager.open_service(SERVICE_NAME, ServiceAccess::QUERY_STATUS) {
         info!("Service already installed");
@@ -531,19 +786,27 @@ fn install_service() -> Result<()> {
         account_name: None,
         account_password: None,
     };
-    let service = manager.create_service(&service_info, ServiceAccess::CHANGE_CONFIG | ServiceAccess::START)?;
+    let service = manager.create_service(
+        &service_info,
+        ServiceAccess::CHANGE_CONFIG | ServiceAccess::START,
+    )?;
     service.set_description(SERVICE_DESCRIPTION)?;
     Ok(())
 }
 
 fn uninstall_service() -> Result<()> {
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
-    let service = manager.open_service(SERVICE_NAME, ServiceAccess::STOP | ServiceAccess::QUERY_STATUS | ServiceAccess::DELETE)?;
+    let service = manager.open_service(
+        SERVICE_NAME,
+        ServiceAccess::STOP | ServiceAccess::QUERY_STATUS | ServiceAccess::DELETE,
+    )?;
     // Request stop and wait a bit for it
     let _ = service.stop();
     for _ in 0..20 {
         if let Ok(st) = service.query_status() {
-            if st.current_state == ServiceState::Stopped { break; }
+            if st.current_state == ServiceState::Stopped {
+                break;
+            }
         }
         std::thread::sleep(Duration::from_millis(250));
     }
@@ -552,34 +815,62 @@ fn uninstall_service() -> Result<()> {
     // Wait until SCM no longer returns the service; tolerate races
     for _ in 0..20 {
         match manager.open_service(SERVICE_NAME, ServiceAccess::QUERY_STATUS) {
-            Ok(s) => { drop(s); std::thread::sleep(Duration::from_millis(250)); }
+            Ok(s) => {
+                drop(s);
+                std::thread::sleep(Duration::from_millis(250));
+            }
             Err(_) => break,
         }
     }
     Ok(())
 }
 
-fn usage() { eprintln!("Usage: home-http [run|install|uninstall|console]"); }
+fn usage() {
+    eprintln!("Usage: home-http [run|install|uninstall|console]");
+}
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
-    if args.len() <= 1 { usage(); return Ok(()); }
+    if args.len() <= 1 {
+        usage();
+        return Ok(());
+    }
     match args[1].as_str() {
         "run" => {
-            #[cfg(windows)] {
-                if let Err(e) = windows_service::service_dispatcher::start(SERVICE_NAME, ffi_service_main) {
+            #[cfg(windows)]
+            {
+                if let Err(e) =
+                    windows_service::service_dispatcher::start(SERVICE_NAME, ffi_service_main)
+                {
                     eprintln!("service dispatcher start error: {e:?}");
                 }
                 return Ok(());
             }
-            #[cfg(not(windows))] { anyhow::bail!("Windows only"); }
+            #[cfg(not(windows))]
+            {
+                anyhow::bail!("Windows only");
+            }
         }
-        "install" => { install_service()?; println!("Service installé. Modifiez {} puis démarrez le service.", config_path().display()); }
-        "uninstall" => { uninstall_service()?; println!("Service désinstallé."); }
+        "install" => {
+            install_service()?;
+            println!(
+                "Service installé. Modifiez {} puis démarrez le service.",
+                config_path().display()
+            );
+        }
+        "uninstall" => {
+            uninstall_service()?;
+            println!("Service désinstallé.");
+        }
         "console" => {
-            let cfg = load_config_or_init()?; init_logger(level_from_cfg(&cfg))?;
+            let cfg = load_config_or_init()?;
+            init_logger(level_from_cfg(&cfg))?;
             info!("Console mode starting");
-            let shared = Shared { cfg: Arc::new(Mutex::new(cfg)), cache: Arc::new(Mutex::new((0, None))), stopping: Arc::new(AtomicBool::new(false)) };
+            let shared = Shared {
+                cfg: Arc::new(Mutex::new(cfg)),
+                cache: Arc::new(Mutex::new((0, None))),
+                stopping: Arc::new(AtomicBool::new(false)),
+            };
             let rt = Runtime::new()?;
 
             // gRPC IPC sur named pipe: toujours actif même si HTTP/HTTPS échouent
@@ -589,7 +880,11 @@ fn main() -> Result<()> {
                     let incoming = PipeIncoming::new(PIPE_NAME).map(|res| res.map(PipeConn));
                     let svc = HomeHttpServer::new(HomeHttpSvc { shared });
                     info!("[console] gRPC IPC listening on named pipe {}", PIPE_NAME);
-                    if let Err(e) = tonic::transport::Server::builder().add_service(svc).serve_with_incoming(incoming).await {
+                    if let Err(e) = tonic::transport::Server::builder()
+                        .add_service(svc)
+                        .serve_with_incoming(incoming)
+                        .await
+                    {
                         error!("gRPC server error: {e:?}");
                     }
                 }
@@ -598,17 +893,32 @@ fn main() -> Result<()> {
             // Serveurs HTTP/HTTPS: on tente, mais on ne bloque pas si ça échoue (ex: ports 80/443 sans admin)
             {
                 // En mode console (dev), on écoute en loopback uniquement pour éviter les popups pare-feu/UAC
-                let http_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), shared.cfg.lock().http);
-                let https_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), shared.cfg.lock().https);
+                let http_addr =
+                    SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), shared.cfg.lock().http);
+                let https_addr =
+                    SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), shared.cfg.lock().https);
                 let http = HttpHttp::new(shared.clone());
                 let tls = TlsSnihttp::new(shared.clone());
-                rt.spawn(async move { if let Err(e) = http.serve(http_addr).await { error!("http server: {e:?}"); } });
-                rt.spawn(async move { if let Err(e) = tls.serve(https_addr).await { error!("https server: {e:?}"); } });
+                rt.spawn(async move {
+                    if let Err(e) = http.serve(http_addr).await {
+                        error!("http server: {e:?}");
+                    }
+                });
+                rt.spawn(async move {
+                    if let Err(e) = tls.serve(https_addr).await {
+                        error!("https server: {e:?}");
+                    }
+                });
             }
 
             // Boucle de garde: laisse tourner jusqu'à fermeture du processus
             info!("Console mode running. Press Ctrl+C to stop.");
-            loop { thread::sleep(Duration::from_millis(500)); if shared.stopping.load(Ordering::SeqCst) { break; } }
+            loop {
+                thread::sleep(Duration::from_millis(500));
+                if shared.stopping.load(Ordering::SeqCst) {
+                    break;
+                }
+            }
         }
         _ => usage(),
     }
