@@ -5,7 +5,7 @@ edition = "2024"
 build = "build.rs"
 
 [dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Memory"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Memory"] }
 sysinfo = { workspace = true }
 tokio = { version = "1.47", features = ["rt-multi-thread", "macros", "time", "sync"] }
 tokio-tungstenite = { workspace = true }
