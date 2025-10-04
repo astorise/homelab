@@ -17,6 +17,8 @@ use windows_sys::Win32::System::Rpc::{
     RpcServerUnregisterIf, RpcServerUseProtseqEpW, RpcStringBindingComposeW, RpcStringFreeW,
 };
 use windows_sys::core::{GUID, PWSTR};
+use windows_sys::Win32::Foundation::{GetLastError, LocalFree};
+use windows_sys::Win32::Security::Authorization::{ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1};
 
 const PROTSEQ_NCALRPC: &[u16] = &[110, 99, 97, 108, 114, 112, 99, 0]; // "ncalrpc\0"
 const NDR_SYNTAX_GUID: GUID = GUID {
@@ -30,6 +32,50 @@ const NDR_SYNTAX_VERSION: RPC_VERSION = RPC_VERSION {
     MinorVersion: 0,
 };
 const NDR_LOCAL_DATA_REPRESENTATION: u32 = 0x10;
+
+const RPC_SDDL: &str = "D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;LS)(A;;GA;;;NS)(A;;GRGW;;;AU)";
+
+struct RpcSecurity {
+    sd: *mut core::ffi::c_void,
+}
+
+impl RpcSecurity {
+    fn new() -> Result<Self, Error> {
+        let mut wide: Vec<u16> = OsStr::new(RPC_SDDL).encode_wide().collect();
+        wide.push(0);
+        let mut sd_ptr: *mut core::ffi::c_void = core::ptr::null_mut();
+        let ok = unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                wide.as_ptr(),
+                SDDL_REVISION_1 as u32,
+                &mut sd_ptr,
+                core::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            return Err(Error::new(
+                unsafe { GetLastError() } as i32,
+                "ConvertStringSecurityDescriptorToSecurityDescriptorW",
+            ));
+        }
+        Ok(Self { sd: sd_ptr })
+    }
+
+    fn as_ptr(&self) -> *const core::ffi::c_void {
+        self.sd
+    }
+}
+
+impl Drop for RpcSecurity {
+    fn drop(&mut self) {
+        if !self.sd.is_null() {
+            unsafe {
+                LocalFree(self.sd);
+            }
+            self.sd = core::ptr::null_mut();
+        }
+    }
+}
 
 fn wide_null(s: &str) -> Vec<u16> {
     let mut v: Vec<u16> = OsStr::new(s).encode_wide().collect();
@@ -144,12 +190,13 @@ impl Server {
         }
 
         let endpoint_w = wide_null(endpoint);
+        let security = RpcSecurity::new()?;
         let status = unsafe {
             RpcServerUseProtseqEpW(
                 PROTSEQ_NCALRPC.as_ptr(),
                 RPC_C_PROTSEQ_MAX_REQS_DEFAULT,
                 endpoint_w.as_ptr(),
-                ptr::null(),
+                security.as_ptr(),
             )
         };
         if status != 0 && status != RPC_S_DUPLICATE_ENDPOINT {
