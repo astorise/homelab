@@ -1,20 +1,20 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use std::sync::Arc;
 use std::{fs, path::PathBuf};
+#[cfg(debug_assertions)]
+use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
 use tracing::{error, info, warn};
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{fmt, EnvFilter};
-use std::sync::Arc;
-#[cfg(debug_assertions)]
-use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
 
-mod icons;
-mod menu;
-mod dns;
-mod http;
-mod ui;
 #[cfg(all(debug_assertions, target_os = "windows"))]
 mod dev_services;
+mod dns;
+mod http;
+mod icons;
+mod menu;
+mod ui;
 
 static mut LOG_GUARD: Option<WorkerGuard> = None;
 
@@ -53,13 +53,18 @@ fn init_file_logger() {
     match file {
         Some(file) => {
             let (nb, guard) = tracing_appender::non_blocking(file);
-            unsafe { LOG_GUARD = Some(guard); }
+            unsafe {
+                LOG_GUARD = Some(guard);
+            }
             let _ = fmt().with_env_filter(filter).with_writer(nb).try_init();
             info!("logger initialisé → {:?}", dir);
         }
         None => {
             let _ = fmt().with_env_filter(filter).try_init();
-            warn!("logger en console uniquement — échec d’ouverture du fichier dans {:?}", dir);
+            warn!(
+                "logger en console uniquement — échec d’ouverture du fichier dans {:?}",
+                dir
+            );
         }
     }
 }
@@ -72,12 +77,12 @@ pub fn run() {
     info!("boot…");
 
     tauri::Builder::default()
-    .on_window_event(|window, event| {
-      if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-        api.prevent_close();           // n'arrête pas l'app
-        let _ = window.hide();         // cache la fenêtre
-      }
-    })
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close(); // n'arrête pas l'app
+                let _ = window.hide(); // cache la fenêtre
+            }
+        })
         .setup(|app| {
             let loaded_icons = Arc::new(crate::icons::Icons::load(&app.handle(), 20)?);
             crate::menu::setup_ui(&app.handle(), loaded_icons)?;
@@ -108,9 +113,8 @@ pub fn run() {
             }
             Ok(())
         })
-         .invoke_handler(tauri::generate_handler![
-                    // Tes handlers d’origine :
-
+        .invoke_handler(tauri::generate_handler![
+            // Tes handlers d’origine :
             dns::dns_get_status,
             dns::dns_stop_service,
             dns::dns_reload_config,
@@ -130,6 +134,4 @@ pub fn run() {
             error!("erreur critique: {:?}", e);
             panic!("Erreur Tauri: {:?}", e);
         });
- 
-        
 }

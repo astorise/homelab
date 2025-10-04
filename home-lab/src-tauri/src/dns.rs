@@ -51,8 +51,13 @@ fn map_err<E: std::fmt::Display + std::fmt::Debug>(e: E) -> String {
         msg = format!("{:?}", e);
     }
     let lower = msg.to_ascii_lowercase();
-    if lower.contains("os error 2") || lower.contains("file specified") || lower.contains("no such file or directory") {
-        msg.push_str(" - pipe introuvable ? Verifiez que le service Windows correspondant est demarre.");
+    if lower.contains("os error 2")
+        || lower.contains("file specified")
+        || lower.contains("no such file or directory")
+    {
+        msg.push_str(
+            " - pipe introuvable ? Verifiez que le service Windows correspondant est demarre.",
+        );
     }
     msg
 }
@@ -185,7 +190,11 @@ pub async fn dns_remove_record(
 ) -> Result<AckOut, String> {
     let ch = dns_make_channel().await.map_err(map_err)?;
     let mut client = HomeDnsClient::new(ch);
-    let req = RemoveRecordRequest { name, rrtype, value };
+    let req = RemoveRecordRequest {
+        name,
+        rrtype,
+        value,
+    };
     let resp = client
         .remove_record(tonic::Request::new(req))
         .await

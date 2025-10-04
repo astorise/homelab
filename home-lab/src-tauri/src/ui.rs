@@ -1,4 +1,4 @@
-use tracing::{error, warn, info, debug, trace};
+use tracing::{debug, error, info, trace, warn};
 
 #[tauri::command]
 pub fn ui_log(level: String, message: String) {

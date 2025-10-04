@@ -4,6 +4,12 @@ fn main() {
         std::env::set_var("PROTOC", pb);
     }
     let out = tonic_build::configure();
-    out.compile(&[proto_dir.join("home_dns.proto"), proto_dir.join("home_http.proto")], &[proto_dir])
-        .expect("compile protos");
+    out.compile(
+        &[
+            proto_dir.join("home_dns.proto"),
+            proto_dir.join("home_http.proto"),
+        ],
+        &[proto_dir],
+    )
+    .expect("compile protos");
 }

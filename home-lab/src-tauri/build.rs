@@ -15,11 +15,22 @@ fn main() {
         let need_http = !dst_bin.join("home-http.exe").exists();
         if need_dns || need_http {
             // Try copying from typical locations first
-            for (name, rel) in [("home-dns.exe", "home-dns.exe"), ("home-http.exe", "home-http.exe")] {
+            for (name, rel) in [
+                ("home-dns.exe", "home-dns.exe"),
+                ("home-http.exe", "home-http.exe"),
+            ] {
                 let candidates = [
                     workspace_root.join("target").join("release").join(rel),
-                    workspace_root.join("home-dns").join("target").join("release").join(rel),
-                    workspace_root.join("home-http").join("target").join("release").join(rel),
+                    workspace_root
+                        .join("home-dns")
+                        .join("target")
+                        .join("release")
+                        .join(rel),
+                    workspace_root
+                        .join("home-http")
+                        .join("target")
+                        .join("release")
+                        .join(rel),
                     manifest_path.join("bin").join(rel),
                 ];
                 for c in candidates.iter() {
@@ -31,9 +42,12 @@ fn main() {
             }
 
             // If still missing, build them now (best effort)
-            let still_need = !dst_bin.join("home-dns.exe").exists() || !dst_bin.join("home-http.exe").exists();
+            let still_need =
+                !dst_bin.join("home-dns.exe").exists() || !dst_bin.join("home-http.exe").exists();
             if still_need {
-                println!("cargo:warning=Building service binaries (home-dns, home-http) for bundling...");
+                println!(
+                    "cargo:warning=Building service binaries (home-dns, home-http) for bundling..."
+                );
                 let status = std::process::Command::new("cargo")
                     .args(["build", "-p", "home-dns", "-p", "home-http", "--release"])
                     .current_dir(workspace_root)
@@ -41,11 +55,17 @@ fn main() {
                     .expect("failed to spawn cargo build for services");
                 if status.success() {
                     let _ = std::fs::copy(
-                        workspace_root.join("target").join("release").join("home-dns.exe"),
+                        workspace_root
+                            .join("target")
+                            .join("release")
+                            .join("home-dns.exe"),
                         dst_bin.join("home-dns.exe"),
                     );
                     let _ = std::fs::copy(
-                        workspace_root.join("target").join("release").join("home-http.exe"),
+                        workspace_root
+                            .join("target")
+                            .join("release")
+                            .join("home-http.exe"),
                         dst_bin.join("home-http.exe"),
                     );
                 } else {
@@ -74,12 +94,19 @@ fn main() {
     std::env::set_var("PROTOC", protoc);
 
     let proto_dir = std::path::Path::new(&manifest_dir).join("proto");
-    let files = [proto_dir.join("home_dns.proto"), proto_dir.join("home_http.proto")];
-    for f in &files { println!("cargo:rerun-if-changed={}", f.display()); }
+    let files = [
+        proto_dir.join("home_dns.proto"),
+        proto_dir.join("home_http.proto"),
+    ];
+    for f in &files {
+        println!("cargo:rerun-if-changed={}", f.display());
+    }
 
     tonic_build::configure()
         .build_server(false) // client only in Tauri app
-        .compile(&files.iter().map(|p| p.as_path()).collect::<Vec<_>>(), &[proto_dir.as_path()])
+        .compile(
+            &files.iter().map(|p| p.as_path()).collect::<Vec<_>>(),
+            &[proto_dir.as_path()],
+        )
         .expect("failed to compile .proto files");
 }
-

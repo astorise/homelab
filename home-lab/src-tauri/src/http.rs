@@ -47,58 +47,90 @@ fn map_err<E: std::fmt::Display + std::fmt::Debug>(e: E) -> String {
         msg = format!("{:?}", e);
     }
     let lower = msg.to_ascii_lowercase();
-    if lower.contains("os error 2") || lower.contains("file specified") || lower.contains("no such file or directory") {
-        msg.push_str(" - pipe introuvable ? Verifiez que le service Windows correspondant est demarre.");
+    if lower.contains("os error 2")
+        || lower.contains("file specified")
+        || lower.contains("no such file or directory")
+    {
+        msg.push_str(
+            " - pipe introuvable ? Verifiez que le service Windows correspondant est demarre.",
+        );
     }
     msg
 }
 #[derive(Serialize)]
-pub struct AckOut { pub ok: bool, pub message: String }
+pub struct AckOut {
+    pub ok: bool,
+    pub message: String,
+}
 
 #[derive(Serialize)]
-pub struct StatusOut { pub state: String, pub log_level: String }
+pub struct StatusOut {
+    pub state: String,
+    pub log_level: String,
+}
 
 #[derive(Serialize)]
-pub struct RouteOut { pub host: String, pub port: u32 }
+pub struct RouteOut {
+    pub host: String,
+    pub port: u32,
+}
 
 #[derive(Serialize)]
-pub struct ListRoutesOut { pub routes: Vec<RouteOut> }
+pub struct ListRoutesOut {
+    pub routes: Vec<RouteOut>,
+}
 
 #[tauri::command]
 pub async fn http_get_status() -> Result<StatusOut, String> {
     let ch = http_make_channel().await.map_err(map_err)?;
     let mut client = HomeHttpClient::new(ch);
-    let resp = client.get_status(Empty{}).await.map_err(map_err)?;
+    let resp = client.get_status(Empty {}).await.map_err(map_err)?;
     let s = resp.into_inner();
-    Ok(StatusOut { state: s.state, log_level: s.log_level })
+    Ok(StatusOut {
+        state: s.state,
+        log_level: s.log_level,
+    })
 }
 
 #[tauri::command]
 pub async fn http_reload_config() -> Result<AckOut, String> {
     let ch = http_make_channel().await.map_err(map_err)?;
     let mut client = HomeHttpClient::new(ch);
-    let resp = client.reload_config(Empty{}).await.map_err(map_err)?;
+    let resp = client.reload_config(Empty {}).await.map_err(map_err)?;
     let a = resp.into_inner();
-    Ok(AckOut { ok: a.ok, message: a.message })
+    Ok(AckOut {
+        ok: a.ok,
+        message: a.message,
+    })
 }
 
 #[tauri::command]
 pub async fn http_stop_service() -> Result<AckOut, String> {
     let ch = http_make_channel().await.map_err(map_err)?;
     let mut client = HomeHttpClient::new(ch);
-    let resp = client.stop_service(Empty{}).await.map_err(map_err)?;
+    let resp = client.stop_service(Empty {}).await.map_err(map_err)?;
     let a = resp.into_inner();
-    Ok(AckOut { ok: a.ok, message: a.message })
+    Ok(AckOut {
+        ok: a.ok,
+        message: a.message,
+    })
 }
 
 #[tauri::command]
 pub async fn http_list_routes() -> Result<ListRoutesOut, String> {
     let ch = http_make_channel().await.map_err(map_err)?;
     let mut client = HomeHttpClient::new(ch);
-    let resp = client.list_routes(Empty{}).await.map_err(map_err)?;
+    let resp = client.list_routes(Empty {}).await.map_err(map_err)?;
     let list = resp.into_inner();
     Ok(ListRoutesOut {
-        routes: list.routes.into_iter().map(|r| RouteOut { host: r.host, port: r.port }).collect()
+        routes: list
+            .routes
+            .into_iter()
+            .map(|r| RouteOut {
+                host: r.host,
+                port: r.port,
+            })
+            .collect(),
     })
 }
 
@@ -109,7 +141,10 @@ pub async fn http_add_route(host: String, port: u32) -> Result<AckOut, String> {
     let req = AddRouteRequest { host, port };
     let resp = client.add_route(req).await.map_err(map_err)?;
     let a = resp.into_inner();
-    Ok(AckOut { ok: a.ok, message: a.message })
+    Ok(AckOut {
+        ok: a.ok,
+        message: a.message,
+    })
 }
 
 #[tauri::command]
@@ -119,5 +154,8 @@ pub async fn http_remove_route(host: String) -> Result<AckOut, String> {
     let req = RemoveRouteRequest { host };
     let resp = client.remove_route(req).await.map_err(map_err)?;
     let a = resp.into_inner();
-    Ok(AckOut { ok: a.ok, message: a.message })
+    Ok(AckOut {
+        ok: a.ok,
+        message: a.message,
+    })
 }

@@ -1,37 +1,27 @@
 use anyhow::{Context, Result};
 use flexi_logger::{Age, Cleanup, Criterion, Duplicate, FileSpec, Logger, Naming};
-use futures_util::StreamExt;
-use homedns::homedns::v1::home_dns_server::{HomeDns, HomeDnsServer};
 use homedns::homedns::v1::*;
+use local_rpc::{Error as RpcError, Handler as RpcHandler, Server as RpcServer};
 use log::{LevelFilter, debug, error, info, warn};
 use parking_lot::Mutex;
+use prost::Message;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::ffi::{OsStr, OsString, c_void};
+use std::ffi::OsString;
 use std::fs::{self, File};
-use std::io::{self, Write};
-use std::mem;
-use std::os::windows::ffi::OsStrExt;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::ptr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::runtime::Runtime;
-use tokio::sync::mpsc;
-use tonic::transport::server::Connected;
 use windows_service::define_windows_service;
 use windows_service::service::*;
 use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
 use windows_service::service_manager::*;
-use windows_sys::Win32::Foundation::LocalFree;
-use windows_sys::Win32::Security::Authorization::{
-    ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
-};
-use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+use windows_sys::Win32::System::Rpc::RPC_S_CALL_FAILED;
+use windows_sys::core::GUID;
 
 // Build metadata (set in build.rs)
 const BUILD_GIT_SHA: &str = env!("BUILD_GIT_SHA");
@@ -40,7 +30,7 @@ const BUILD_TIME: &str = env!("BUILD_TIME");
 mod homedns {
     pub mod homedns {
         pub mod v1 {
-            tonic::include_proto!("homedns.v1");
+            include!(concat!(env!("OUT_DIR"), "/homedns.v1.rs"));
         }
     }
 }
@@ -48,11 +38,20 @@ mod homedns {
 const SERVICE_NAME: &str = "HomeDnsService";
 const SERVICE_DISPLAY_NAME: &str = "Home DNS Service";
 const SERVICE_DESCRIPTION: &str =
-    r"DNS config + rollback + gRPC IPC over named pipe \\.\pipe\home-dns";
+    r"DNS config + rollback + Windows RPC IPC on ncalrpc endpoint home-dns";
 #[cfg(debug_assertions)]
-const PIPE_NAME: &str = r"\\.\pipe\home-dns-dev";
+const RPC_ENDPOINT: &str = "home-dns-dev";
 #[cfg(not(debug_assertions))]
-const PIPE_NAME: &str = r"\\.\pipe\home-dns";
+const RPC_ENDPOINT: &str = "home-dns";
+const RPC_INTERFACE_UUID: GUID = GUID::from_u128(0x18477de6c4b24746b60492db45db2d31);
+const RPC_INTERFACE_VERSION: (u16, u16) = (1, 0);
+const RPC_PROC_COUNT: u32 = 6;
+const PROC_STOP_SERVICE: u32 = 0;
+const PROC_RELOAD_CONFIG: u32 = 1;
+const PROC_GET_STATUS: u32 = 2;
+const PROC_ADD_RECORD: u32 = 3;
+const PROC_REMOVE_RECORD: u32 = 4;
+const PROC_LIST_RECORDS: u32 = 5;
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 struct RecordEntry {
@@ -398,61 +397,46 @@ struct SharedState {
 struct HomeDnsSvc {
     state: SharedState,
 }
-
-#[tonic::async_trait]
-impl HomeDns for HomeDnsSvc {
-    async fn stop_service(
-        &self,
-        _req: tonic::Request<Empty>,
-    ) -> Result<tonic::Response<Ack>, tonic::Status> {
+impl HomeDnsSvc {
+    fn stop_service(&self) -> Ack {
         info!("RPC StopService requested");
         self.state.stopping.store(true, Ordering::SeqCst);
-        Ok(tonic::Response::new(Ack {
+        Ack {
             ok: true,
             message: "stopping".into(),
-        }))
+        }
     }
 
-    async fn reload_config(
-        &self,
-        _req: tonic::Request<Empty>,
-    ) -> Result<tonic::Response<Ack>, tonic::Status> {
+    fn reload_config(&self) -> Result<Ack> {
         info!("RPC ReloadConfig requested");
-        let new_cfg = load_config_or_init().map_err(to_status)?;
+        let new_cfg = load_config_or_init()?;
         *self.state.cfg.lock() = new_cfg;
-        Ok(tonic::Response::new(Ack {
+        Ok(Ack {
             ok: true,
             message: "reloaded".into(),
-        }))
+        })
     }
 
-    async fn get_status(
-        &self,
-        _req: tonic::Request<Empty>,
-    ) -> Result<tonic::Response<StatusResponse>, tonic::Status> {
+    fn get_status(&self) -> StatusResponse {
         let level = level_from_cfg(&self.state.cfg.lock());
         let state = if self.state.stopping.load(Ordering::SeqCst) {
             "Stopping"
         } else {
             "Running"
         };
-        Ok(tonic::Response::new(StatusResponse {
+        StatusResponse {
             state: state.into(),
             log_level: format!("{:?}", level).to_lowercase(),
-        }))
+        }
     }
 
-    async fn add_record(
-        &self,
-        req: tonic::Request<AddRecordRequest>,
-    ) -> Result<tonic::Response<Ack>, tonic::Status> {
-        let r = req.into_inner();
+    fn add_record(&self, r: AddRecordRequest) -> Result<Ack> {
         if r.name.trim().is_empty() {
-            return Err(tonic::Status::invalid_argument("name required"));
+            anyhow::bail!("name required");
         }
         let t = r.rrtype.to_ascii_uppercase();
         if t != "A" && t != "AAAA" {
-            return Err(tonic::Status::invalid_argument("type must be A or AAAA"));
+            anyhow::bail!("type must be A or AAAA");
         }
         let mut cfg = self.state.cfg.lock();
         let entry = cfg.records.entry(r.name.clone()).or_default();
@@ -472,26 +456,20 @@ impl HomeDns for HomeDnsSvc {
         if r.ttl != 0 {
             entry.ttl = Some(r.ttl);
         }
-        save_config(&cfg).map_err(to_status)?;
+        save_config(&cfg)?;
         info!("Record added: {} {} {}", r.name, t, r.value);
-        Ok(tonic::Response::new(Ack {
+        Ok(Ack {
             ok: true,
             message: "added".into(),
-        }))
+        })
     }
 
-    async fn remove_record(
-        &self,
-        req: tonic::Request<RemoveRecordRequest>,
-    ) -> Result<tonic::Response<Ack>, tonic::Status> {
-        let r = req.into_inner();
+    fn remove_record(&self, r: RemoveRecordRequest) -> Result<Ack> {
         if r.name.trim().is_empty() {
-            return Err(tonic::Status::invalid_argument("name required"));
+            anyhow::bail!("name required");
         }
-
         let mut cfg = self.state.cfg.lock();
         let mut should_remove_key = false;
-
         if let Some(entry) = cfg.records.get_mut(&r.name) {
             let t = r.rrtype.to_ascii_uppercase();
             if t.is_empty() {
@@ -509,37 +487,29 @@ impl HomeDns for HomeDnsSvc {
                     entry.aaaa.retain(|v| v != &r.value);
                 }
             } else {
-                return Err(tonic::Status::invalid_argument(
-                    "type must be A, AAAA or empty",
-                ));
+                anyhow::bail!("type must be A, AAAA or empty");
             }
-
             if !should_remove_key && entry.a.is_empty() && entry.aaaa.is_empty() {
                 should_remove_key = true;
             }
         } else {
-            return Ok(tonic::Response::new(Ack {
+            return Ok(Ack {
                 ok: true,
                 message: "not found".into(),
-            }));
+            });
         }
-
         if should_remove_key {
             cfg.records.remove(&r.name);
         }
-
-        save_config(&cfg).map_err(to_status)?;
+        save_config(&cfg)?;
         info!("Record removed: {} {} {}", r.name, r.rrtype, r.value);
-        Ok(tonic::Response::new(Ack {
+        Ok(Ack {
             ok: true,
             message: "removed".into(),
-        }))
+        })
     }
 
-    async fn list_records(
-        &self,
-        _req: tonic::Request<Empty>,
-    ) -> Result<tonic::Response<ListRecordsResponse>, tonic::Status> {
+    fn list_records(&self) -> ListRecordsResponse {
         let cfg = self.state.cfg.lock().clone();
         let mut out = Vec::new();
         for (name, ent) in cfg.records {
@@ -550,161 +520,84 @@ impl HomeDns for HomeDnsSvc {
                 ttl: ent.ttl.unwrap_or(0),
             });
         }
-        Ok(tonic::Response::new(ListRecordsResponse { records: out }))
+        ListRecordsResponse { records: out }
     }
 }
 
-fn to_status(e: anyhow::Error) -> tonic::Status {
-    tonic::Status::internal(format!("{e:#}"))
+struct HomeDnsRpcHandler {
+    svc: HomeDnsSvc,
 }
 
-use std::pin::Pin;
-use std::task::{Context as TaskContext, Poll};
-use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
-
-struct PipeConn(NamedPipeServer);
-
-impl Connected for PipeConn {
-    type ConnectInfo = ();
-    fn connect_info(&self) -> Self::ConnectInfo {
-        ()
-    }
-}
-
-impl Unpin for PipeConn {}
-
-impl AsyncRead for PipeConn {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut TaskContext<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.0).poll_read(cx, buf)
-    }
-}
-
-impl AsyncWrite for PipeConn {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut TaskContext<'_>,
-        data: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
-        Pin::new(&mut self.0).poll_write(cx, data)
-    }
-
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.0).poll_flush(cx)
-    }
-
-    fn poll_shutdown(
-        mut self: Pin<&mut Self>,
-        cx: &mut TaskContext<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.0).poll_shutdown(cx)
-    }
-}
-
-const PIPE_SDDL: &str = "D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;LS)(A;;GA;;;NS)(A;;GRGW;;;AU)";
-
-struct PipeSecurity {
-    attrs: SECURITY_ATTRIBUTES,
-    sd: *mut c_void,
-}
-
-impl PipeSecurity {
-    fn new() -> io::Result<Self> {
-        let mut wide: Vec<u16> = OsStr::new(PIPE_SDDL).encode_wide().collect();
-        wide.push(0);
-        let mut sd_ptr: *mut c_void = ptr::null_mut();
-        let ok = unsafe {
-            ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                wide.as_ptr(),
-                SDDL_REVISION_1 as u32,
-                &mut sd_ptr,
-                ptr::null_mut(),
-            )
-        };
-        if ok == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let attrs = SECURITY_ATTRIBUTES {
-            nLength: mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
-            lpSecurityDescriptor: sd_ptr,
-            bInheritHandle: 0,
-        };
-        Ok(Self { attrs, sd: sd_ptr })
-    }
-
-    fn as_mut_ptr(&mut self) -> *mut c_void {
-        &mut self.attrs as *mut _ as *mut c_void
-    }
-}
-
-impl Drop for PipeSecurity {
-    fn drop(&mut self) {
-        if !self.sd.is_null() {
-            unsafe {
-                LocalFree(self.sd);
+impl RpcHandler for HomeDnsRpcHandler {
+    fn handle(&self, proc_num: u32, request: &[u8]) -> Result<Vec<u8>, RpcError> {
+        match proc_num {
+            PROC_STOP_SERVICE => {
+                let ack = self.svc.stop_service();
+                Ok(ack.encode_to_vec())
             }
-            self.sd = ptr::null_mut();
-        }
-    }
-}
-
-fn create_pipe_server(name: &str, first: bool) -> io::Result<NamedPipeServer> {
-    let mut security = PipeSecurity::new()?;
-    unsafe {
-        ServerOptions::new()
-            .first_pipe_instance(first)
-            .create_with_security_attributes_raw(name, security.as_mut_ptr())
-    }
-}
-struct PipeIncoming {
-    rx: mpsc::Receiver<Result<NamedPipeServer, std::io::Error>>,
-}
-
-impl PipeIncoming {
-    fn new(name: &str) -> Self {
-        let (tx, rx) = mpsc::channel(64);
-        let name = name.to_string();
-        std::thread::spawn(move || {
-            let rt = Runtime::new().expect("tokio rt");
-            rt.block_on(async move {
-                // Create one server at a time and await connection before creating the next.
-                // This avoids unbounded pipe instances piling up (memory/CPU leak).
-                let mut first = true;
-                loop {
-                    let created = create_pipe_server(&name, first)
-                        .or_else(|_| create_pipe_server(&name, false));
-                    match created {
-                        Ok(server) => {
-                            first = false; // subsequent instances are not first
-                            match server.connect().await {
-                                Ok(()) => {
-                                    let _ = tx.send(Ok(server)).await;
-                                }
-                                Err(e) => {
-                                    let _ = tx.send(Err(e)).await;
-                                    tokio::time::sleep(Duration::from_millis(200)).await;
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            let _ = tx.send(Err(e)).await;
-                            tokio::time::sleep(Duration::from_millis(200)).await;
+            PROC_RELOAD_CONFIG => {
+                let ack = match self.svc.reload_config() {
+                    Ok(ack) => ack,
+                    Err(err) => {
+                        error!("reload_config failed: {err:#}");
+                        Ack {
+                            ok: false,
+                            message: err.to_string(),
                         }
                     }
-                }
-            });
-        });
-        Self { rx }
-    }
-}
-
-impl futures_util::stream::Stream for PipeIncoming {
-    type Item = Result<NamedPipeServer, std::io::Error>;
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
-        self.rx.poll_recv(cx)
+                };
+                Ok(ack.encode_to_vec())
+            }
+            PROC_GET_STATUS => {
+                let status = self.svc.get_status();
+                Ok(status.encode_to_vec())
+            }
+            PROC_ADD_RECORD => {
+                let req = match AddRecordRequest::decode(request) {
+                    Ok(r) => r,
+                    Err(err) => {
+                        error!("decode AddRecordRequest failed: {err}");
+                        return Err(RpcError::new(RPC_S_CALL_FAILED, "decode add_record"));
+                    }
+                };
+                let ack = match self.svc.add_record(req) {
+                    Ok(ack) => ack,
+                    Err(err) => {
+                        error!("add_record failed: {err:#}");
+                        Ack {
+                            ok: false,
+                            message: err.to_string(),
+                        }
+                    }
+                };
+                Ok(ack.encode_to_vec())
+            }
+            PROC_REMOVE_RECORD => {
+                let req = match RemoveRecordRequest::decode(request) {
+                    Ok(r) => r,
+                    Err(err) => {
+                        error!("decode RemoveRecordRequest failed: {err}");
+                        return Err(RpcError::new(RPC_S_CALL_FAILED, "decode remove_record"));
+                    }
+                };
+                let ack = match self.svc.remove_record(req) {
+                    Ok(ack) => ack,
+                    Err(err) => {
+                        error!("remove_record failed: {err:#}");
+                        Ack {
+                            ok: false,
+                            message: err.to_string(),
+                        }
+                    }
+                };
+                Ok(ack.encode_to_vec())
+            }
+            PROC_LIST_RECORDS => {
+                let list = self.svc.list_records();
+                Ok(list.encode_to_vec())
+            }
+            _ => Err(RpcError::new(RPC_S_CALL_FAILED, "unknown procedure")),
+        }
     }
 }
 
@@ -749,7 +642,7 @@ fn run_service() -> Result<()> {
     set_status(ServiceState::Running);
     info!("Service running (early), proceeding with background init...");
 
-    // Background init: config, logger, gRPC server
+    // Background init: config, logger, RPC server
     let shared = SharedState {
         cfg: Arc::new(Mutex::new(DnsConfig {
             servers_v4: vec![],
@@ -760,7 +653,7 @@ fn run_service() -> Result<()> {
         })),
         stopping: Arc::new(AtomicBool::new(false)),
     };
-    let shared_clone_for_grpc = shared.clone();
+    let shared_clone_for_rpc = shared.clone();
     let shared_clone_for_cfg = shared.clone();
 
     // Init logger + config in a thread to avoid blocking SCM
@@ -788,22 +681,21 @@ fn run_service() -> Result<()> {
         *shared_clone_for_cfg.cfg.lock() = cfg;
     });
 
-    // Start gRPC server on a tokio runtime (non-blocking)
-    let rt = Runtime::new()?;
-    rt.spawn(async move {
-        let incoming = PipeIncoming::new(PIPE_NAME).map(|res| res.map(PipeConn));
-        let svc = HomeDnsServer::new(HomeDnsSvc {
-            state: shared_clone_for_grpc,
-        });
-        info!("gRPC IPC listening on named pipe {}", PIPE_NAME);
-        if let Err(e) = tonic::transport::Server::builder()
-            .add_service(svc)
-            .serve_with_incoming(incoming)
-            .await
-        {
-            error!("gRPC server error: {e:?}");
-        }
+    // Start RPC server (non-blocking)
+    let rpc_handler: Arc<dyn RpcHandler> = Arc::new(HomeDnsRpcHandler {
+        svc: HomeDnsSvc {
+            state: shared_clone_for_rpc,
+        },
     });
+    let _rpc_server = RpcServer::start(
+        RPC_INTERFACE_UUID,
+        RPC_INTERFACE_VERSION,
+        RPC_ENDPOINT,
+        RPC_PROC_COUNT,
+        rpc_handler,
+    )
+    .map_err(|e| anyhow::anyhow!("start RPC server: {e}"))?;
+    info!("Windows RPC IPC listening on endpoint {}", RPC_ENDPOINT);
     info!("Background init scheduled (elapsed {:?})", t0.elapsed());
 
     // Heavy tasks in background: restore then snapshot/apply
@@ -849,7 +741,7 @@ fn run_console() -> Result<()> {
         Ok(c) => c,
         Err(e) => {
             warn!("snapshot/apply failed in console mode: {e:?} — continuing without applying");
-            // Charge config sans l'appliquer pour que le gRPC démarre quand même
+            // Charge config sans l'appliquer pour que le RPC démarre quand même
             load_config_or_init()?
         }
     };
@@ -858,21 +750,23 @@ fn run_console() -> Result<()> {
         stopping: Arc::new(AtomicBool::new(false)),
     };
     let shared_clone = shared.clone();
-    let rt = Runtime::new()?;
-    rt.spawn(async move {
-        let incoming = PipeIncoming::new(PIPE_NAME).map(|res| res.map(PipeConn));
-        let svc = HomeDnsServer::new(HomeDnsSvc {
+    let rpc_handler: Arc<dyn RpcHandler> = Arc::new(HomeDnsRpcHandler {
+        svc: HomeDnsSvc {
             state: shared_clone,
-        });
-        info!("[console] gRPC IPC listening on named pipe {}", PIPE_NAME);
-        if let Err(e) = tonic::transport::Server::builder()
-            .add_service(svc)
-            .serve_with_incoming(incoming)
-            .await
-        {
-            error!("[console] gRPC server error: {e:?}");
-        }
+        },
     });
+    let _rpc_server = RpcServer::start(
+        RPC_INTERFACE_UUID,
+        RPC_INTERFACE_VERSION,
+        RPC_ENDPOINT,
+        RPC_PROC_COUNT,
+        rpc_handler,
+    )
+    .map_err(|e| anyhow::anyhow!("start RPC server: {e}"))?;
+    info!(
+        "[console] Windows RPC IPC listening on endpoint {}",
+        RPC_ENDPOINT
+    );
     info!("Console mode running. Press Ctrl+C to stop.");
     loop {
         std::thread::sleep(std::time::Duration::from_millis(500));
