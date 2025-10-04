@@ -1,65 +1,76 @@
-use anyhow::Result;
+use anyhow::{anyhow, Result};
+use local_rpc::Client as RpcClient;
+use prost::Message;
 use serde::Serialize;
-use std::time::Duration;
-use tokio::net::windows::named_pipe::ClientOptions;
-use tonic::transport::{Channel, Endpoint, Uri};
-use tower::service_fn;
+use tokio::task;
+use windows_sys::core::GUID;
 
-// === gRPC generated modules ===
 pub mod homedns {
     pub mod homedns {
         pub mod v1 {
-            tonic::include_proto!("homedns.v1");
+            include!(concat!(env!("OUT_DIR"), "/homedns.v1.rs"));
         }
     }
 }
-use homedns::homedns::v1::home_dns_client::HomeDnsClient;
 use homedns::homedns::v1::*;
 
-// Pipes nommes: en dev "-dev", en prod sans suffixe. On essaie les deux.
-const PIPE_DEV: &str = r"\\.\pipe\home-dns-dev";
-const PIPE_REL: &str = r"\\.\pipe\home-dns";
+#[cfg(debug_assertions)]
+const RPC_ENDPOINTS: &[&str] = &["home-dns-dev", "home-dns"];
+#[cfg(not(debug_assertions))]
+const RPC_ENDPOINTS: &[&str] = &["home-dns", "home-dns-dev"];
 
-async fn connect_pipe(path: &str) -> Result<Channel> {
-    // Endpoint URI factice; le connecteur ouvre le pipe nomme.
-    let ep = Endpoint::try_from("http://pipe.invalid")?
-        .connect_timeout(Duration::from_secs(5))
-        .tcp_nodelay(true);
-    let p = path.to_string();
-    let ch = ep
-        .connect_with_connector(service_fn(move |_uri: Uri| {
-            let p2 = p.clone();
-            async move {
-                let client = ClientOptions::new().open(&p2)?;
-                Ok::<_, std::io::Error>(client)
-            }
-        }))
-        .await?;
-    Ok(ch)
+const RPC_INTERFACE_UUID: GUID = GUID::from_u128(0x18477de6c4b24746b60492db45db2d31);
+const RPC_INTERFACE_VERSION: (u16, u16) = (1, 0);
+const PROC_STOP_SERVICE: u32 = 0;
+const PROC_RELOAD_CONFIG: u32 = 1;
+const PROC_GET_STATUS: u32 = 2;
+const PROC_ADD_RECORD: u32 = 3;
+const PROC_REMOVE_RECORD: u32 = 4;
+const PROC_LIST_RECORDS: u32 = 5;
+
+fn connect_rpc() -> Result<RpcClient> {
+    let mut last_err = None;
+    for endpoint in RPC_ENDPOINTS {
+        match RpcClient::connect(RPC_INTERFACE_UUID, RPC_INTERFACE_VERSION, endpoint) {
+            Ok(client) => return Ok(client),
+            Err(err) => last_err = Some((*endpoint, err)),
+        }
+    }
+    let (endpoint, err) = last_err.expect("RPC_ENDPOINTS is not empty");
+    Err(anyhow!("connect {endpoint}: {err}"))
 }
 
-async fn dns_make_channel() -> Result<Channel> {
-    match connect_pipe(PIPE_DEV).await {
-        Ok(ch) => Ok(ch),
-        Err(_) => connect_pipe(PIPE_REL).await,
+fn format_transport_error(msg: impl std::fmt::Display) -> String {
+    let mut text = msg.to_string();
+    if text.trim().is_empty() {
+        text = format!("{:?}", msg.to_string());
     }
-}
-
-fn map_err<E: std::fmt::Display + std::fmt::Debug>(e: E) -> String {
-    let mut msg = e.to_string();
-    if msg.trim().is_empty() || msg == "transport error" {
-        msg = format!("{:?}", e);
-    }
-    let lower = msg.to_ascii_lowercase();
-    if lower.contains("os error 2")
-        || lower.contains("file specified")
-        || lower.contains("no such file or directory")
-    {
-        msg.push_str(
-            " - pipe introuvable ? Verifiez que le service Windows correspondant est demarre.",
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("rpc_s_server_unavailable") || lower.contains("1722") {
+        text.push_str(
+            " - service introuvable ? Verifiez que le service Windows correspondant est demarre.",
         );
     }
-    msg
+    if lower.contains("os error 5") || lower.contains("access denied") {
+        text.push_str(" - acces refuse (lancez l'application avec des droits suffisants).");
+    }
+    text
+}
+
+async fn rpc_call(proc_num: u32, request: Vec<u8>) -> Result<Vec<u8>, String> {
+    task::spawn_blocking(move || {
+        let client = connect_rpc().map_err(|e| format_transport_error(e))?;
+        client
+            .call(proc_num, &request)
+            .map_err(|e| format_transport_error(e))
+    })
+    .await
+    .map_err(|e| format_transport_error(e))?
+}
+
+fn decode_response<T: Message + Default>(bytes: Vec<u8>) -> Result<T, String> {
+    T::decode(bytes.as_slice())
+        .map_err(|e| format_transport_error(format!("decodage reponse: {e}")))
 }
 
 #[derive(Serialize)]
@@ -89,71 +100,49 @@ pub struct ListRecordsOut {
 
 #[tauri::command]
 pub async fn dns_get_status() -> Result<StatusOut, String> {
-    let ch = dns_make_channel().await.map_err(map_err)?;
-    let mut client = HomeDnsClient::new(ch);
-    let resp = client
-        .get_status(tonic::Request::new(Empty {}))
-        .await
-        .map_err(map_err)?;
-    let s = resp.into_inner();
+    let bytes = rpc_call(PROC_GET_STATUS, Empty {}.encode_to_vec()).await?;
+    let resp: StatusResponse = decode_response(bytes)?;
     Ok(StatusOut {
-        state: s.state,
-        log_level: s.log_level,
+        state: resp.state,
+        log_level: resp.log_level,
     })
 }
 
 #[tauri::command]
 pub async fn dns_stop_service() -> Result<AckOut, String> {
-    let ch = dns_make_channel().await.map_err(map_err)?;
-    let mut client = HomeDnsClient::new(ch);
-    let resp = client
-        .stop_service(tonic::Request::new(Empty {}))
-        .await
-        .map_err(map_err)?;
-    let a = resp.into_inner();
+    let bytes = rpc_call(PROC_STOP_SERVICE, Empty {}.encode_to_vec()).await?;
+    let ack: Ack = decode_response(bytes)?;
     Ok(AckOut {
-        ok: a.ok,
-        message: a.message,
+        ok: ack.ok,
+        message: ack.message,
     })
 }
 
 #[tauri::command]
 pub async fn dns_reload_config() -> Result<AckOut, String> {
-    let ch = dns_make_channel().await.map_err(map_err)?;
-    let mut client = HomeDnsClient::new(ch);
-    let resp = client
-        .reload_config(tonic::Request::new(Empty {}))
-        .await
-        .map_err(map_err)?;
-    let a = resp.into_inner();
+    let bytes = rpc_call(PROC_RELOAD_CONFIG, Empty {}.encode_to_vec()).await?;
+    let ack: Ack = decode_response(bytes)?;
     Ok(AckOut {
-        ok: a.ok,
-        message: a.message,
+        ok: ack.ok,
+        message: ack.message,
     })
 }
 
 #[tauri::command]
 pub async fn dns_list_records() -> Result<ListRecordsOut, String> {
-    let ch = dns_make_channel().await.map_err(map_err)?;
-    let mut client = HomeDnsClient::new(ch);
-    let resp = client
-        .list_records(tonic::Request::new(Empty {}))
-        .await
-        .map_err(map_err)?;
-    let list = resp.into_inner();
-    let out = ListRecordsOut {
-        records: list
-            .records
-            .into_iter()
-            .map(|r| RecordOut {
-                name: r.name,
-                a: r.a,
-                aaaa: r.aaaa,
-                ttl: r.ttl,
-            })
-            .collect(),
-    };
-    Ok(out)
+    let bytes = rpc_call(PROC_LIST_RECORDS, Empty {}.encode_to_vec()).await?;
+    let list: ListRecordsResponse = decode_response(bytes)?;
+    let records = list
+        .records
+        .into_iter()
+        .map(|r| RecordOut {
+            name: r.name,
+            a: r.a,
+            aaaa: r.aaaa,
+            ttl: r.ttl,
+        })
+        .collect();
+    Ok(ListRecordsOut { records })
 }
 
 #[tauri::command]
@@ -163,22 +152,17 @@ pub async fn dns_add_record(
     value: String,
     ttl: u32,
 ) -> Result<AckOut, String> {
-    let ch = dns_make_channel().await.map_err(map_err)?;
-    let mut client = HomeDnsClient::new(ch);
     let req = AddRecordRequest {
         name,
         rrtype,
         value,
         ttl,
     };
-    let resp = client
-        .add_record(tonic::Request::new(req))
-        .await
-        .map_err(map_err)?;
-    let a = resp.into_inner();
+    let bytes = rpc_call(PROC_ADD_RECORD, req.encode_to_vec()).await?;
+    let ack: Ack = decode_response(bytes)?;
     Ok(AckOut {
-        ok: a.ok,
-        message: a.message,
+        ok: ack.ok,
+        message: ack.message,
     })
 }
 
@@ -188,20 +172,15 @@ pub async fn dns_remove_record(
     rrtype: String,
     value: String,
 ) -> Result<AckOut, String> {
-    let ch = dns_make_channel().await.map_err(map_err)?;
-    let mut client = HomeDnsClient::new(ch);
     let req = RemoveRecordRequest {
         name,
         rrtype,
         value,
     };
-    let resp = client
-        .remove_record(tonic::Request::new(req))
-        .await
-        .map_err(map_err)?;
-    let a = resp.into_inner();
+    let bytes = rpc_call(PROC_REMOVE_RECORD, req.encode_to_vec()).await?;
+    let ack: Ack = decode_response(bytes)?;
     Ok(AckOut {
-        ok: a.ok,
-        message: a.message,
+        ok: ack.ok,
+        message: ack.message,
     })
 }

@@ -103,7 +103,8 @@ fn main() {
     }
 
     tonic_build::configure()
-        .build_server(false) // client only in Tauri app
+        .build_client(false)
+        .build_server(false) // messages only for RPC transport
         .compile(
             &files.iter().map(|p| p.as_path()).collect::<Vec<_>>(),
             &[proto_dir.as_path()],
