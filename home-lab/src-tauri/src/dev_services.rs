@@ -19,6 +19,14 @@ fn cargo_bin() -> &'static str {
     "cargo"
 }
 
+fn fallback_rust_log() -> String {
+    if cfg!(debug_assertions) {
+        "debug,home_dns=debug,home_http=debug".to_string()
+    } else {
+        "info".to_string()
+    }
+}
+
 struct ProcGuard {
     _name: &'static str,
     child: Child,
@@ -77,7 +85,7 @@ fn spawn_cargo_package(pkg: &str, args: &[&str]) -> Result<Child> {
     cmd.current_dir(workspace_root())
         .env(
             "RUST_LOG",
-            std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()),
+            std::env::var("RUST_LOG").unwrap_or_else(|_| fallback_rust_log()),
         )
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -94,7 +102,7 @@ fn spawn_binary<P: AsRef<Path>>(exe: P, args: &[&str]) -> Result<Child> {
     cmd.current_dir(workspace_root())
         .env(
             "RUST_LOG",
-            std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()),
+            std::env::var("RUST_LOG").unwrap_or_else(|_| fallback_rust_log()),
         )
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

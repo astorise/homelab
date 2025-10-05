@@ -72,6 +72,22 @@ const PROC_ADD_ROUTE: u32 = 3;
 const PROC_REMOVE_ROUTE: u32 = 4;
 const PROC_LIST_ROUTES: u32 = 5;
 
+fn default_level_filter() -> LevelFilter {
+    if cfg!(debug_assertions) {
+        LevelFilter::Debug
+    } else {
+        LevelFilter::Info
+    }
+}
+
+fn default_level_str() -> &'static str {
+    if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "info"
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct HttpConfig {
     #[serde(default = "default_http_port")]
@@ -161,7 +177,7 @@ fn load_config_or_init() -> Result<HttpConfig> {
             wsl_ip: None,
             wsl_refresh_secs: 30,
             routes: HashMap::new(),
-            log_level: Some("info".into()),
+            log_level: Some(default_level_str().into()),
         };
         save_config(&cfg)?;
         return Ok(cfg);

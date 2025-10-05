@@ -7,6 +7,11 @@ use std::ptr;
 use std::slice;
 use std::sync::Arc;
 
+use log::{debug, error, info, warn};
+use windows_sys::Win32::Foundation::{GetLastError, LocalFree};
+use windows_sys::Win32::Security::Authorization::{
+    ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+};
 use windows_sys::Win32::System::Rpc::{
     I_RpcFreeBuffer, I_RpcGetBuffer, I_RpcSendReceive, RPC_C_LISTEN_MAX_CALLS_DEFAULT,
     RPC_C_PROTSEQ_MAX_REQS_DEFAULT, RPC_CLIENT_INTERFACE, RPC_DISPATCH_FUNCTION,
@@ -17,8 +22,6 @@ use windows_sys::Win32::System::Rpc::{
     RpcServerUnregisterIf, RpcServerUseProtseqEpW, RpcStringBindingComposeW, RpcStringFreeW,
 };
 use windows_sys::core::{GUID, PWSTR};
-use windows_sys::Win32::Foundation::{GetLastError, LocalFree};
-use windows_sys::Win32::Security::Authorization::{ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1};
 
 const PROTSEQ_NCALRPC: &[u16] = &[110, 99, 97, 108, 114, 112, 99, 0]; // "ncalrpc\0"
 const NDR_SYNTAX_GUID: GUID = GUID {
@@ -81,6 +84,22 @@ fn wide_null(s: &str) -> Vec<u16> {
     let mut v: Vec<u16> = OsStr::new(s).encode_wide().collect();
     v.push(0);
     v
+}
+
+fn format_guid(g: GUID) -> String {
+    format!(
+        "{:#010x}-{:#06x}-{:#06x}-{:#04x}-{:#012x}",
+        g.data1,
+        g.data2,
+        g.data3,
+        ((g.data4[0] as u16) << 8) | g.data4[1] as u16,
+        ((g.data4[2] as u64) << 40)
+            | ((g.data4[3] as u64) << 32)
+            | ((g.data4[4] as u64) << 24)
+            | ((g.data4[5] as u64) << 16)
+            | ((g.data4[6] as u64) << 8)
+            | g.data4[7] as u64
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -172,6 +191,7 @@ pub struct Server {
     dispatch_table: *mut RPC_DISPATCH_TABLE,
     _dispatch_entries: Box<[RPC_DISPATCH_FUNCTION]>,
     ctx: *mut ServerContext,
+    _security: RpcSecurity,
 }
 
 unsafe impl Send for Server {}
@@ -189,6 +209,15 @@ impl Server {
             return Err(Error::new(RPC_S_CALL_FAILED, "proc_count must be > 0"));
         }
 
+        info!("local-rpc: starting server for endpoint {}", endpoint);
+        debug!(
+            "local-rpc: server uuid={} version={}.{} proc_count={}",
+            format_guid(uuid),
+            version.0,
+            version.1,
+            proc_count,
+        );
+
         let endpoint_w = wide_null(endpoint);
         let security = RpcSecurity::new()?;
         let status = unsafe {
@@ -199,8 +228,22 @@ impl Server {
                 security.as_ptr(),
             )
         };
-        if status != 0 && status != RPC_S_DUPLICATE_ENDPOINT {
+        if status == RPC_S_DUPLICATE_ENDPOINT {
+            warn!(
+                "local-rpc: endpoint {} already registered, continuing",
+                endpoint
+            );
+        } else if status != 0 {
+            error!(
+                "local-rpc: RpcServerUseProtseqEpW failed for {}: status {}",
+                endpoint, status
+            );
             return Err(Error::new(status, "RpcServerUseProtseqEpW"));
+        } else {
+            info!(
+                "local-rpc: RpcServerUseProtseqEpW succeeded for {}",
+                endpoint
+            );
         }
 
         let mut entries = vec![None; proc_count as usize].into_boxed_slice();
@@ -275,14 +318,20 @@ impl Server {
             dispatch_table: dispatch_table_ptr,
             _dispatch_entries: entries,
             ctx: ctx_ptr,
+            _security: security,
         })
     }
 
     pub fn stop(&self) -> Result<(), Error> {
         let status = unsafe { RpcMgmtStopServerListening(ptr::null()) };
+        info!("local-rpc: stopping server");
         if status == 0 {
             Ok(())
         } else {
+            error!(
+                "local-rpc: RpcMgmtStopServerListening failed: status {}",
+                status
+            );
             Err(Error::new(status, "RpcMgmtStopServerListening"))
         }
     }
@@ -290,6 +339,7 @@ impl Server {
 
 impl Drop for Server {
     fn drop(&mut self) {
+        debug!("local-rpc: dropping server");
         unsafe {
             let _ = RpcMgmtStopServerListening(ptr::null());
             let _ = RpcServerUnregisterIf(self.server_if as *const _, ptr::null(), 1);
@@ -307,6 +357,7 @@ pub struct Client {
 
 impl Client {
     pub fn connect(uuid: GUID, version: (u16, u16), endpoint: &str) -> Result<Self, Error> {
+        debug!("local-rpc: client connecting to endpoint {}", endpoint);
         let endpoint_w = wide_null(endpoint);
         let mut string_binding: PWSTR = ptr::null_mut();
         let status = unsafe {
@@ -320,6 +371,10 @@ impl Client {
             )
         };
         if status != 0 {
+            error!(
+                "local-rpc: RpcStringBindingComposeW failed for {}: status {}",
+                endpoint, status
+            );
             return Err(Error::new(status, "RpcStringBindingComposeW"));
         }
 
@@ -329,6 +384,10 @@ impl Client {
             let _ = RpcStringFreeW(&mut string_binding);
         }
         if status != 0 {
+            error!(
+                "local-rpc: RpcBindingFromStringBindingW failed for {}: status {}",
+                endpoint, status
+            );
             return Err(Error::new(status, "RpcBindingFromStringBindingW"));
         }
 
@@ -353,10 +412,16 @@ impl Client {
             Flags: 0,
         });
 
+        debug!("local-rpc: client connected to {}", endpoint);
         Ok(Self { binding, client_if })
     }
 
     pub fn call(&self, proc_num: u32, request: &[u8]) -> Result<Vec<u8>, Error> {
+        debug!(
+            "local-rpc: call proc {} ({} bytes)",
+            proc_num,
+            request.len()
+        );
         let mut message = RPC_MESSAGE {
             Handle: self.binding,
             DataRepresentation: NDR_LOCAL_DATA_REPRESENTATION,
@@ -373,6 +438,7 @@ impl Client {
 
         let status = unsafe { I_RpcGetBuffer(&mut message) };
         if status != 0 {
+            error!("local-rpc: I_RpcGetBuffer failed: status {}", status);
             return Err(Error::new(status, "I_RpcGetBuffer"));
         }
 
