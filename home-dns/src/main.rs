@@ -53,6 +53,22 @@ const PROC_ADD_RECORD: u32 = 3;
 const PROC_REMOVE_RECORD: u32 = 4;
 const PROC_LIST_RECORDS: u32 = 5;
 
+fn default_level_filter() -> LevelFilter {
+    if cfg!(debug_assertions) {
+        LevelFilter::Debug
+    } else {
+        LevelFilter::Info
+    }
+}
+
+fn default_level_str() -> &'static str {
+    if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "info"
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 struct RecordEntry {
     #[serde(default)]
@@ -150,7 +166,7 @@ fn level_from_cfg(cfg: &DnsConfig) -> LevelFilter {
     match cfg
         .log_level
         .as_deref()
-        .unwrap_or("info")
+        .unwrap_or(default_level_str())
         .to_ascii_lowercase()
         .as_str()
     {
@@ -180,7 +196,7 @@ fn load_config_or_init() -> Result<DnsConfig> {
             servers_v4: vec!["1.1.1.1".into(), "1.0.0.1".into()],
             servers_v6: vec![],
             backups: HashMap::new(),
-            log_level: Some("info".into()),
+            log_level: Some(default_level_str().into()),
             records: HashMap::new(),
         };
         let yaml = serde_yaml::to_string(&cfg)?;
@@ -648,7 +664,7 @@ fn run_service() -> Result<()> {
             servers_v4: vec![],
             servers_v6: vec![],
             backups: HashMap::new(),
-            log_level: Some("info".into()),
+            log_level: Some(default_level_str().into()),
             records: HashMap::new(),
         })),
         stopping: Arc::new(AtomicBool::new(false)),
@@ -666,7 +682,7 @@ fn run_service() -> Result<()> {
                     servers_v4: vec![],
                     servers_v6: vec![],
                     backups: HashMap::new(),
-                    log_level: Some("info".into()),
+                    log_level: Some(default_level_str().into()),
                     records: HashMap::new(),
                 }
             }
@@ -815,7 +831,7 @@ fn install_service() -> Result<()> {
 }
 
 fn uninstall_service() -> Result<()> {
-    if let Err(e) = init_logger(LevelFilter::Info) {
+    if let Err(e) = init_logger(default_level_filter()) {
         eprintln!("[uninstall] logger init failed (continuing): {e}");
     }
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;

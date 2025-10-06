@@ -5,7 +5,7 @@ use std::{fs, path::PathBuf};
 #[cfg(debug_assertions)]
 use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
 use tracing::{error, info, warn};
-use tracing_appender::non_blocking::WorkerGuard;
+use tracing_appender::{non_blocking::WorkerGuard, rolling};
 use tracing_subscriber::{fmt, EnvFilter};
 
 #[cfg(all(debug_assertions, target_os = "windows"))]
@@ -18,56 +18,87 @@ mod ui;
 
 static mut LOG_GUARD: Option<WorkerGuard> = None;
 
+fn default_log_filter() -> &'static str {
+    if cfg!(debug_assertions) {
+        "debug,tauri=info"
+    } else {
+        "info"
+    }
+}
+
 fn log_dir() -> PathBuf {
-    // 1. ProgramData (idéal pour une app installée)
+    // 1. ProgramData (preferred when the app is installed)
     if let Some(pd) = std::env::var_os("PROGRAMDATA") {
         return PathBuf::from(pd).join("home-lab").join("logs");
     }
-    // 2. LocalAppData (dev / per-user)
+    // 2. LocalAppData (user scope, common during development)
     if let Some(la) = std::env::var_os("LOCALAPPDATA") {
         return PathBuf::from(la).join("home-lab").join("logs");
     }
-    // 3. Temp (toujours présent)
+    // 3. Temp (always available)
     if let Some(t) = std::env::var_os("TEMP").or_else(|| std::env::var_os("TMP")) {
         return PathBuf::from(t).join("home-lab").join("logs");
     }
-    // 4. Répertoire courant (dernier recours)
+    // 4. Current directory (last resort)
     PathBuf::from(".").join("home-lab").join("logs")
 }
 
 fn init_file_logger() {
-    // défaut si RUST_LOG absent
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-
     let dir = log_dir();
     if let Err(e) = fs::create_dir_all(&dir) {
-        eprintln!("Impossible de créer {:?}: {:?}", dir, e);
+        eprintln!("Unable to create {}: {e}", dir.display());
     }
 
-    let file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(dir.join("app.log"))
-        .ok();
+    let filter_directive =
+        std::env::var("RUST_LOG").unwrap_or_else(|_| default_log_filter().to_string());
+    let filter = EnvFilter::try_new(filter_directive.clone())
+        .unwrap_or_else(|_| EnvFilter::new(default_log_filter()));
 
-    match file {
-        Some(file) => {
-            let (nb, guard) = tracing_appender::non_blocking(file);
+    let file_appender = rolling::daily(&dir, "app.log");
+    let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+
+    let builder = fmt()
+        .with_env_filter(filter)
+        .with_writer(non_blocking)
+        .with_ansi(false)
+        .with_level(true)
+        .with_target(true)
+        .with_file(true)
+        .with_line_number(true)
+        .with_thread_ids(true)
+        .with_thread_names(true);
+
+    match builder.try_init() {
+        Ok(()) => {
             unsafe {
                 LOG_GUARD = Some(guard);
             }
-            let _ = fmt().with_env_filter(filter).with_writer(nb).try_init();
-            info!("logger initialisé → {:?}", dir);
+            info!("File logger initialised in {}", dir.display());
         }
-        None => {
-            let _ = fmt().with_env_filter(filter).try_init();
-            warn!(
-                "logger en console uniquement — échec d’ouverture du fichier dans {:?}",
-                dir
-            );
+        Err(err) => {
+            drop(guard);
+            let fallback_filter = EnvFilter::try_new(filter_directive)
+                .unwrap_or_else(|_| EnvFilter::new(default_log_filter()));
+            if fmt()
+                .with_env_filter(fallback_filter)
+                .with_ansi(false)
+                .with_level(true)
+                .with_target(true)
+                .with_file(true)
+                .with_line_number(true)
+                .with_thread_ids(true)
+                .with_thread_names(true)
+                .try_init()
+                .is_ok()
+            {
+                warn!("File logger initialisation failed: {err}. Logging to console instead.");
+            } else {
+                eprintln!("Logger initialisation failed: {err}");
+            }
         }
     }
 }
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     std::env::set_var("RUST_BACKTRACE", "1");
