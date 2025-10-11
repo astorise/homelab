@@ -4,7 +4,8 @@ members = [
   "home-http",
   "home-lab/src-tauri",
   "local-rpc",
-  "pipe-test"
+  "pipe-test",
+  "service-tester"
 ]
 resolver = "3"
 

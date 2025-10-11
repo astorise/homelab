@@ -91,8 +91,8 @@ function Ensure-Service {
 }
 
 $root = Get-RepoRoot
-$nsis = Join-Path $root 'home-lab\target\release\bundle\nsis\home-lab_0.1.0_x64-setup.exe'
-$msi  = Join-Path $root 'home-lab\target\release\bundle\msi\home-lab_0.1.0_x64_en-US.msi'
+$nsis = Join-Path $root 'target\release\bundle\nsis\home-lab_0.1.0_x64-setup.exe'
+$msi  = Join-Path $root 'target\release\bundle\msi\home-lab_0.1.0_x64_en-US.msi'
 
 if ($UseMsi) {
   Uninstall-MSI-IfPresent

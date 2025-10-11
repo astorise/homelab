@@ -2,7 +2,10 @@ use anyhow::{anyhow, Result};
 use local_rpc::Client as RpcClient;
 use prost::Message;
 use serde::Serialize;
+use std::process::Command;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::task;
+use tracing::{debug, error, info, instrument, trace, warn, Span};
 use windows_sys::core::GUID;
 
 pub mod homedns {
@@ -28,16 +31,156 @@ const PROC_ADD_RECORD: u32 = 3;
 const PROC_REMOVE_RECORD: u32 = 4;
 const PROC_LIST_RECORDS: u32 = 5;
 
+static CALL_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+static DIAGNOSTICS_LOGGED: AtomicBool = AtomicBool::new(false);
+const SERVICE_CANDIDATES: &[&str] = &[
+    "HomeDnsService",
+    "HomeDnsDevService",
+    "home-dns",
+    "home-dns-dev",
+    "HomeDns",
+    "HomeDnsDev",
+];
+const ENV_VARS_OF_INTEREST: &[&str] = &[
+    "PROGRAMDATA",
+    "LOCALAPPDATA",
+    "APPDATA",
+    "TEMP",
+    "TMP",
+    "USERNAME",
+    "USERDOMAIN",
+];
+
+fn procedure_name(proc_num: u32) -> &'static str {
+    match proc_num {
+        PROC_STOP_SERVICE => "STOP_SERVICE",
+        PROC_RELOAD_CONFIG => "RELOAD_CONFIG",
+        PROC_GET_STATUS => "GET_STATUS",
+        PROC_ADD_RECORD => "ADD_RECORD",
+        PROC_REMOVE_RECORD => "REMOVE_RECORD",
+        PROC_LIST_RECORDS => "LIST_RECORDS",
+        _ => "UNKNOWN",
+    }
+}
+
+fn log_env_snapshot(context: &str) {
+    for var in ENV_VARS_OF_INTEREST {
+        let value = std::env::var_os(var)
+            .map(|v| v.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "<unset>".into());
+        info!(
+            context = context,
+            env_var = *var,
+            value = %value,
+            "Environment snapshot captured for diagnostics"
+        );
+    }
+    match std::env::current_dir() {
+        Ok(dir) => info!(
+            context = context,
+            cwd = %dir.display(),
+            "Current working directory captured for diagnostics"
+        ),
+        Err(err) => warn!(
+            context = context,
+            error = %err,
+            "Unable to read current working directory during diagnostics"
+        ),
+    }
+}
+
+fn log_service_state(context: &str, service: &str) {
+    match Command::new("sc").args(["query", service]).output() {
+        Ok(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout_summary = stdout
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .take(12)
+                .collect::<Vec<_>>()
+                .join(" | ");
+            let stderr_summary = stderr
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .take(12)
+                .collect::<Vec<_>>()
+                .join(" | ");
+            let exit_code = output
+                .status
+                .code()
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "terminated".into());
+            info!(
+                context = context,
+                service = service,
+                exit_code = %exit_code,
+                stdout = %stdout_summary,
+                stderr = %stderr_summary,
+                "Windows service query result (sc query)"
+            );
+        }
+        Err(err) => warn!(
+            context = context,
+            service = service,
+            error = %err,
+            "Failed to run `sc query` during diagnostics"
+        ),
+    }
+}
+
+fn log_service_snapshots(context: &str, services: &[&str]) {
+    for service in services {
+        log_service_state(context, service);
+    }
+}
+
+fn log_dns_diagnostics(error: &str) {
+    if DIAGNOSTICS_LOGGED.swap(true, Ordering::SeqCst) {
+        debug!(
+            context = "dns",
+            error = %error,
+            "DNS diagnostics already recorded earlier in this session"
+        );
+        return;
+    }
+    warn!(
+        context = "dns",
+        error = %error,
+        "DNS RPC diagnostics triggered after repeated failures"
+    );
+    log_env_snapshot("dns");
+    log_service_snapshots("dns", SERVICE_CANDIDATES);
+}
+
 fn connect_rpc() -> Result<RpcClient> {
     let mut last_err = None;
     for endpoint in RPC_ENDPOINTS {
+        info!(endpoint = endpoint, "Attempting DNS RPC endpoint discovery");
         match RpcClient::connect(RPC_INTERFACE_UUID, RPC_INTERFACE_VERSION, endpoint) {
-            Ok(client) => return Ok(client),
-            Err(err) => last_err = Some((*endpoint, err)),
+            Ok(client) => {
+                info!(endpoint = endpoint, "Connected to DNS RPC endpoint");
+                return Ok(client);
+            }
+            Err(err) => {
+                warn!(
+                    endpoint = endpoint,
+                    error = %err,
+                    "DNS RPC endpoint connection failed, will try next candidate"
+                );
+                last_err = Some((*endpoint, err));
+            }
         }
     }
     let (endpoint, err) = last_err.expect("RPC_ENDPOINTS is not empty");
-    Err(anyhow!("connect {endpoint}: {err}"))
+    let failure = anyhow!("connect {endpoint}: {err}");
+    error!(
+        endpoint = endpoint,
+        error = %failure,
+        "All DNS RPC endpoint attempts failed"
+    );
+    log_dns_diagnostics(&failure.to_string());
+    Err(failure)
 }
 
 fn format_transport_error(msg: impl std::fmt::Display) -> String {
@@ -57,20 +200,114 @@ fn format_transport_error(msg: impl std::fmt::Display) -> String {
     text
 }
 
+#[instrument(
+    level = "trace",
+    skip(request),
+    fields(
+        proc = procedure_name(proc_num),
+        call_id = tracing::field::Empty,
+        payload_size = tracing::field::Empty
+    )
+)]
 async fn rpc_call(proc_num: u32, request: Vec<u8>) -> Result<Vec<u8>, String> {
+    let payload_size = request.len();
+    let payload_size_u64 = payload_size as u64;
+    let call_id = CALL_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    Span::current().record("call_id", &call_id);
+    Span::current().record("payload_size", &payload_size_u64);
+    trace!(
+        proc = procedure_name(proc_num),
+        call_id,
+        payload_size,
+        "Dispatching DNS RPC call"
+    );
+    let span = Span::current();
     task::spawn_blocking(move || {
-        let client = connect_rpc().map_err(|e| format_transport_error(e))?;
-        client
-            .call(proc_num, &request)
-            .map_err(|e| format_transport_error(e))
+        span.in_scope(|| {
+            trace!(
+                proc = procedure_name(proc_num),
+                call_id,
+                payload_size,
+                "Starting DNS RPC call in blocking task"
+            );
+            let client = connect_rpc().map_err(|e| {
+                let msg = format_transport_error(e);
+                log_dns_diagnostics(&msg);
+                error!(
+                    proc = procedure_name(proc_num),
+                    call_id,
+                    payload_size,
+                    error = %msg,
+                    "DNS RPC connect failed"
+                );
+                msg
+            })?;
+            trace!(
+                proc = procedure_name(proc_num),
+                call_id,
+                payload_size,
+                "DNS RPC client ready"
+            );
+            client
+                .call(proc_num, &request)
+                .map(|response| {
+                    trace!(
+                        proc = procedure_name(proc_num),
+                        call_id,
+                        payload_size,
+                        response_size = response.len(),
+                        "DNS RPC call succeeded"
+                    );
+                    response
+                })
+                .map_err(|e| {
+                    let msg = format_transport_error(e);
+                    log_dns_diagnostics(&msg);
+                    error!(
+                        proc = procedure_name(proc_num),
+                        call_id,
+                        payload_size,
+                        error = %msg,
+                        "DNS RPC call failed"
+                    );
+                    msg
+                })
+        })
     })
     .await
-    .map_err(|e| format_transport_error(e))?
+    .map_err(|e| {
+        let msg = format_transport_error(e);
+        log_dns_diagnostics(&msg);
+        error!(
+            proc = procedure_name(proc_num),
+            call_id,
+            payload_size,
+            error = %msg,
+            "DNS RPC join error"
+        );
+        msg
+    })?
 }
 
 fn decode_response<T: Message + Default>(bytes: Vec<u8>) -> Result<T, String> {
-    T::decode(bytes.as_slice())
-        .map_err(|e| format_transport_error(format!("decodage reponse: {e}")))
+    let response_type = std::any::type_name::<T>();
+    let payload_size = bytes.len();
+    trace!(
+        response_type,
+        payload_size,
+        "Decoding DNS RPC response payload"
+    );
+    T::decode(bytes.as_slice()).map_err(|e| {
+        let msg = format_transport_error(format!("decodage reponse: {e}"));
+        log_dns_diagnostics(&msg);
+        error!(
+            response_type,
+            payload_size,
+            error = %msg,
+            "DNS RPC response decode failed"
+        );
+        msg
+    })
 }
 
 #[derive(Serialize)]
@@ -99,39 +336,81 @@ pub struct ListRecordsOut {
 }
 
 #[tauri::command]
+#[instrument(level = "debug")]
 pub async fn dns_get_status() -> Result<StatusOut, String> {
-    let bytes = rpc_call(PROC_GET_STATUS, Empty {}.encode_to_vec()).await?;
-    let resp: StatusResponse = decode_response(bytes)?;
-    Ok(StatusOut {
-        state: resp.state,
-        log_level: resp.log_level,
-    })
+    debug!("Requesting DNS status from service");
+    let bytes = rpc_call(PROC_GET_STATUS, Empty {}.encode_to_vec())
+        .await
+        .map_err(|e| {
+            error!(error = %e, "DNS status RPC call failed");
+            e
+        })?;
+    trace!("DNS status response received ({} bytes)", bytes.len());
+    let resp: StatusResponse = decode_response(bytes).map_err(|e| {
+        error!(error = %e, "DNS status response decode failed");
+        e
+    })?;
+    let state = resp.state;
+    let log_level = resp.log_level;
+    debug!(state = %state, log_level = %log_level, "DNS status retrieved");
+    Ok(StatusOut { state, log_level })
 }
 
 #[tauri::command]
+#[instrument(level = "debug")]
 pub async fn dns_stop_service() -> Result<AckOut, String> {
-    let bytes = rpc_call(PROC_STOP_SERVICE, Empty {}.encode_to_vec()).await?;
-    let ack: Ack = decode_response(bytes)?;
-    Ok(AckOut {
-        ok: ack.ok,
-        message: ack.message,
-    })
+    debug!("Sending DNS stop service command");
+    let bytes = rpc_call(PROC_STOP_SERVICE, Empty {}.encode_to_vec())
+        .await
+        .map_err(|e| {
+            error!(error = %e, "DNS stop RPC call failed");
+            e
+        })?;
+    let ack: Ack = decode_response(bytes).map_err(|e| {
+        error!(error = %e, "DNS stop response decode failed");
+        e
+    })?;
+    let ok = ack.ok;
+    let message = ack.message;
+    info!(ok, message = %message, "DNS stop service acknowledged");
+    Ok(AckOut { ok, message })
 }
 
 #[tauri::command]
+#[instrument(level = "debug")]
 pub async fn dns_reload_config() -> Result<AckOut, String> {
-    let bytes = rpc_call(PROC_RELOAD_CONFIG, Empty {}.encode_to_vec()).await?;
-    let ack: Ack = decode_response(bytes)?;
-    Ok(AckOut {
-        ok: ack.ok,
-        message: ack.message,
-    })
+    debug!("Sending DNS reload configuration command");
+    let bytes = rpc_call(PROC_RELOAD_CONFIG, Empty {}.encode_to_vec())
+        .await
+        .map_err(|e| {
+            error!(error = %e, "DNS reload RPC call failed");
+            e
+        })?;
+    let ack: Ack = decode_response(bytes).map_err(|e| {
+        error!(error = %e, "DNS reload response decode failed");
+        e
+    })?;
+    let ok = ack.ok;
+    let message = ack.message;
+    info!(ok, message = %message, "DNS reload configuration acknowledged");
+    Ok(AckOut { ok, message })
 }
 
 #[tauri::command]
+#[instrument(level = "debug")]
 pub async fn dns_list_records() -> Result<ListRecordsOut, String> {
-    let bytes = rpc_call(PROC_LIST_RECORDS, Empty {}.encode_to_vec()).await?;
-    let list: ListRecordsResponse = decode_response(bytes)?;
+    debug!("Requesting DNS record list");
+    let bytes = rpc_call(PROC_LIST_RECORDS, Empty {}.encode_to_vec())
+        .await
+        .map_err(|e| {
+            error!(error = %e, "DNS list records RPC call failed");
+            e
+        })?;
+    let list: ListRecordsResponse = decode_response(bytes).map_err(|e| {
+        error!(error = %e, "DNS list records response decode failed");
+        e
+    })?;
+    let total = list.records.len();
     let records = list
         .records
         .into_iter()
@@ -142,45 +421,76 @@ pub async fn dns_list_records() -> Result<ListRecordsOut, String> {
             ttl: r.ttl,
         })
         .collect();
+    info!(total, "DNS record list retrieved");
     Ok(ListRecordsOut { records })
 }
 
 #[tauri::command]
+#[instrument(level = "debug", skip(value))]
 pub async fn dns_add_record(
     name: String,
     rrtype: String,
     value: String,
     ttl: u32,
 ) -> Result<AckOut, String> {
+    debug!(
+        name = %name,
+        rrtype = %rrtype,
+        ttl,
+        "Adding DNS record via RPC"
+    );
     let req = AddRecordRequest {
         name,
         rrtype,
         value,
         ttl,
     };
-    let bytes = rpc_call(PROC_ADD_RECORD, req.encode_to_vec()).await?;
-    let ack: Ack = decode_response(bytes)?;
-    Ok(AckOut {
-        ok: ack.ok,
-        message: ack.message,
-    })
+    let bytes = rpc_call(PROC_ADD_RECORD, req.encode_to_vec())
+        .await
+        .map_err(|e| {
+            error!(error = %e, "DNS add record RPC call failed");
+            e
+        })?;
+    let ack: Ack = decode_response(bytes).map_err(|e| {
+        error!(error = %e, "DNS add record response decode failed");
+        e
+    })?;
+    let ok = ack.ok;
+    let message = ack.message;
+    info!(ok, message = %message, "DNS add record acknowledged");
+    Ok(AckOut { ok, message })
 }
 
 #[tauri::command]
+#[instrument(level = "debug")]
 pub async fn dns_remove_record(
     name: String,
     rrtype: String,
     value: String,
 ) -> Result<AckOut, String> {
+    debug!(
+        name = %name,
+        rrtype = %rrtype,
+        value = %value,
+        "Removing DNS record via RPC"
+    );
     let req = RemoveRecordRequest {
         name,
         rrtype,
         value,
     };
-    let bytes = rpc_call(PROC_REMOVE_RECORD, req.encode_to_vec()).await?;
-    let ack: Ack = decode_response(bytes)?;
-    Ok(AckOut {
-        ok: ack.ok,
-        message: ack.message,
-    })
+    let bytes = rpc_call(PROC_REMOVE_RECORD, req.encode_to_vec())
+        .await
+        .map_err(|e| {
+            error!(error = %e, "DNS remove record RPC call failed");
+            e
+        })?;
+    let ack: Ack = decode_response(bytes).map_err(|e| {
+        error!(error = %e, "DNS remove record response decode failed");
+        e
+    })?;
+    let ok = ack.ok;
+    let message = ack.message;
+    info!(ok, message = %message, "DNS remove record acknowledged");
+    Ok(AckOut { ok, message })
 }
