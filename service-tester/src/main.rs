@@ -30,6 +30,9 @@ const DNS_UUID: GUID = GUID::from_u128(0x18477de6c4b24746b60492db45db2d31);
 const HTTP_UUID: GUID = GUID::from_u128(0x9df99e13af1c480cb5e64864350b5f3e);
 const RPC_VERSION: (u16, u16) = (1, 0);
 const PROC_GET_STATUS: u32 = 2;
+const RPC_STATUS_SERVER_NOT_LISTENING: i32 = 1715;
+const RPC_STATUS_SERVER_UNAVAILABLE: i32 = 1722;
+const RPC_STATUS_ENDPOINT_NOT_FOUND: i32 = 1753;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
 enum ServiceKind {
@@ -164,60 +167,82 @@ fn check_rpc(service: ServiceKind, override_endpoints: &[String]) -> Result<()> 
         return Err(anyhow!("no RPC endpoints provided to test"));
     }
 
-    let mut last_err: Option<(String, local_rpc::Error)> = None;
-    let mut active: Option<(RpcClient, String)> = None;
+    let mut last_failure: Option<String> = None;
 
     for endpoint in &endpoints {
         match RpcClient::connect(service.rpc_uuid(), RPC_VERSION, endpoint) {
             Ok(client) => {
-                active = Some((client, endpoint.clone()));
-                break;
+                let request = match service {
+                    ServiceKind::Dns => homedns::homedns::v1::Empty {}.encode_to_vec(),
+                    ServiceKind::Http => homehttp::homehttp::v1::Empty {}.encode_to_vec(),
+                };
+                match client.call(PROC_GET_STATUS, &request) {
+                    Ok(response) => {
+                        println!("  RPC connected via endpoint '{}'", endpoint);
+                        match service {
+                            ServiceKind::Dns => {
+                                let status = homedns::homedns::v1::StatusResponse::decode(
+                                    response.as_slice(),
+                                )
+                                .context("decode DNS status response")?;
+                                println!(
+                                    "  RPC status: state='{}', log_level='{}'",
+                                    status.state, status.log_level
+                                );
+                            }
+                            ServiceKind::Http => {
+                                let status = homehttp::homehttp::v1::StatusResponse::decode(
+                                    response.as_slice(),
+                                )
+                                .context("decode HTTP status response")?;
+                                println!(
+                                    "  RPC status: state='{}', log_level='{}'",
+                                    status.state, status.log_level
+                                );
+                            }
+                        }
+                        return Ok(());
+                    }
+                    Err(err) => {
+                        let code = err.code();
+                        println!(
+                            "  RPC call failed on '{}': {} (code {})",
+                            endpoint, err, code
+                        );
+                        if is_transient_rpc_error(code) {
+                            last_failure =
+                                Some(format!("call endpoint '{endpoint}': {}", err));
+                            continue;
+                        } else {
+                            return Err(anyhow!(
+                                "RPC GetStatus call failed on '{endpoint}': {err}"
+                            ));
+                        }
+                    }
+                }
             }
             Err(err) => {
                 println!("  RPC connect failed on '{}': {}", endpoint, err);
-                last_err = Some((endpoint.clone(), err));
+                last_failure = Some(format!("connect endpoint '{endpoint}': {err}"));
+                continue;
             }
         }
     }
 
-    let (client, endpoint) = if let Some(pair) = active {
-        pair
-    } else if let Some((ep, err)) = last_err {
-        return Err(anyhow!("unable to connect to RPC endpoint '{ep}': {err}"));
+    if let Some(msg) = last_failure {
+        Err(anyhow!("unable to reach any RPC endpoint: {msg}"))
     } else {
-        return Err(anyhow!("no RPC endpoints provided to test"));
-    };
-
-    println!("  RPC connected via endpoint '{}'", endpoint);
-
-    let request = match service {
-        ServiceKind::Dns => homedns::homedns::v1::Empty {}.encode_to_vec(),
-        ServiceKind::Http => homehttp::homehttp::v1::Empty {}.encode_to_vec(),
-    };
-    let response = client
-        .call(PROC_GET_STATUS, &request)
-        .map_err(|err| anyhow!("RPC GetStatus call failed: {}", err))?;
-
-    match service {
-        ServiceKind::Dns => {
-            let status = homedns::homedns::v1::StatusResponse::decode(response.as_slice())
-                .context("decode DNS status response")?;
-            println!(
-                "  RPC status: state='{}', log_level='{}'",
-                status.state, status.log_level
-            );
-        }
-        ServiceKind::Http => {
-            let status = homehttp::homehttp::v1::StatusResponse::decode(response.as_slice())
-                .context("decode HTTP status response")?;
-            println!(
-                "  RPC status: state='{}', log_level='{}'",
-                status.state, status.log_level
-            );
-        }
+        Err(anyhow!("no RPC endpoints provided to test"))
     }
+}
 
-    Ok(())
+fn is_transient_rpc_error(code: i32) -> bool {
+    matches!(
+        code,
+        RPC_STATUS_SERVER_NOT_LISTENING
+            | RPC_STATUS_SERVER_UNAVAILABLE
+            | RPC_STATUS_ENDPOINT_NOT_FOUND
+    )
 }
 
 fn query_service_status(name: &str) -> windows_service::Result<ServiceStatus> {
