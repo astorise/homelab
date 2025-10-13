@@ -98,16 +98,14 @@ fn main() {
         proto_dir.join("home_dns.proto"),
         proto_dir.join("home_http.proto"),
     ];
+    let include_dirs = [proto_dir.clone()];
     for f in &files {
         println!("cargo:rerun-if-changed={}", f.display());
     }
 
-    tonic_build::configure()
+    tonic_prost_build::configure()
         .build_client(false)
         .build_server(false) // messages only for RPC transport
-        .compile(
-            &files.iter().map(|p| p.as_path()).collect::<Vec<_>>(),
-            &[proto_dir.as_path()],
-        )
+        .compile_protos(&files, &include_dirs)
         .expect("failed to compile .proto files");
 }

@@ -3,15 +3,15 @@ fn main() {
     if let Ok(pb) = protoc_bin_vendored::protoc_bin_path() {
         std::env::set_var("PROTOC", pb);
     }
-    tonic_build::configure()
+    let include_dirs = [proto_dir.to_path_buf()];
+    let protos = [
+        proto_dir.join("home_dns.proto"),
+        proto_dir.join("home_http.proto"),
+    ];
+
+    tonic_prost_build::configure()
         .build_client(false)
         .build_server(false)
-        .compile(
-            &[
-                proto_dir.join("home_dns.proto"),
-                proto_dir.join("home_http.proto"),
-            ],
-            &[proto_dir],
-        )
+        .compile_protos(&protos, &include_dirs)
         .expect("compile protos");
 }
