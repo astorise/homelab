@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use local_rpc::Client as RpcClient;
 use prost::Message;
 use serde::Serialize;
@@ -30,6 +30,9 @@ const PROC_GET_STATUS: u32 = 2;
 const PROC_ADD_RECORD: u32 = 3;
 const PROC_REMOVE_RECORD: u32 = 4;
 const PROC_LIST_RECORDS: u32 = 5;
+const RPC_STATUS_SERVER_NOT_LISTENING: i32 = 1715;
+const RPC_STATUS_SERVER_UNAVAILABLE: i32 = 1722;
+const RPC_STATUS_ENDPOINT_NOT_FOUND: i32 = 1753;
 
 static CALL_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static DIAGNOSTICS_LOGGED: AtomicBool = AtomicBool::new(false);
@@ -153,33 +156,113 @@ fn log_dns_diagnostics(error: &str) {
     log_service_snapshots("dns", SERVICE_CANDIDATES);
 }
 
-fn connect_rpc() -> Result<RpcClient> {
-    let mut last_err = None;
+fn call_rpc_with_fallback(
+    proc_num: u32,
+    request: &[u8],
+    call_id: u64,
+    payload_size: usize,
+) -> Result<Vec<u8>, String> {
+    let mut last_error: Option<String> = None;
     for endpoint in RPC_ENDPOINTS {
-        info!(endpoint = endpoint, "Attempting DNS RPC endpoint discovery");
+        info!(
+            proc = procedure_name(proc_num),
+            call_id,
+            payload_size,
+            endpoint = endpoint,
+            "Attempting DNS RPC endpoint discovery"
+        );
         match RpcClient::connect(RPC_INTERFACE_UUID, RPC_INTERFACE_VERSION, endpoint) {
             Ok(client) => {
-                info!(endpoint = endpoint, "Connected to DNS RPC endpoint");
-                return Ok(client);
+                info!(
+                    proc = procedure_name(proc_num),
+                    call_id,
+                    payload_size,
+                    endpoint = endpoint,
+                    "Connected to DNS RPC endpoint"
+                );
+                trace!(
+                    proc = procedure_name(proc_num),
+                    call_id,
+                    payload_size,
+                    endpoint = endpoint,
+                    "DNS RPC client ready"
+                );
+                match client.call(proc_num, request) {
+                    Ok(response) => {
+                        let response_size = response.len();
+                        trace!(
+                            proc = procedure_name(proc_num),
+                            call_id,
+                            payload_size,
+                            endpoint = endpoint,
+                            response_size,
+                            "DNS RPC call succeeded"
+                        );
+                        return Ok(response);
+                    }
+                    Err(err) => {
+                        let code = err.code();
+                        let err_text = err.to_string();
+                        let formatted = format_transport_error(&err_text);
+                        if is_transient_rpc_status(code) {
+                            warn!(
+                                proc = procedure_name(proc_num),
+                                call_id,
+                                payload_size,
+                                endpoint = endpoint,
+                                code,
+                                error = %formatted,
+                                "DNS RPC call transport failed, trying next endpoint"
+                            );
+                            last_error = Some(format!(
+                                "endpoint {endpoint}: {formatted} (code {code})"
+                            ));
+                            continue;
+                        } else {
+                            error!(
+                                proc = procedure_name(proc_num),
+                                call_id,
+                                payload_size,
+                                endpoint = endpoint,
+                                code,
+                                error = %formatted,
+                                "DNS RPC call failed without recovery"
+                            );
+                            log_dns_diagnostics(&formatted);
+                            return Err(formatted);
+                        }
+                    }
+                }
             }
             Err(err) => {
+                let code = err.code();
+                let err_text = err.to_string();
+                let formatted = format_transport_error(&err_text);
                 warn!(
+                    proc = procedure_name(proc_num),
+                    call_id,
+                    payload_size,
                     endpoint = endpoint,
-                    error = %err,
+                    code,
+                    error = %formatted,
                     "DNS RPC endpoint connection failed, will try next candidate"
                 );
-                last_err = Some((*endpoint, err));
+                last_error = Some(format!(
+                    "endpoint {endpoint}: {formatted} (code {code})"
+                ));
+                continue;
             }
         }
     }
-    let (endpoint, err) = last_err.expect("RPC_ENDPOINTS is not empty");
-    let failure = anyhow!("connect {endpoint}: {err}");
+    let failure = last_error.unwrap_or_else(|| "aucun point de terminaison RPC valide".into());
     error!(
-        endpoint = endpoint,
+        proc = procedure_name(proc_num),
+        call_id,
+        payload_size,
         error = %failure,
         "All DNS RPC endpoint attempts failed"
     );
-    log_dns_diagnostics(&failure.to_string());
+    log_dns_diagnostics(&failure);
     Err(failure)
 }
 
@@ -198,6 +281,15 @@ fn format_transport_error(msg: impl std::fmt::Display) -> String {
         text.push_str(" - acces refuse (lancez l'application avec des droits suffisants).");
     }
     text
+}
+
+fn is_transient_rpc_status(code: i32) -> bool {
+    matches!(
+        code,
+        RPC_STATUS_SERVER_NOT_LISTENING
+            | RPC_STATUS_SERVER_UNAVAILABLE
+            | RPC_STATUS_ENDPOINT_NOT_FOUND
+    )
 }
 
 #[instrument(
@@ -230,48 +322,7 @@ async fn rpc_call(proc_num: u32, request: Vec<u8>) -> Result<Vec<u8>, String> {
                 payload_size,
                 "Starting DNS RPC call in blocking task"
             );
-            let client = connect_rpc().map_err(|e| {
-                let msg = format_transport_error(e);
-                log_dns_diagnostics(&msg);
-                error!(
-                    proc = procedure_name(proc_num),
-                    call_id,
-                    payload_size,
-                    error = %msg,
-                    "DNS RPC connect failed"
-                );
-                msg
-            })?;
-            trace!(
-                proc = procedure_name(proc_num),
-                call_id,
-                payload_size,
-                "DNS RPC client ready"
-            );
-            client
-                .call(proc_num, &request)
-                .map(|response| {
-                    trace!(
-                        proc = procedure_name(proc_num),
-                        call_id,
-                        payload_size,
-                        response_size = response.len(),
-                        "DNS RPC call succeeded"
-                    );
-                    response
-                })
-                .map_err(|e| {
-                    let msg = format_transport_error(e);
-                    log_dns_diagnostics(&msg);
-                    error!(
-                        proc = procedure_name(proc_num),
-                        call_id,
-                        payload_size,
-                        error = %msg,
-                        "DNS RPC call failed"
-                    );
-                    msg
-                })
+            call_rpc_with_fallback(proc_num, &request, call_id, payload_size)
         })
     })
     .await
