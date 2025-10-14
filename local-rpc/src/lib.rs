@@ -36,7 +36,7 @@ const NDR_SYNTAX_VERSION: RPC_VERSION = RPC_VERSION {
 };
 const NDR_LOCAL_DATA_REPRESENTATION: u32 = 0x10;
 
-const RPC_SDDL: &str = "D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;LS)(A;;GA;;;NS)(A;;GRGW;;;AU)";
+const RPC_SDDL: &str = "D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;LS)(A;;GA;;;NS)(A;;GA;;;AU)";
 
 struct RpcSecurity {
     sd: *mut core::ffi::c_void,
