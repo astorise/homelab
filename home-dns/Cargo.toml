@@ -19,7 +19,7 @@ prost = "0.12"
 parking_lot = "0.12"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net"] }
 tonic = { version = "0.11", features = ["transport"] }
-tower-http = { version = "0.5.0", features = ["cors"] }
+tower-http = { version = "0.6.0", features = ["cors"] }
 tokio-stream = "0.1.15"
 futures-util = "0.3.30"
 pin-project = "1.1.5"
