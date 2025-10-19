@@ -39,7 +39,7 @@ usvg = "0.45"
 tiny-skia = "0.11"
 png = "0.18"
 tonic = { version = "0.11", features = ["transport"] }
-tower = "0.4"
+tower = "0.5"
 tokio-stream = "0.1.15"
 futures-util = "0.3.30"
 pin-project = "1.1.5"
