@@ -2,58 +2,62 @@
 
 use anyhow::{Context, Result};
 use flexi_logger::{Age, Cleanup, Criterion, Duplicate, FileSpec, Logger, Naming};
-use homedns::homedns::v1::*;
-use local_rpc::{Error as RpcError, Handler as RpcHandler, Server as RpcServer};
-use log::{LevelFilter, debug, error, info, warn};
+use log::{debug, error, info, warn, LevelFilter};
 use parking_lot::Mutex;
-use prost::Message;
+use pin_project::pin_project;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs::{self, File};
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::process::{Command, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::task::{Context as TaskContext, Poll};
 use std::thread;
 use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
+use tokio::runtime::Runtime;
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::UnboundedReceiverStream;
+use tonic::transport::{server::Connected, Server};
 use windows_service::define_windows_service;
 use windows_service::service::*;
 use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
 use windows_service::service_manager::*;
-use windows_sys::Win32::System::Rpc::RPC_S_CALL_FAILED;
-use windows_sys::core::GUID;
 
 // Build metadata (set in build.rs)
 const BUILD_GIT_SHA: &str = env!("BUILD_GIT_SHA");
 const BUILD_GIT_TAG: &str = env!("BUILD_GIT_TAG");
 const BUILD_TIME: &str = env!("BUILD_TIME");
-mod homedns {
+
+// gRPC service
+mod proto {
     pub mod homedns {
         pub mod v1 {
-            include!(concat!(env!("OUT_DIR"), "/homedns.v1.rs"));
+            tonic::include_proto!("homedns.v1");
         }
     }
 }
 
+use proto::homedns::v1::home_dns_server::{HomeDns, HomeDnsServer};
+use proto::homedns::v1::{
+    Ack, AddRecordRequest, Empty, ListRecordsResponse, Record, RemoveRecordRequest, StatusResponse,
+};
+
 const SERVICE_NAME: &str = "HomeDnsService";
 const SERVICE_DISPLAY_NAME: &str = "Home DNS Service";
-const SERVICE_DESCRIPTION: &str =
+const SERVICE_DESCRIPTION:
+    &str =
     r"DNS config + rollback + Windows RPC IPC on ncalrpc endpoint home-dns";
+
 #[cfg(debug_assertions)]
-const RPC_ENDPOINT: &str = "home-dns-dev";
+const NAMED_PIPE_NAME: &str = r"\\.\pipe\home-dns-dev";
 #[cfg(not(debug_assertions))]
-const RPC_ENDPOINT: &str = "home-dns";
-const RPC_INTERFACE_UUID: GUID = GUID::from_u128(0x18477de6c4b24746b60492db45db2d31);
-const RPC_INTERFACE_VERSION: (u16, u16) = (1, 0);
-const RPC_PROC_COUNT: u32 = 6;
-const PROC_STOP_SERVICE: u32 = 0;
-const PROC_RELOAD_CONFIG: u32 = 1;
-const PROC_GET_STATUS: u32 = 2;
-const PROC_ADD_RECORD: u32 = 3;
-const PROC_REMOVE_RECORD: u32 = 4;
-const PROC_LIST_RECORDS: u32 = 5;
+const NAMED_PIPE_NAME: &str = r"\\.\pipe\home-dns";
 
 fn default_level_filter() -> LevelFilter {
     if cfg!(debug_assertions) {
@@ -138,7 +142,7 @@ fn init_logger(level: LevelFilter) -> Result<()> {
         Ok(l) => l,
         Err(e) => {
             eprintln!("failed to configure logger (continuing): {e}");
-            return Ok(());
+            return Ok(())
         }
     }
     .log_to_file(
@@ -223,13 +227,12 @@ fn normalize_mac(mac: &str) -> String {
 }
 
 fn get_all_adapters() -> Result<Vec<PsAdapter>> {
-    let ps = r#"Get-NetAdapter | Select-Object -Property Name,MacAddress,Status | ConvertTo-Json -Compress"#;
+    let ps = r"Get-NetAdapter | Select-Object -Property Name,MacAddress,Status | ConvertTo-Json -Compress";
     let out = Command::new("powershell")
         .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .output()
-        .context("Get-NetAdapter")?;
+        .output()?;
     if !out.status.success() {
         anyhow::bail!(
             "Get-NetAdapter a échoué: {}",
@@ -238,9 +241,9 @@ fn get_all_adapters() -> Result<Vec<PsAdapter>> {
     }
     let stdout = String::from_utf8_lossy(&out.stdout);
     let adapters: Vec<PsAdapter> = if stdout.trim_start().starts_with('[') {
-        serde_json::from_str(stdout.trim()).context("parse JSON adapters")?
+        serde_json::from_str(stdout.trim()).context("parse JSON adapters")? 
     } else {
-        let single: PsAdapter =
+        let single: PsAdapter = 
             serde_json::from_str(stdout.trim()).context("parse JSON adapter")?;
         vec![single]
     };
@@ -249,16 +252,16 @@ fn get_all_adapters() -> Result<Vec<PsAdapter>> {
 
 fn read_current_dns(alias: &str, family: &str) -> Result<(bool, Vec<String>)> {
     let ps = format!(
-        r#"$x = Get-DnsClientServerAddress -InterfaceAlias \"{}\" -AddressFamily {}
-if ($x -eq $null -or $x.ServerAddresses -eq $null -or $x.ServerAddresses.Count -eq 0) {{\"DHCP\";\"\"}} else {{\"STATIC\"; [string]::Join(\",\", $x.ServerAddresses)}}"#,
-        alias, family
+        "$x = Get-DnsClientServerAddress -InterfaceAlias \"{alias}\" -AddressFamily {family}
+if ($x -eq $null -or $x.ServerAddresses -eq $null -or $x.ServerAddresses.Count -eq 0) {{\"DHCP\";\"\"}} else {{\"STATIC\"; [string]::Join(\",\", $x.ServerAddresses)}}",
+        alias = alias,
+        family = family,
     );
     let out = Command::new("powershell")
         .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &ps])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .output()
-        .context("Get-DnsClientServerAddress")?;
+        .output()?;
     if !out.status.success() {
         anyhow::bail!(
             "Get-DnsClientServerAddress a échoué: {}",
@@ -289,30 +292,33 @@ fn set_dns_with_powershell(alias: &str, family: &str, servers: &[String]) -> Res
         .collect::<Vec<_>>()
         .join(",");
     let cmd = format!(
-        r#"Set-DnsClientServerAddress -InterfaceAlias \"{}\" -AddressFamily {} -ServerAddresses {}"#,
-        alias, family, joined
+        "Set-DnsClientServerAddress -InterfaceAlias \"{alias}\" -AddressFamily {family} -ServerAddresses {joined}",
+        alias = alias,
+        family = family,
+        joined = joined,
     );
-    debug!("Apply DNS [{}] {} => {}", alias, family, joined);
+    debug!("Apply DNS [{} {} => {}]", alias, family, joined);
     let status = Command::new("powershell")
         .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &cmd])
         .status()?;
     if !status.success() {
-        anyhow::bail!("Set-DnsClientServerAddress({family}) a échoué");
+        anyhow::bail!("Set-DnsClientServerAddress({}) a échoué", family);
     }
     Ok(())
 }
 
 fn reset_dns_to_dhcp(alias: &str, family: &str) -> Result<()> {
     let cmd = format!(
-        r#"Set-DnsClientServerAddress -InterfaceAlias \"{}\" -AddressFamily {} -ResetServerAddresses"#,
-        alias, family
+        "Set-DnsClientServerAddress -InterfaceAlias \"{alias}\" -AddressFamily {family} -ResetServerAddresses",
+        alias = alias,
+        family = family,
     );
-    debug!("Reset DNS [{}] {} to DHCP", alias, family);
+    debug!("Reset DNS [{} {} to DHCP]", alias, family);
     let status = Command::new("powershell")
         .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &cmd])
         .status()?;
     if !status.success() {
-        anyhow::bail!("ResetServerAddresses({family}) a échoué");
+        anyhow::bail!("ResetServerAddresses({}) a échoué", family);
     }
     Ok(())
 }
@@ -331,7 +337,7 @@ fn snapshot_and_apply_all(mut cfg: DnsConfig) -> Result<DnsConfig> {
         let alias = ad.name;
         let status = ad.status.unwrap_or_default();
         debug!(
-            "Processing adapter [{}] MAC={} Status={}",
+            "Processing adapter [{} MAC={} Status={}]",
             alias, mac, status
         );
         let (is_dhcp_v4, servers_v4) = read_current_dns(&alias, "IPv4").unwrap_or((true, vec![]));
@@ -383,7 +389,7 @@ fn restore_all() -> Result<()> {
                 .get(&mac)
                 .cloned()
                 .unwrap_or_else(|| entry.alias.clone());
-            info!("Restoring adapter [{}] MAC={}", alias, mac);
+            info!("Restoring adapter [{} MAC={}]", alias, mac);
             if entry.is_dhcp_v4 {
                 let _ = reset_dns_to_dhcp(&alias, "IPv4");
             } else if !entry.servers_v4.is_empty() {
@@ -412,49 +418,71 @@ struct SharedState {
 }
 
 #[derive(Clone)]
-struct HomeDnsSvc {
+struct MyDnsService {
     state: SharedState,
 }
-impl HomeDnsSvc {
-    fn stop_service(&self) -> Ack {
-        info!("RPC StopService requested");
+
+#[tonic::async_trait]
+impl HomeDns for MyDnsService {
+    async fn stop_service(
+        &self,
+        _request: tonic::Request<Empty>,
+    ) -> Result<tonic::Response<Ack>, tonic::Status> {
+        info!("gRPC StopService requested");
         self.state.stopping.store(true, Ordering::SeqCst);
-        Ack {
+        Ok(tonic::Response::new(Ack {
             ok: true,
             message: "stopping".into(),
+        }))
+    }
+
+    async fn reload_config(
+        &self,
+        _request: tonic::Request<Empty>,
+    ) -> Result<tonic::Response<Ack>, tonic::Status> {
+        info!("gRPC ReloadConfig requested");
+        match load_config_or_init() {
+            Ok(new_cfg) => {
+                *self.state.cfg.lock() = new_cfg;
+                Ok(tonic::Response::new(Ack {
+                    ok: true,
+                    message: "reloaded".into(),
+                }))
+            }
+            Err(e) => {
+                error!("reload_config failed: {:#}", e);
+                Err(tonic::Status::internal(e.to_string()))
+            }
         }
     }
 
-    fn reload_config(&self) -> Result<Ack> {
-        info!("RPC ReloadConfig requested");
-        let new_cfg = load_config_or_init()?;
-        *self.state.cfg.lock() = new_cfg;
-        Ok(Ack {
-            ok: true,
-            message: "reloaded".into(),
-        })
-    }
-
-    fn get_status(&self) -> StatusResponse {
+    async fn get_status(
+        &self,
+        _request: tonic::Request<Empty>,
+    ) -> Result<tonic::Response<StatusResponse>, tonic::Status> {
         let level = level_from_cfg(&self.state.cfg.lock());
         let state = if self.state.stopping.load(Ordering::SeqCst) {
             "Stopping"
         } else {
             "Running"
         };
-        StatusResponse {
+        Ok(tonic::Response::new(StatusResponse {
             state: state.into(),
             log_level: format!("{:?}", level).to_lowercase(),
-        }
+        }))
     }
 
-    fn add_record(&self, r: AddRecordRequest) -> Result<Ack> {
+    async fn add_record(
+        &self,
+        request: tonic::Request<AddRecordRequest>,
+    ) -> Result<tonic::Response<Ack>, tonic::Status> {
+        let r = request.into_inner();
         if r.name.trim().is_empty() {
-            anyhow::bail!("name required");
+            return Err(tonic::Status::invalid_argument("name required"));
         }
         let t = r.rrtype.to_ascii_uppercase();
         if t != "A" && t != "AAAA" {
-            anyhow::bail!("type must be A or AAAA");
+            return Err(tonic::Status::invalid_argument("type must be A or AAAA"));
         }
         let mut cfg = self.state.cfg.lock();
         let entry = cfg.records.entry(r.name.clone()).or_default();
@@ -474,17 +502,23 @@ impl HomeDnsSvc {
         if r.ttl != 0 {
             entry.ttl = Some(r.ttl);
         }
-        save_config(&cfg)?;
+        if let Err(e) = save_config(&cfg) {
+            return Err(tonic::Status::internal(e.to_string()));
+        }
         info!("Record added: {} {} {}", r.name, t, r.value);
-        Ok(Ack {
+        Ok(tonic::Response::new(Ack {
             ok: true,
             message: "added".into(),
-        })
+        }))
     }
 
-    fn remove_record(&self, r: RemoveRecordRequest) -> Result<Ack> {
+    async fn remove_record(
+        &self,
+        request: tonic::Request<RemoveRecordRequest>,
+    ) -> Result<tonic::Response<Ack>, tonic::Status> {
+        let r = request.into_inner();
         if r.name.trim().is_empty() {
-            anyhow::bail!("name required");
+            return Err(tonic::Status::invalid_argument("name required"));
         }
         let mut cfg = self.state.cfg.lock();
         let mut should_remove_key = false;
@@ -505,29 +539,36 @@ impl HomeDnsSvc {
                     entry.aaaa.retain(|v| v != &r.value);
                 }
             } else {
-                anyhow::bail!("type must be A, AAAA or empty");
+                return Err(tonic::Status::invalid_argument(
+                    "type must be A, AAAA or empty",
+                ));
             }
             if !should_remove_key && entry.a.is_empty() && entry.aaaa.is_empty() {
                 should_remove_key = true;
             }
         } else {
-            return Ok(Ack {
+            return Ok(tonic::Response::new(Ack {
                 ok: true,
                 message: "not found".into(),
-            });
+            }));
         }
         if should_remove_key {
             cfg.records.remove(&r.name);
         }
-        save_config(&cfg)?;
+        if let Err(e) = save_config(&cfg) {
+            return Err(tonic::Status::internal(e.to_string()));
+        }
         info!("Record removed: {} {} {}", r.name, r.rrtype, r.value);
-        Ok(Ack {
+        Ok(tonic::Response::new(Ack {
             ok: true,
             message: "removed".into(),
-        })
+        }))
     }
 
-    fn list_records(&self) -> ListRecordsResponse {
+    async fn list_records(
+        &self,
+        _request: tonic::Request<Empty>,
+    ) -> Result<tonic::Response<ListRecordsResponse>, tonic::Status> {
         let cfg = self.state.cfg.lock().clone();
         let mut out = Vec::new();
         for (name, ent) in cfg.records {
@@ -538,84 +579,7 @@ impl HomeDnsSvc {
                 ttl: ent.ttl.unwrap_or(0),
             });
         }
-        ListRecordsResponse { records: out }
-    }
-}
-
-struct HomeDnsRpcHandler {
-    svc: HomeDnsSvc,
-}
-
-impl RpcHandler for HomeDnsRpcHandler {
-    fn handle(&self, proc_num: u32, request: &[u8]) -> Result<Vec<u8>, RpcError> {
-        match proc_num {
-            PROC_STOP_SERVICE => {
-                let ack = self.svc.stop_service();
-                Ok(ack.encode_to_vec())
-            }
-            PROC_RELOAD_CONFIG => {
-                let ack = match self.svc.reload_config() {
-                    Ok(ack) => ack,
-                    Err(err) => {
-                        error!("reload_config failed: {err:#}");
-                        Ack {
-                            ok: false,
-                            message: err.to_string(),
-                        }
-                    }
-                };
-                Ok(ack.encode_to_vec())
-            }
-            PROC_GET_STATUS => {
-                let status = self.svc.get_status();
-                Ok(status.encode_to_vec())
-            }
-            PROC_ADD_RECORD => {
-                let req = match AddRecordRequest::decode(request) {
-                    Ok(r) => r,
-                    Err(err) => {
-                        error!("decode AddRecordRequest failed: {err}");
-                        return Err(RpcError::new(RPC_S_CALL_FAILED, "decode add_record"));
-                    }
-                };
-                let ack = match self.svc.add_record(req) {
-                    Ok(ack) => ack,
-                    Err(err) => {
-                        error!("add_record failed: {err:#}");
-                        Ack {
-                            ok: false,
-                            message: err.to_string(),
-                        }
-                    }
-                };
-                Ok(ack.encode_to_vec())
-            }
-            PROC_REMOVE_RECORD => {
-                let req = match RemoveRecordRequest::decode(request) {
-                    Ok(r) => r,
-                    Err(err) => {
-                        error!("decode RemoveRecordRequest failed: {err}");
-                        return Err(RpcError::new(RPC_S_CALL_FAILED, "decode remove_record"));
-                    }
-                };
-                let ack = match self.svc.remove_record(req) {
-                    Ok(ack) => ack,
-                    Err(err) => {
-                        error!("remove_record failed: {err:#}");
-                        Ack {
-                            ok: false,
-                            message: err.to_string(),
-                        }
-                    }
-                };
-                Ok(ack.encode_to_vec())
-            }
-            PROC_LIST_RECORDS => {
-                let list = self.svc.list_records();
-                Ok(list.encode_to_vec())
-            }
-            _ => Err(RpcError::new(RPC_S_CALL_FAILED, "unknown procedure")),
-        }
+        Ok(tonic::Response::new(ListRecordsResponse { records: out }))
     }
 }
 
@@ -623,8 +587,6 @@ define_windows_service!(ffi_service_main, service_main);
 static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 fn service_main(_args: Vec<OsString>) {
-    // Le logger est initialisé dans run_service() selon la config.
-    // L'initialiser ici provoquait une double initialisation et un échec au démarrage du service.
     if let Err(e) = run_service() {
         eprintln!("[home-dns] FATAL: {e:?}");
         let _ = restore_all();
@@ -632,7 +594,6 @@ fn service_main(_args: Vec<OsString>) {
 }
 
 fn run_service() -> Result<()> {
-    // Register with the SCM and report StartPending immediately.
     let status_handle = service_control_handler::register(SERVICE_NAME, |event| match event {
         ServiceControl::Stop | ServiceControl::Shutdown => {
             STOP_REQUESTED.store(true, Ordering::SeqCst);
@@ -654,144 +615,122 @@ fn run_service() -> Result<()> {
         let _ = status_handle.set_service_status(status);
     };
 
-    // Move to Running state as early as possible; remaining init is background.
     set_status(ServiceState::StartPending);
-    let t0 = std::time::Instant::now();
-    set_status(ServiceState::Running);
-    info!("Service running (early), proceeding with background init...");
 
-    // Background init: config, logger, RPC server
-    let shared = SharedState {
-        cfg: Arc::new(Mutex::new(DnsConfig {
-            servers_v4: vec![],
-            servers_v6: vec![],
-            backups: HashMap::new(),
-            log_level: Some(default_level_str().into()),
-            records: HashMap::new(),
-        })),
-        stopping: Arc::new(AtomicBool::new(false)),
-    };
-    let shared_clone_for_rpc = shared.clone();
-    let shared_clone_for_cfg = shared.clone();
-
-    // Init logger + config in a thread to avoid blocking SCM
-    std::thread::spawn(move || {
-        let cfg = match load_config_or_init() {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("[home-dns] config load failed (using defaults): {e:#}");
-                DnsConfig {
-                    servers_v4: vec![],
-                    servers_v6: vec![],
-                    backups: HashMap::new(),
-                    log_level: Some(default_level_str().into()),
-                    records: HashMap::new(),
-                }
-            }
-        };
+    let rt = Runtime::new()?;
+    rt.block_on(async {
+        let cfg = load_config_or_init()?;
         let level = level_from_cfg(&cfg);
-        let _ = init_logger(level);
+        init_logger(level)?;
         info!("Service starting (level={:?})", level);
         info!(
             "build tag={} sha={} at {}",
             BUILD_GIT_TAG, BUILD_GIT_SHA, BUILD_TIME
         );
-        *shared_clone_for_cfg.cfg.lock() = cfg;
-    });
 
-    // Start RPC server (non-blocking)
-    let rpc_handler: Arc<dyn RpcHandler> = Arc::new(HomeDnsRpcHandler {
-        svc: HomeDnsSvc {
-            state: shared_clone_for_rpc,
-        },
-    });
-    let _rpc_server = RpcServer::start(
-        RPC_INTERFACE_UUID,
-        RPC_INTERFACE_VERSION,
-        RPC_ENDPOINT,
-        RPC_PROC_COUNT,
-        rpc_handler,
-    )
-    .map_err(|e| anyhow::anyhow!("start RPC server: {e}"))?;
-    info!("Windows RPC IPC listening on endpoint {}", RPC_ENDPOINT);
-    info!("Background init scheduled (elapsed {:?})", t0.elapsed());
+        let shared = SharedState {
+            cfg: Arc::new(Mutex::new(cfg)),
+            stopping: Arc::new(AtomicBool::new(false)),
+        };
 
-    // Heavy tasks in background: restore then snapshot/apply
-    let shared_bg = shared.clone();
-    thread::spawn(move || {
-        let t_restore = std::time::Instant::now();
-        info!("restoring previous DNS state if any...");
-        let _ = restore_all();
-        info!("restore_all done in {:?}", t_restore.elapsed());
-        info!("snapshot_and_apply_all starting...");
-        let cfg0 = shared_bg.cfg.lock().clone();
-        match snapshot_and_apply_all(cfg0) {
-            Ok(new_cfg) => {
-                *shared_bg.cfg.lock() = new_cfg;
-                info!("snapshot_and_apply_all finished");
+        // Start gRPC server
+        let grpc_service = MyDnsService {
+            state: shared.clone(),
+        };
+        let grpc_server = Server::builder().add_service(HomeDnsServer::new(grpc_service));
+        tokio::spawn(async move {
+            info!("gRPC server listening on {}", NAMED_PIPE_NAME);
+            let stream = match named_pipe_stream() {
+                Ok(stream) => stream,
+                Err(e) => {
+                    error!("failed to prepare named pipe listener: {}", e);
+                    return;
+                }
+            };
+            if let Err(e) = grpc_server.serve_with_incoming(stream).await {
+                error!("gRPC server error: {}", e);
             }
-            Err(e) => {
-                error!("snapshot/apply failed: {e:?}");
+        });
+
+        // Heavy tasks in background
+        let shared_bg = shared.clone();
+        tokio::spawn(async move {
+            info!("restoring previous DNS state if any...");
+            let _ = restore_all();
+            info!("snapshot_and_apply_all starting...");
+            let cfg0 = shared_bg.cfg.lock().clone();
+            match snapshot_and_apply_all(cfg0) {
+                Ok(new_cfg) => {
+                    *shared_bg.cfg.lock() = new_cfg;
+                    info!("snapshot_and_apply_all finished");
+                }
+                Err(e) => {
+                    error!("snapshot/apply failed: {e:?}");
+                }
             }
+        });
+
+        set_status(ServiceState::Running);
+        info!("Service running");
+
+        while !STOP_REQUESTED.load(Ordering::SeqCst) && !shared.stopping.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(500)).await;
         }
-    });
 
-    // Wait for stop
-    while !STOP_REQUESTED.load(Ordering::SeqCst) && !shared.stopping.load(Ordering::SeqCst) {
-        thread::sleep(Duration::from_millis(500));
-    }
-
-    info!("Service stopping");
-    let _ = restore_all();
-    set_status(ServiceState::Stopped);
-    info!("Service stopped");
-    Ok(())
+        info!("Service stopping");
+        let _ = restore_all();
+        set_status(ServiceState::Stopped);
+        info!("Service stopped");
+        Ok(())
+    })
 }
 
 #[allow(dead_code)]
 fn run_console() -> Result<()> {
-    let cfg = load_config_or_init()?;
-    let level = level_from_cfg(&cfg);
-    init_logger(level)?;
-    info!("Console mode starting (level={:?})", level);
-    let _ = restore_all();
-    let cfg = match snapshot_and_apply_all(cfg) {
-        Ok(c) => c,
-        Err(e) => {
-            warn!("snapshot/apply failed in console mode: {e:?} — continuing without applying");
-            // Charge config sans l'appliquer pour que le RPC démarre quand même
-            load_config_or_init()?
+    let rt = Runtime::new()?;
+    rt.block_on(async {
+        let cfg = load_config_or_init()?;
+        let level = level_from_cfg(&cfg);
+        init_logger(level)?;
+        info!("Console mode starting (level={:?})", level);
+        let _ = restore_all();
+        let cfg = match snapshot_and_apply_all(cfg) {
+            Ok(c) => c,
+            Err(e) => {
+                warn!("snapshot/apply failed: {e:?}; continuing without applying");
+                load_config_or_init()?
+            }
+        };
+        let shared = SharedState {
+            cfg: Arc::new(Mutex::new(cfg)),
+            stopping: Arc::new(AtomicBool::new(false)),
+        };
+
+        // gRPC server
+        let grpc_service = MyDnsService {
+            state: shared.clone(),
+        };
+        let grpc_server = Server::builder().add_service(HomeDnsServer::new(grpc_service));
+        tokio::spawn(async move {
+            info!("gRPC server listening on {}", NAMED_PIPE_NAME);
+            let stream = match named_pipe_stream() {
+                Ok(stream) => stream,
+                Err(e) => {
+                    error!("failed to prepare named pipe listener: {}", e);
+                    return;
+                }
+            };
+            if let Err(e) = grpc_server.serve_with_incoming(stream).await {
+                error!("gRPC server error: {}", e);
+            }
+        });
+
+        info!("Console mode running. Press Ctrl+C to stop.");
+        while !shared.stopping.load(std::sync::atomic::Ordering::SeqCst) {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
-    };
-    let shared = SharedState {
-        cfg: Arc::new(Mutex::new(cfg)),
-        stopping: Arc::new(AtomicBool::new(false)),
-    };
-    let shared_clone = shared.clone();
-    let rpc_handler: Arc<dyn RpcHandler> = Arc::new(HomeDnsRpcHandler {
-        svc: HomeDnsSvc {
-            state: shared_clone,
-        },
-    });
-    let _rpc_server = RpcServer::start(
-        RPC_INTERFACE_UUID,
-        RPC_INTERFACE_VERSION,
-        RPC_ENDPOINT,
-        RPC_PROC_COUNT,
-        rpc_handler,
-    )
-    .map_err(|e| anyhow::anyhow!("start RPC server: {e}"))?;
-    info!(
-        "[console] Windows RPC IPC listening on endpoint {}",
-        RPC_ENDPOINT
-    );
-    info!("Console mode running. Press Ctrl+C to stop.");
-    loop {
-        std::thread::sleep(std::time::Duration::from_millis(500));
-        if shared.stopping.load(std::sync::atomic::Ordering::SeqCst) {
-            break;
-        }
-    }
+        Ok::<(), anyhow::Error>(())
+    })?;
     Ok(())
 }
 
@@ -800,14 +739,13 @@ fn install_service() -> Result<()> {
     if let Err(e) = init_logger(level_from_cfg(&cfg)) {
         eprintln!("[install] logger init failed (continuing): {e}");
     }
-    // Try to open if already installed to keep install idempotent.
     let manager = ServiceManager::local_computer(
         None::<&str>,
         ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE,
     )?;
     if let Ok(_svc) = manager.open_service(SERVICE_NAME, ServiceAccess::QUERY_STATUS) {
         info!("Service already installed");
-        return Ok(());
+        return Ok(())
     }
     let exe_path = std::env::current_exe()?;
     let service_info = ServiceInfo {
@@ -848,7 +786,7 @@ fn uninstall_service() -> Result<()> {
                 break;
             }
         }
-        std::thread::sleep(Duration::from_millis(250));
+        thread::sleep(Duration::from_millis(250));
     }
     service.delete()?;
     drop(service);
@@ -856,7 +794,7 @@ fn uninstall_service() -> Result<()> {
         match manager.open_service(SERVICE_NAME, ServiceAccess::QUERY_STATUS) {
             Ok(s) => {
                 drop(s);
-                std::thread::sleep(Duration::from_millis(250));
+                thread::sleep(Duration::from_millis(250));
             }
             Err(_) => break,
         }
@@ -868,8 +806,9 @@ fn uninstall_service() -> Result<()> {
 fn configure_recovery_action_run_restore(exe: &Path) -> Result<()> {
     let exe_str = exe.display().to_string();
     let cmd = format!(
-        r#"sc.exe failure \"{}\" actions=run/0 reset=0 command=\"\"{}\" restore\""#,
-        SERVICE_NAME, exe_str
+        r#"sc.exe failure "{service}" actions=run/0 reset=0 command=""{exe}" restore""#,
+        service = SERVICE_NAME,
+        exe = exe_str,
     );
     debug!("Configuring SCM recovery: {}", cmd);
     let status = Command::new("cmd").args(["/C", &cmd]).status()?;
@@ -894,7 +833,7 @@ fn main() -> Result<()> {
             println!("Service désinstallé.");
         }
         "run" => {
-            if let Err(e) =
+            if let Err(e) = 
                 windows_service::service_dispatcher::start(SERVICE_NAME, ffi_service_main)
             {
                 error!("Erreur démarrage service: {e:?}");
@@ -921,4 +860,87 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[pin_project]
+struct PipeConnection {
+    #[pin]
+    inner: NamedPipeServer,
+}
+
+impl PipeConnection {
+    fn new(inner: NamedPipeServer) -> Self {
+        Self { inner }
+    }
+}
+
+unsafe impl Send for PipeConnection {}
+
+impl Connected for PipeConnection {
+    type ConnectInfo = ();
+
+    fn connect_info(&self) -> Self::ConnectInfo {}
+}
+
+impl AsyncRead for PipeConnection {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        self.project().inner.poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for PipeConnection {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        data: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        self.project().inner.poll_write(cx, data)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        self.project().inner.poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        self.project().inner.poll_shutdown(cx)
+    }
+}
+
+fn named_pipe_stream(
+) -> io::Result<UnboundedReceiverStream<Result<PipeConnection, io::Error>>> {
+    let mut server = ServerOptions::new()
+        .first_pipe_instance(true)
+        .create(NAMED_PIPE_NAME)?;
+    let (tx, rx) = mpsc::unbounded_channel();
+
+    tokio::spawn(async move {
+        loop {
+            match server.connect().await {
+                Ok(()) => {
+                    let new_server = match ServerOptions::new().create(NAMED_PIPE_NAME) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            let _ = tx.send(Err(e));
+                            break;
+                        }
+                    };
+                    let old_server = std::mem::replace(&mut server, new_server);
+                    if tx.send(Ok(PipeConnection::new(old_server))).is_err() {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    if tx.send(Err(e)).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    Ok(UnboundedReceiverStream::new(rx))
 }

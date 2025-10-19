@@ -5,19 +5,18 @@ edition = "2024"
 
 [build-dependencies]
 protoc-bin-vendored = "3"
+tonic-build = { version = "0.11", features = ["prost"] }
 prost-build = "0.12"
-tonic-build = "0.14"
-tonic-prost-build = "0.14"
 chrono = "0.4"
 
 [dependencies]
-windows-sys = { version = "0.61", features = ["Win32_System_Rpc"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation"] }
 anyhow = "1"
 bytes = "1"
 http = "1"
 hyper = { version = "1.7", features = ["server", "http1", "http2", "client"] }
 hyper-util = { version = "0.1", features = ["server", "server-auto", "http1", "http2", "client-legacy"] }
-http-body-util = "0.1"          # ← AJOUT
+http-body-util = "0.1"
 log = "0.4"
 flexi_logger = "0.31"
 parking_lot = "0.12"
@@ -25,10 +24,15 @@ serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 prost = "0.12"
 chrono = "0.4"
-tokio = { workspace = true, features = ["full"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net"] }
 windows-service = { workspace = true }
 sysinfo = "0.37"
-local-rpc = { path = "../local-rpc" }
+tonic = { version = "0.11", features = ["transport"] }
+tower-http = { version = "0.5.0", features = ["cors"] }
+tokio-stream = "0.1.15"
+futures-util = "0.3.30"
+pin-project = "1.1.5"
+
 
 
  

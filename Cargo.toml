@@ -3,7 +3,6 @@ members = [
   "home-dns",
   "home-http",
   "home-lab/src-tauri",
-  "local-rpc",
   "pipe-test",
   "service-tester"
 ]

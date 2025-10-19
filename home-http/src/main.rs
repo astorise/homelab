@@ -1,11 +1,14 @@
 #![cfg_attr(not(windows), allow(dead_code))]
-#![cfg_attr(all(not(debug_assertions), target_os = "windows"), windows_subsystem = "windows")]
+#![cfg_attr(
+    all(not(debug_assertions), target_os = "windows"),
+    windows_subsystem = "windows"
+)]
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
 use flexi_logger::{Age, Cleanup, Criterion, Duplicate, FileSpec, Logger, Naming};
 use http::Uri;
-use http_body_util::{BodyExt, Full, combinators::BoxBody};
+use http_body_util::{combinators::BoxBody, BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::{Request, Response};
 use hyper_util::{
@@ -13,30 +16,32 @@ use hyper_util::{
     rt::{TokioExecutor, TokioIo},
     server::conn::auto::Builder as ServerBuilder,
 };
-use local_rpc::{Error as RpcError, Handler as RpcHandler, Server as RpcServer};
-use log::{LevelFilter, error, info, warn};
+use log::{error, info, warn, LevelFilter};
 use parking_lot::Mutex;
-use prost::Message;
+use pin_project::pin_project;
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
+use std::io;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::pin::Pin;
+use std::task::{Context as TaskContext, Poll};
 use std::{
     collections::HashMap,
-    net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
     sync::{
-        Arc,
         atomic::{AtomicBool, Ordering},
+        Arc,
     },
     thread,
     time::Duration,
 };
-use windows_sys::Win32::System::Rpc::RPC_S_CALL_FAILED;
-use windows_sys::core::GUID;
-
-use tokio::{
-    net::{TcpListener, TcpStream},
-    runtime::Runtime,
-};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::runtime::Runtime;
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::UnboundedReceiverStream;
+use tonic::transport::{server::Connected, Server};
 use windows_service::service::*;
 use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
 use windows_service::{define_windows_service, service_manager::*};
@@ -45,34 +50,34 @@ use windows_service::{define_windows_service, service_manager::*};
 const BUILD_GIT_SHA: &str = env!("BUILD_GIT_SHA");
 const BUILD_GIT_TAG: &str = env!("BUILD_GIT_TAG");
 const BUILD_TIME: &str = env!("BUILD_TIME");
-mod homehttp {
+
+// gRPC service
+mod proto {
     pub mod homehttp {
         pub mod v1 {
-            include!(concat!(env!("OUT_DIR"), "/homehttp.v1.rs"));
+            tonic::include_proto!("homehttp.v1");
         }
     }
 }
-use homehttp::homehttp::v1::*;
+
+use proto::homehttp::v1::home_http_server::{HomeHttp, HomeHttpServer};
+use proto::homehttp::v1::{
+    list_routes_response, Acknowledge, AddRouteRequest, Empty, ListRoutesResponse,
+    RemoveRouteRequest, StatusResponse,
+};
 
 // Harmonized naming with DNS service
 const SERVICE_NAME: &str = "HomeHttpService";
 const SERVICE_DISPLAY_NAME: &str = "Home HTTP Service";
-const SERVICE_DESCRIPTION: &str =
+const SERVICE_DESCRIPTION:
+    &str =
     r"HTTP + TLS SNI pass-through to WSL with Windows RPC IPC on ncalrpc endpoint home-http";
 #[cfg(debug_assertions)]
-const RPC_ENDPOINT: &str = "home-http-dev";
+const NAMED_PIPE_NAME: &str = r"\\.\pipe\home-http-dev";
 #[cfg(not(debug_assertions))]
-const RPC_ENDPOINT: &str = "home-http";
-const RPC_INTERFACE_UUID: GUID = GUID::from_u128(0x9df99e13af1c480cb5e64864350b5f3e);
-const RPC_INTERFACE_VERSION: (u16, u16) = (1, 0);
-const RPC_PROC_COUNT: u32 = 6;
-const PROC_STOP_SERVICE: u32 = 0;
-const PROC_RELOAD_CONFIG: u32 = 1;
-const PROC_GET_STATUS: u32 = 2;
-const PROC_ADD_ROUTE: u32 = 3;
-const PROC_REMOVE_ROUTE: u32 = 4;
-const PROC_LIST_ROUTES: u32 = 5;
+const NAMED_PIPE_NAME: &str = r"\\.\pipe\home-http";
 
+#[allow(dead_code)]
 fn default_level_filter() -> LevelFilter {
     if cfg!(debug_assertions) {
         LevelFilter::Debug
@@ -230,76 +235,108 @@ fn wsl_ip(cfg: &HttpConfig, cache: &Arc<Mutex<(u64, Option<String>)>>) -> String
     }
 }
 
-// ---- RPC service helpers ----
+// ---- gRPC service ----
 #[derive(Clone)]
 struct Shared {
     cfg: Arc<Mutex<HttpConfig>>,
     cache: Arc<Mutex<(u64, Option<String>)>>,
     stopping: Arc<AtomicBool>,
 }
-struct HomeHttpSvc {
+
+struct MyHttpService {
     shared: Shared,
 }
 
-struct HomeHttpRpcHandler {
-    svc: HomeHttpSvc,
-}
-
-impl HomeHttpSvc {
-    fn stop_service(&self) -> Acknowledge {
+#[tonic::async_trait]
+impl HomeHttp for MyHttpService {
+    async fn stop_service(
+        &self,
+        _request: tonic::Request<Empty>,
+    ) -> Result<tonic::Response<Acknowledge>, tonic::Status> {
         self.shared.stopping.store(true, Ordering::SeqCst);
-        Acknowledge {
+        Ok(tonic::Response::new(Acknowledge {
             ok: true,
             message: "stopping".into(),
+        }))
+    }
+
+    async fn reload_config(
+        &self,
+        _request: tonic::Request<Empty>,
+    ) -> Result<tonic::Response<Acknowledge>, tonic::Status> {
+        match load_config_or_init() {
+            Ok(new_cfg) => {
+                *self.shared.cfg.lock() = new_cfg;
+                Ok(tonic::Response::new(Acknowledge {
+                    ok: true,
+                    message: "reloaded".into(),
+                }))
+            }
+            Err(e) => {
+                error!("reload_config failed: {e:#}");
+                Err(tonic::Status::internal(e.to_string()))
+            }
         }
     }
 
-    fn reload_config(&self) -> Result<Acknowledge> {
-        let new_cfg = load_config_or_init()?;
-        *self.shared.cfg.lock() = new_cfg;
-        Ok(Acknowledge {
-            ok: true,
-            message: "reloaded".into(),
-        })
-    }
-
-    fn get_status(&self) -> StatusResponse {
+    async fn get_status(
+        &self,
+        _request: tonic::Request<Empty>,
+    ) -> Result<tonic::Response<StatusResponse>, tonic::Status> {
         let cfg = self.shared.cfg.lock().clone();
-        StatusResponse {
+        let res = StatusResponse {
             state: if self.shared.stopping.load(Ordering::SeqCst) {
                 "stopping".into()
             } else {
                 "running".into()
             },
             log_level: cfg.log_level.unwrap_or_else(|| "info".into()),
-        }
+        };
+        Ok(tonic::Response::new(res))
     }
 
-    fn add_route(&self, req: AddRouteRequest) -> Result<Acknowledge> {
-        let port =
-            u16::try_from(req.port).map_err(|_| anyhow::anyhow!("port out of range for u16"))?;
+    async fn add_route(
+        &self,
+        request: tonic::Request<AddRouteRequest>,
+    ) -> Result<tonic::Response<Acknowledge>, tonic::Status> {
+        let req = request.into_inner();
+        let port = u16::try_from(req.port)
+            .map_err(|_| tonic::Status::invalid_argument("port out of range for u16"))?;
         let mut cfg = self.shared.cfg.lock().clone();
         cfg.routes.insert(req.host.to_lowercase(), port);
-        save_config(&cfg)?;
+        if let Err(e) = save_config(&cfg) {
+            error!("add_route failed to save config: {e:#}");
+            return Err(tonic::Status::internal(e.to_string()));
+        }
         *self.shared.cfg.lock() = cfg;
-        Ok(Acknowledge {
+        Ok(tonic::Response::new(Acknowledge {
             ok: true,
             message: "added".into(),
-        })
+        }))
     }
 
-    fn remove_route(&self, req: RemoveRouteRequest) -> Result<Acknowledge> {
+    async fn remove_route(
+        &self,
+        request: tonic::Request<RemoveRouteRequest>,
+    ) -> Result<tonic::Response<Acknowledge>, tonic::Status> {
+        let req = request.into_inner();
         let mut cfg = self.shared.cfg.lock().clone();
         cfg.routes.remove(&req.host.to_lowercase());
-        save_config(&cfg)?;
+        if let Err(e) = save_config(&cfg) {
+            error!("remove_route failed to save config: {e:#}");
+            return Err(tonic::Status::internal(e.to_string()));
+        }
         *self.shared.cfg.lock() = cfg;
-        Ok(Acknowledge {
+        Ok(tonic::Response::new(Acknowledge {
             ok: true,
             message: "removed".into(),
-        })
+        }))
     }
 
-    fn list_routes(&self) -> ListRoutesResponse {
+    async fn list_routes(
+        &self,
+        _request: tonic::Request<Empty>,
+    ) -> Result<tonic::Response<ListRoutesResponse>, tonic::Status> {
         let cfg = self.shared.cfg.lock().clone();
         let routes = cfg
             .routes
@@ -309,82 +346,10 @@ impl HomeHttpSvc {
                 port: p as u32,
             })
             .collect();
-        ListRoutesResponse { routes }
+        Ok(tonic::Response::new(ListRoutesResponse { routes }))
     }
 }
 
-impl RpcHandler for HomeHttpRpcHandler {
-    fn handle(&self, proc_num: u32, request: &[u8]) -> Result<Vec<u8>, RpcError> {
-        match proc_num {
-            PROC_STOP_SERVICE => {
-                let ack = self.svc.stop_service();
-                Ok(ack.encode_to_vec())
-            }
-            PROC_RELOAD_CONFIG => {
-                let ack = match self.svc.reload_config() {
-                    Ok(ack) => ack,
-                    Err(err) => {
-                        error!("reload_config failed: {err:#}");
-                        Acknowledge {
-                            ok: false,
-                            message: err.to_string(),
-                        }
-                    }
-                };
-                Ok(ack.encode_to_vec())
-            }
-            PROC_GET_STATUS => {
-                let status = self.svc.get_status();
-                Ok(status.encode_to_vec())
-            }
-            PROC_ADD_ROUTE => {
-                let req = match AddRouteRequest::decode(request) {
-                    Ok(r) => r,
-                    Err(err) => {
-                        error!("decode AddRouteRequest failed: {err}");
-                        return Err(RpcError::new(RPC_S_CALL_FAILED, "decode add_route"));
-                    }
-                };
-                let ack = match self.svc.add_route(req) {
-                    Ok(ack) => ack,
-                    Err(err) => {
-                        error!("add_route failed: {err:#}");
-                        Acknowledge {
-                            ok: false,
-                            message: err.to_string(),
-                        }
-                    }
-                };
-                Ok(ack.encode_to_vec())
-            }
-            PROC_REMOVE_ROUTE => {
-                let req = match RemoveRouteRequest::decode(request) {
-                    Ok(r) => r,
-                    Err(err) => {
-                        error!("decode RemoveRouteRequest failed: {err}");
-                        return Err(RpcError::new(RPC_S_CALL_FAILED, "decode remove_route"));
-                    }
-                };
-                let ack = match self.svc.remove_route(req) {
-                    Ok(ack) => ack,
-                    Err(err) => {
-                        error!("remove_route failed: {err:#}");
-                        Acknowledge {
-                            ok: false,
-                            message: err.to_string(),
-                        }
-                    }
-                };
-                Ok(ack.encode_to_vec())
-            }
-            PROC_LIST_ROUTES => {
-                let list = self.svc.list_routes();
-                Ok(list.encode_to_vec())
-            }
-            _ => Err(RpcError::new(RPC_S_CALL_FAILED, "unknown procedure")),
-        }
-    }
-}
 // ---- HTTP http (Hyper 1.x) ----
 #[derive(Clone)]
 struct HttpHttp {
@@ -439,7 +404,7 @@ impl HttpHttp {
         let port = self.shared.cfg.lock().routes.get(&host).copied();
         let Some(port) = port else {
             let body = Full::from(Bytes::from_static(b"bad gateway: no route"))
-                .map_err(|never| match never {}) // Infallible -> hyper::Error
+                .map_err(|never| match never {})
                 .boxed(); // -> BoxBody<Bytes, hyper::Error>
             return Ok(Response::builder().status(502).body(body).unwrap());
         };
@@ -464,7 +429,7 @@ impl HttpHttp {
                 // Convertit l'erreur client en 502 c't' http
                 let msg = format!("upstream error: {e}");
                 let body = Full::from(Bytes::from(msg))
-                    .map_err(|never| match never {}) // Infallible -> hyper::Error
+                    .map_err(|never| match never {})
                     .boxed();
                 return Ok(Response::builder().status(502).body(body).unwrap());
             }
@@ -652,25 +617,30 @@ fn run_service() -> Result<()> {
         cache: Arc::new(Mutex::new((0, None))),
         stopping: Arc::new(AtomicBool::new(false)),
     };
-    let rpc_handler: Arc<dyn RpcHandler> = Arc::new(HomeHttpRpcHandler {
-        svc: HomeHttpSvc {
-            shared: shared.clone(),
-        },
-    });
-    let _rpc_server = RpcServer::start(
-        RPC_INTERFACE_UUID,
-        RPC_INTERFACE_VERSION,
-        RPC_ENDPOINT,
-        RPC_PROC_COUNT,
-        rpc_handler,
-    )
-    .map_err(|e| anyhow::anyhow!("start RPC server: {e}"))?;
-    info!("Windows RPC IPC listening on endpoint {}", RPC_ENDPOINT);
 
     eprintln!("[home-http] creating tokio runtime");
     let rt = Runtime::new()?;
 
-    // Serveurs HTTP / HTTPS
+    // gRPC server over named pipe
+    let grpc_service = MyHttpService {
+        shared: shared.clone(),
+    };
+    let grpc_server = Server::builder().add_service(HomeHttpServer::new(grpc_service));
+    rt.spawn(async move {
+        info!("gRPC server listening on {}", NAMED_PIPE_NAME);
+        let stream = match named_pipe_stream() {
+            Ok(stream) => stream,
+            Err(e) => {
+                error!("failed to prepare named pipe listener: {}", e);
+                return;
+            }
+        };
+        if let Err(e) = grpc_server.serve_with_incoming(stream).await {
+            error!("gRPC server error: {}", e);
+        }
+    });
+
+    // HTTP/HTTPS servers
     let http_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), shared.cfg.lock().http);
     let https_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), shared.cfg.lock().https);
     let http = HttpHttp::new(shared.clone());
@@ -712,7 +682,7 @@ fn install_service() -> Result<()> {
     // Idempotent install: if service exists, do nothing.
     if let Ok(_svc) = manager.open_service(SERVICE_NAME, ServiceAccess::QUERY_STATUS) {
         info!("Service already installed");
-        return Ok(());
+        return Ok(())
     }
     let service_info = ServiceInfo {
         name: SERVICE_NAME.into(),
@@ -773,7 +743,7 @@ fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() <= 1 {
         usage();
-        return Ok(());
+        return Ok(())
     }
     match args[1].as_str() {
         "run" => {
@@ -784,10 +754,9 @@ fn main() -> Result<()> {
                 {
                     eprintln!("service dispatcher start error: {e:?}");
                 }
-                return Ok(());
+                return Ok(())
             }
-            #[cfg(not(windows))]
-            {
+            #[cfg(not(windows))] {
                 anyhow::bail!("Windows only");
             }
         }
@@ -806,57 +775,141 @@ fn main() -> Result<()> {
             let cfg = load_config_or_init()?;
             init_logger(level_from_cfg(&cfg))?;
             info!("Console mode starting");
-            let shared = Shared {
-                cfg: Arc::new(Mutex::new(cfg)),
-                cache: Arc::new(Mutex::new((0, None))),
-                stopping: Arc::new(AtomicBool::new(false)),
-            };
-            let rpc_handler: Arc<dyn RpcHandler> = Arc::new(HomeHttpRpcHandler {
-                svc: HomeHttpSvc {
-                    shared: shared.clone(),
-                },
-            });
-            let _rpc_server = RpcServer::start(
-                RPC_INTERFACE_UUID,
-                RPC_INTERFACE_VERSION,
-                RPC_ENDPOINT,
-                RPC_PROC_COUNT,
-                rpc_handler,
-            )
-            .map_err(|e| anyhow::anyhow!("start RPC server: {e}"))?;
             let rt = Runtime::new()?;
+            rt.block_on(async {
+                let shared = Shared {
+                    cfg: Arc::new(Mutex::new(cfg)),
+                    cache: Arc::new(Mutex::new((0, None))),
+                    stopping: Arc::new(AtomicBool::new(false)),
+                };
 
-            // Serveurs HTTP/HTTPS: on tente, mais on ne bloque pas si 'a 'choue (ex: ports 80/443 sans admin)
-            {
-                // En mode console (dev), on 'coute en loopback uniquement pour 'viter les popups pare-feu/UAC
+                // gRPC server
+                let grpc_service = MyHttpService {
+                    shared: shared.clone(),
+                };
+                let grpc_server = Server::builder().add_service(HomeHttpServer::new(grpc_service));
+                tokio::spawn(async move {
+                    info!("gRPC server listening on {}", NAMED_PIPE_NAME);
+                    let stream = match named_pipe_stream() {
+                        Ok(stream) => stream,
+                        Err(e) => {
+                            error!("failed to prepare named pipe listener: {}", e);
+                            return;
+                        }
+                    };
+                    if let Err(e) = grpc_server.serve_with_incoming(stream).await {
+                        error!("gRPC server error: {}", e);
+                    }
+                });
+
+                // HTTP/HTTPS servers
                 let http_addr =
                     SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), shared.cfg.lock().http);
                 let https_addr =
                     SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), shared.cfg.lock().https);
                 let http = HttpHttp::new(shared.clone());
                 let tls = TlsSnihttp::new(shared.clone());
-                rt.spawn(async move {
+                tokio::spawn(async move {
                     if let Err(e) = http.serve(http_addr).await {
                         error!("http server: {e:?}");
                     }
                 });
-                rt.spawn(async move {
+                tokio::spawn(async move {
                     if let Err(e) = tls.serve(https_addr).await {
                         error!("https server: {e:?}");
                     }
                 });
-            }
 
-            // Boucle de garde: laisse tourner jusqu'' fermeture du processus
-            info!("Console mode running. Press Ctrl+C to stop.");
-            loop {
-                thread::sleep(Duration::from_millis(500));
-                if shared.stopping.load(Ordering::SeqCst) {
-                    break;
+                info!("Console mode running. Press Ctrl+C to stop.");
+                while !shared.stopping.load(Ordering::SeqCst) {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
                 }
-            }
+            });
         }
         _ => usage(),
     }
     Ok(())
+}
+
+#[pin_project]
+struct PipeConnection {
+    #[pin]
+    inner: NamedPipeServer,
+}
+
+impl PipeConnection {
+    fn new(inner: NamedPipeServer) -> Self {
+        Self { inner }
+    }
+}
+
+unsafe impl Send for PipeConnection {}
+
+impl Connected for PipeConnection {
+    type ConnectInfo = ();
+
+    fn connect_info(&self) -> Self::ConnectInfo {}
+}
+
+impl AsyncRead for PipeConnection {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        self.project().inner.poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for PipeConnection {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        data: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        self.project().inner.poll_write(cx, data)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        self.project().inner.poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        self.project().inner.poll_shutdown(cx)
+    }
+}
+
+fn named_pipe_stream(
+) -> io::Result<UnboundedReceiverStream<Result<PipeConnection, io::Error>>> {
+    let mut server = ServerOptions::new()
+        .first_pipe_instance(true)
+        .create(NAMED_PIPE_NAME)?;
+    let (tx, rx) = mpsc::unbounded_channel();
+
+    tokio::spawn(async move {
+        loop {
+            match server.connect().await {
+                Ok(()) => {
+                    let new_server = match ServerOptions::new().create(NAMED_PIPE_NAME) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            let _ = tx.send(Err(e));
+                            break;
+                        }
+                    };
+                    let old_server = std::mem::replace(&mut server, new_server);
+                    if tx.send(Ok(PipeConnection::new(old_server))).is_err() {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    if tx.send(Err(e)).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    Ok(UnboundedReceiverStream::new(rx))
 }

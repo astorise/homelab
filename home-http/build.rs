@@ -25,10 +25,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::env::set_var("PROTOC", protoc);
     }
 
-    tonic_prost_build::configure()
-        .build_client(false)
-        .build_server(false)
-        .compile_protos(&["proto/home_http.proto"], &["proto"])?;
+    tonic_build::configure()
+        .build_server(true)
+        .compile(&["proto/home_http.proto"], &["proto"])?;
 
     println!("cargo:rerun-if-changed=proto/home_http.proto");
     println!("cargo:rerun-if-changed=proto");
