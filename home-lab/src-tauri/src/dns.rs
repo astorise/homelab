@@ -25,9 +25,6 @@ use proto::homedns::v1::home_dns_client::HomeDnsClient;
 use proto::homedns::v1::{AddRecordRequest, Empty, RemoveRecordRequest};
 
 // The name of the named pipe the gRPC server is listening on.
-#[cfg(debug_assertions)]
-const NAMED_PIPE_NAME: &str = r"\\.\\pipe\\home-dns-dev";
-#[cfg(not(debug_assertions))]
 const NAMED_PIPE_NAME: &str = r"\\.\\pipe\\home-dns";
 
 type DnsClient = HomeDnsClient<tonic::transport::Channel>;

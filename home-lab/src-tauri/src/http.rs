@@ -25,9 +25,6 @@ use proto::homehttp::v1::home_http_client::HomeHttpClient;
 use proto::homehttp::v1::{AddRouteRequest, Empty, RemoveRouteRequest};
 
 // The name of the named pipe the gRPC server is listening on.
-#[cfg(debug_assertions)]
-const NAMED_PIPE_NAME: &str = r"\\.\pipe\home-http-dev";
-#[cfg(not(debug_assertions))]
 const NAMED_PIPE_NAME: &str = r"\\.\pipe\home-http";
 
 type HttpClient = HomeHttpClient<tonic::transport::Channel>;
