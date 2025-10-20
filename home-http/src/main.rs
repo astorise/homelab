@@ -929,31 +929,52 @@ impl AsyncWrite for PipeConnection {
 fn named_pipe_stream(
 ) -> io::Result<UnboundedReceiverStream<Result<PipeConnection, io::Error>>> {
     // Create security attributes that allow Authenticated Users to connect.
-    let (sa, _sd_ptr) = get_permissive_security_attributes().map_err(|e| {
+    let (mut sa, sd_ptr) = get_permissive_security_attributes().map_err(|e| {
         error!("FATAL: Failed to create security attributes for named pipe: {}", e);
         io::Error::new(io::ErrorKind::Other, "Security attributes creation failed")
     })?;
 
-    // Box and leak the security attributes to get a 'static reference, which is required
-    // for the pointer to be used in the async block below. The memory will be reclaimed
-    // by the OS when the service process terminates.
-    let sa_static: &'static mut windows_sys::Win32::Security::SECURITY_ATTRIBUTES = Box::leak(Box::new(sa));
-
+    // The first server is created here, outside the async block.
     let mut server = unsafe {
         ServerOptions::new()
             .first_pipe_instance(true)
-            .create_with_security_attributes_raw(NAMED_PIPE_NAME, sa_static as *mut _ as *mut _)?
+            .create_with_security_attributes_raw(NAMED_PIPE_NAME, &mut sa as *mut _ as *mut _)?
     };
+    
     let (tx, rx) = mpsc::unbounded_channel();
 
+    // The SECURITY_ATTRIBUTES struct contains a raw pointer, making it non-Send.
+    // To use it in a tokio::spawn task, we pass the raw pointer address as a usize,
+    // which is Send. The async block then takes ownership of the pointer and is
+    // responsible for freeing it.
+    let sd_addr = sd_ptr as usize;
+
     tokio::spawn(async move {
-        // The security descriptor is part of the leaked 'sa_static' and will be reclaimed by the OS.
+        struct SecurityDescriptorGuard(usize);
+        impl Drop for SecurityDescriptorGuard {
+            fn drop(&mut self) {
+                if self.0 != 0 {
+                    unsafe { windows_sys::Win32::Foundation::LocalFree(self.0 as isize); }
+                }
+            }
+        }
+        // This guard ensures the security descriptor is freed when the task finishes.
+        let _guard = SecurityDescriptorGuard(sd_addr);
+        let sd_ptr = sd_addr as windows_sys::Win32::Security::PSECURITY_DESCRIPTOR;
+
         loop {
             match server.connect().await {
                 Ok(()) => {
+                    // Reconstruct the security attributes for each new server instance.
+                    let mut sa_loop = windows_sys::Win32::Security::SECURITY_ATTRIBUTES {
+                        nLength: std::mem::size_of::<windows_sys::Win32::Security::SECURITY_ATTRIBUTES>() as u32,
+                        lpSecurityDescriptor: sd_ptr,
+                        bInheritHandle: 0,
+                    };
+
                     let new_server = match unsafe {
                         ServerOptions::new()
-                            .create_with_security_attributes_raw(NAMED_PIPE_NAME, sa_static as *mut _ as *mut _)
+                            .create_with_security_attributes_raw(NAMED_PIPE_NAME, &mut sa_loop as *mut _ as *mut _)
                     } {
                         Ok(s) => s,
                         Err(e) => {
