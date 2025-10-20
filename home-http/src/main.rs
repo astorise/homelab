@@ -844,7 +844,7 @@ fn get_permissive_security_attributes() -> Result<(
     let result = unsafe {
         windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW(
             sddl_w.as_ptr(),
-            windows_sys::Win32::Security::SDDL_REVISION_1,
+            windows_sys::Win32::Security::Authorization::SDDL_REVISION_1,
             &mut sd,
             std::ptr::null_mut(),
         )
@@ -906,6 +906,20 @@ impl AsyncWrite for PipeConnection {
     fn poll_flush(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
         self.project().inner.poll_flush(cx)
     }
+}
+
+impl AsyncWrite for PipeConnection {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        data: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        self.project().inner.poll_write(cx, data)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        self.project().inner.poll_flush(cx)
+    }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
         self.project().inner.poll_shutdown(cx)
@@ -928,8 +942,7 @@ fn named_pipe_stream(
     let mut server = unsafe {
         ServerOptions::new()
             .first_pipe_instance(true)
-            .security_attributes(sa_static as *mut _ as *mut _)
-            .create(NAMED_PIPE_NAME)?
+            .create_with_security_attributes_raw(NAMED_PIPE_NAME, sa_static as *mut _ as *mut _)?
     };
     let (tx, rx) = mpsc::unbounded_channel();
 
@@ -940,8 +953,7 @@ fn named_pipe_stream(
                 Ok(()) => {
                     let new_server = match unsafe {
                         ServerOptions::new()
-                            .security_attributes(sa_static as *mut _ as *mut _)
-                            .create(NAMED_PIPE_NAME)
+                            .create_with_security_attributes_raw(NAMED_PIPE_NAME, sa_static as *mut _ as *mut _)
                     } {
                         Ok(s) => s,
                         Err(e) => {
