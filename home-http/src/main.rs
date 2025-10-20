@@ -831,6 +831,39 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// Creates a security descriptor that allows access for Authenticated Users.
+/// This is required for the Tauri app (as a normal user) to connect to the service's named pipe.
+fn get_permissive_security_attributes() -> Result<(
+    windows_sys::Win32::Security::SECURITY_ATTRIBUTES,
+    windows_sys::Win32::Security::PSECURITY_DESCRIPTOR,
+), anyhow::Error> {
+    let sddl = "D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;AU)"; // Allow System, Built-in Admins, Authenticated Users
+    let mut sd: windows_sys::Win32::Security::PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    let sddl_w: Vec<u16> = sddl.encode_utf16().chain(std::iter::once(0)).collect();
+
+    let result = unsafe {
+        windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl_w.as_ptr(),
+            windows_sys::Win32::Security::SDDL_REVISION_1,
+            &mut sd,
+            std::ptr::null_mut(),
+        )
+    };
+
+    if result == 0 {
+        let err = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+        anyhow::bail!("ConvertStringSecurityDescriptorToSecurityDescriptorW failed: {}", err);
+    }
+
+    let sa = windows_sys::Win32::Security::SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<windows_sys::Win32::Security::SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: sd,
+        bInheritHandle: 0, // FALSE
+    };
+
+    Ok((sa, sd))
+}
+
 #[pin_project]
 struct PipeConnection {
     #[pin]
@@ -881,16 +914,35 @@ impl AsyncWrite for PipeConnection {
 
 fn named_pipe_stream(
 ) -> io::Result<UnboundedReceiverStream<Result<PipeConnection, io::Error>>> {
-    let mut server = ServerOptions::new()
-        .first_pipe_instance(true)
-        .create(NAMED_PIPE_NAME)?;
+    // Create security attributes that allow Authenticated Users to connect.
+    let (sa, _sd_ptr) = get_permissive_security_attributes().map_err(|e| {
+        error!("FATAL: Failed to create security attributes for named pipe: {}", e);
+        io::Error::new(io::ErrorKind::Other, "Security attributes creation failed")
+    })?;
+
+    // Box and leak the security attributes to get a 'static reference, which is required
+    // for the pointer to be used in the async block below. The memory will be reclaimed
+    // by the OS when the service process terminates.
+    let sa_static: &'static mut windows_sys::Win32::Security::SECURITY_ATTRIBUTES = Box::leak(Box::new(sa));
+
+    let mut server = unsafe {
+        ServerOptions::new()
+            .first_pipe_instance(true)
+            .security_attributes(sa_static as *mut _ as *mut _)
+            .create(NAMED_PIPE_NAME)?
+    };
     let (tx, rx) = mpsc::unbounded_channel();
 
     tokio::spawn(async move {
+        // The security descriptor is part of the leaked 'sa_static' and will be reclaimed by the OS.
         loop {
             match server.connect().await {
                 Ok(()) => {
-                    let new_server = match ServerOptions::new().create(NAMED_PIPE_NAME) {
+                    let new_server = match unsafe {
+                        ServerOptions::new()
+                            .security_attributes(sa_static as *mut _ as *mut _)
+                            .create(NAMED_PIPE_NAME)
+                    } {
                         Ok(s) => s,
                         Err(e) => {
                             let _ = tx.send(Err(e));
