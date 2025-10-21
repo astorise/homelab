@@ -20,7 +20,7 @@ use log::{error, info, warn, LevelFilter};
 use parking_lot::Mutex;
 use pin_project::pin_project;
 use serde::{Deserialize, Serialize};
-use std::ffi::OsString;
+use std::ffi::{c_void, OsString};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::pin::Pin;
@@ -906,20 +906,6 @@ impl AsyncWrite for PipeConnection {
     fn poll_flush(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
         self.project().inner.poll_flush(cx)
     }
-}
-
-impl AsyncWrite for PipeConnection {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut TaskContext<'_>,
-        data: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        self.project().inner.poll_write(cx, data)
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
-        self.project().inner.poll_flush(cx)
-    }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
         self.project().inner.poll_shutdown(cx)
@@ -954,17 +940,19 @@ fn named_pipe_stream(
         impl Drop for SecurityDescriptorGuard {
             fn drop(&mut self) {
                 if self.0 != 0 {
-                    unsafe { windows_sys::Win32::Foundation::LocalFree(self.0 as isize); }
+                    unsafe {
+                        windows_sys::Win32::Foundation::LocalFree(self.0 as *mut c_void);
+                    }
                 }
             }
         }
         // This guard ensures the security descriptor is freed when the task finishes.
         let _guard = SecurityDescriptorGuard(sd_addr);
-        let sd_ptr = sd_addr as windows_sys::Win32::Security::PSECURITY_DESCRIPTOR;
 
         loop {
             match server.connect().await {
                 Ok(()) => {
+                    let sd_ptr = sd_addr as windows_sys::Win32::Security::PSECURITY_DESCRIPTOR;
                     // Reconstruct the security attributes for each new server instance.
                     let mut sa_loop = windows_sys::Win32::Security::SECURITY_ATTRIBUTES {
                         nLength: std::mem::size_of::<windows_sys::Win32::Security::SECURITY_ATTRIBUTES>() as u32,

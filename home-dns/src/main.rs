@@ -971,21 +971,23 @@ fn named_pipe_stream(
         impl Drop for SecurityDescriptorGuard {
             fn drop(&mut self) {
                 if self.0 != 0 {
-                    unsafe { windows_sys::Win32::Foundation::LocalFree(self.0 as isize); }
+                    // Correctly cast the usize back to a pointer for LocalFree.
+                    unsafe { windows_sys::Win32::Foundation::LocalFree(self.0 as *mut _); }
                 }
             }
         }
         // This guard ensures the security descriptor is freed when the task finishes.
         let _guard = SecurityDescriptorGuard(sd_addr);
-        let sd_ptr = sd_addr as windows_sys::Win32::Security::PSECURITY_DESCRIPTOR;
 
         loop {
             match server.connect().await {
                 Ok(()) => {
                     // Reconstruct the security attributes for each new server instance.
+                    // The raw pointer is created from the usize only within this scope,
+                    // so it does not live across an .await point.
                     let mut sa_loop = windows_sys::Win32::Security::SECURITY_ATTRIBUTES {
                         nLength: std::mem::size_of::<windows_sys::Win32::Security::SECURITY_ATTRIBUTES>() as u32,
-                        lpSecurityDescriptor: sd_ptr,
+                        lpSecurityDescriptor: sd_addr as windows_sys::Win32::Security::PSECURITY_DESCRIPTOR,
                         bInheritHandle: 0,
                     };
 
