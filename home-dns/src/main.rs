@@ -7,7 +7,7 @@ use parking_lot::Mutex;
 use pin_project::pin_project;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::ffi::OsString;
+use std::ffi::{c_void, OsString};
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -972,7 +972,7 @@ fn named_pipe_stream(
             fn drop(&mut self) {
                 if self.0 != 0 {
                     // Correctly cast the usize back to a pointer for LocalFree.
-                    unsafe { windows_sys::Win32::Foundation::LocalFree(self.0 as *mut _); }
+                    unsafe { windows_sys::Win32::Foundation::LocalFree(self.0 as *mut std::ffi::c_void); }
                 }
             }
         }
