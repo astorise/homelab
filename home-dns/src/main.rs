@@ -1,20 +1,23 @@
-#![cfg_attr(all(not(debug_assertions), target_os = "windows"), windows_subsystem = "windows")]
+#![cfg_attr(
+    all(not(debug_assertions), target_os = "windows"),
+    windows_subsystem = "windows"
+)]
 
 use anyhow::{Context, Result};
 use flexi_logger::{Age, Cleanup, Criterion, Duplicate, FileSpec, Logger, Naming};
-use log::{debug, error, info, warn, LevelFilter};
+use log::{LevelFilter, debug, error, info, warn};
 use parking_lot::Mutex;
 use pin_project::pin_project;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::ffi::{c_void, OsString};
+use std::ffi::{OsString, c_void};
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context as TaskContext, Poll};
 use std::thread;
 use std::time::Duration;
@@ -23,7 +26,7 @@ use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
-use tonic::transport::{server::Connected, Server};
+use tonic::transport::{Server, server::Connected};
 use windows_service::define_windows_service;
 use windows_service::service::*;
 use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
@@ -50,8 +53,7 @@ use proto::homedns::v1::{
 
 const SERVICE_NAME: &str = "HomeDnsService";
 const SERVICE_DISPLAY_NAME: &str = "Home DNS Service";
-const SERVICE_DESCRIPTION:
-    &str =
+const SERVICE_DESCRIPTION: &str =
     r"DNS config + rollback + Windows RPC IPC on ncalrpc endpoint home-dns";
 
 #[cfg(debug_assertions)]
@@ -142,7 +144,7 @@ fn init_logger(level: LevelFilter) -> Result<()> {
         Ok(l) => l,
         Err(e) => {
             eprintln!("failed to configure logger (continuing): {e}");
-            return Ok(())
+            return Ok(());
         }
     }
     .log_to_file(
@@ -241,9 +243,9 @@ fn get_all_adapters() -> Result<Vec<PsAdapter>> {
     }
     let stdout = String::from_utf8_lossy(&out.stdout);
     let adapters: Vec<PsAdapter> = if stdout.trim_start().starts_with('[') {
-        serde_json::from_str(stdout.trim()).context("parse JSON adapters")? 
+        serde_json::from_str(stdout.trim()).context("parse JSON adapters")?
     } else {
-        let single: PsAdapter = 
+        let single: PsAdapter =
             serde_json::from_str(stdout.trim()).context("parse JSON adapter")?;
         vec![single]
     };
@@ -745,7 +747,7 @@ fn install_service() -> Result<()> {
     )?;
     if let Ok(_svc) = manager.open_service(SERVICE_NAME, ServiceAccess::QUERY_STATUS) {
         info!("Service already installed");
-        return Ok(())
+        return Ok(());
     }
     let exe_path = std::env::current_exe()?;
     let service_info = ServiceInfo {
@@ -833,7 +835,7 @@ fn main() -> Result<()> {
             println!("Service désinstallé.");
         }
         "run" => {
-            if let Err(e) = 
+            if let Err(e) =
                 windows_service::service_dispatcher::start(SERVICE_NAME, ffi_service_main)
             {
                 error!("Erreur démarrage service: {e:?}");
@@ -864,10 +866,13 @@ fn main() -> Result<()> {
 
 /// Creates a security descriptor that allows access for Authenticated Users.
 /// This is required for the Tauri app (as a normal user) to connect to the service's named pipe.
-fn get_permissive_security_attributes() -> Result<(
-    windows_sys::Win32::Security::SECURITY_ATTRIBUTES,
-    windows_sys::Win32::Security::PSECURITY_DESCRIPTOR,
-), anyhow::Error> {
+fn get_permissive_security_attributes() -> Result<
+    (
+        windows_sys::Win32::Security::SECURITY_ATTRIBUTES,
+        windows_sys::Win32::Security::PSECURITY_DESCRIPTOR,
+    ),
+    anyhow::Error,
+> {
     let sddl = "D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;AU)"; // Allow System, Built-in Admins, Authenticated Users
     let mut sd: windows_sys::Win32::Security::PSECURITY_DESCRIPTOR = std::ptr::null_mut();
     let sddl_w: Vec<u16> = sddl.encode_utf16().chain(std::iter::once(0)).collect();
@@ -883,7 +888,10 @@ fn get_permissive_security_attributes() -> Result<(
 
     if result == 0 {
         let err = unsafe { windows_sys::Win32::Foundation::GetLastError() };
-        anyhow::bail!("ConvertStringSecurityDescriptorToSecurityDescriptorW failed: {}", err);
+        anyhow::bail!(
+            "ConvertStringSecurityDescriptorToSecurityDescriptorW failed: {}",
+            err
+        );
     }
 
     let sa = windows_sys::Win32::Security::SECURITY_ATTRIBUTES {
@@ -943,11 +951,13 @@ impl AsyncWrite for PipeConnection {
     }
 }
 
-fn named_pipe_stream(
-) -> io::Result<UnboundedReceiverStream<Result<PipeConnection, io::Error>>> {
+fn named_pipe_stream() -> io::Result<UnboundedReceiverStream<Result<PipeConnection, io::Error>>> {
     // Create security attributes that allow Authenticated Users to connect.
     let (mut sa, sd_ptr) = get_permissive_security_attributes().map_err(|e| {
-        error!("FATAL: Failed to create security attributes for named pipe: {}", e);
+        error!(
+            "FATAL: Failed to create security attributes for named pipe: {}",
+            e
+        );
         io::Error::new(io::ErrorKind::Other, "Security attributes creation failed")
     })?;
 
@@ -957,7 +967,7 @@ fn named_pipe_stream(
             .first_pipe_instance(true)
             .create_with_security_attributes_raw(NAMED_PIPE_NAME, &mut sa as *mut _ as *mut _)?
     };
-    
+
     let (tx, rx) = mpsc::unbounded_channel();
 
     // The SECURITY_ATTRIBUTES struct contains a raw pointer, making it non-Send.
@@ -972,7 +982,9 @@ fn named_pipe_stream(
             fn drop(&mut self) {
                 if self.0 != 0 {
                     // Correctly cast the usize back to a pointer for LocalFree.
-                    unsafe { windows_sys::Win32::Foundation::LocalFree(self.0 as *mut std::ffi::c_void); }
+                    unsafe {
+                        windows_sys::Win32::Foundation::LocalFree(self.0 as *mut std::ffi::c_void);
+                    }
                 }
             }
         }
@@ -986,14 +998,19 @@ fn named_pipe_stream(
                     // The raw pointer is created from the usize only within this scope,
                     // so it does not live across an .await point.
                     let mut sa_loop = windows_sys::Win32::Security::SECURITY_ATTRIBUTES {
-                        nLength: std::mem::size_of::<windows_sys::Win32::Security::SECURITY_ATTRIBUTES>() as u32,
-                        lpSecurityDescriptor: sd_addr as windows_sys::Win32::Security::PSECURITY_DESCRIPTOR,
+                        nLength: std::mem::size_of::<
+                            windows_sys::Win32::Security::SECURITY_ATTRIBUTES,
+                        >() as u32,
+                        lpSecurityDescriptor: sd_addr
+                            as windows_sys::Win32::Security::PSECURITY_DESCRIPTOR,
                         bInheritHandle: 0,
                     };
 
                     let new_server = match unsafe {
-                        ServerOptions::new()
-                            .create_with_security_attributes_raw(NAMED_PIPE_NAME, &mut sa_loop as *mut _ as *mut _)
+                        ServerOptions::new().create_with_security_attributes_raw(
+                            NAMED_PIPE_NAME,
+                            &mut sa_loop as *mut _ as *mut _,
+                        )
                     } {
                         Ok(s) => s,
                         Err(e) => {

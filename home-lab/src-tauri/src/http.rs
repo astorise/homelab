@@ -11,7 +11,7 @@ use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient};
 use tokio::sync::OnceCell;
 use tonic::transport::{Endpoint, Uri};
 use tower::service_fn;
-use tracing::{debug, error, info, instrument};
+use tracing::{debug, error, info, instrument, warn};
 
 // gRPC generated code
 mod proto {
@@ -35,6 +35,17 @@ type HttpClient = HomeHttpClient<tonic::transport::Channel>;
 
 static CLIENT: OnceCell<HttpClient> = OnceCell::const_new();
 
+fn pipe_candidates() -> &'static [&'static str] {
+    #[cfg(debug_assertions)]
+    {
+        &[NAMED_PIPE_NAME, r"\\.\\pipe\\home-http"]
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        &[NAMED_PIPE_NAME]
+    }
+}
+
 #[pin_project]
 struct SendablePipeClient {
     #[pin]
@@ -50,7 +61,6 @@ impl SendablePipeClient {
 // Safety: Windows named pipe handles are thread-safe to move across threads.
 // Tokio doesn't mark `NamedPipeClient` as `Send`, so we wrap it to satisfy tonic's requirement.
 unsafe impl Send for SendablePipeClient {}
-
 
 impl AsyncRead for SendablePipeClient {
     fn poll_read(
@@ -84,25 +94,43 @@ impl AsyncWrite for SendablePipeClient {
 async fn get_client() -> Result<&'static HttpClient, String> {
     CLIENT
         .get_or_try_init(|| async {
-            info!("Connecting to HTTP gRPC service at {}", NAMED_PIPE_NAME);
-            // A dummy URI is required by Endpoint, but it's not used for connection.
-            let channel = Endpoint::try_from("http://[::]:50051")
-                .unwrap()
-                .connect_with_connector(service_fn(|_uri: Uri| async {
-                    ClientOptions::new()
-                        .open(NAMED_PIPE_NAME)
-                        .map(SendablePipeClient::new)
-                        .map(TokioIo::new)
-                }))
-                .await
-                .map_err(|e| {
-                    let msg = format!("Failed to connect to HTTP service: {}. Is the service running?", e);
-                    error!(error = %e, "HTTP service connection failed");
-                    msg
-                })?;
+            let mut last_error = None;
+            for pipe in pipe_candidates() {
+                info!("Attempting HTTP gRPC connection via {}", pipe);
+                let pipe_path = pipe.to_string();
+                match Endpoint::try_from("http://[::]:50051")
+                    .unwrap()
+                    .connect_with_connector(service_fn(move |_uri: Uri| {
+                        let path = pipe_path.clone();
+                        async move {
+                            ClientOptions::new()
+                                .open(&path)
+                                .map(SendablePipeClient::new)
+                                .map(TokioIo::new)
+                        }
+                    }))
+                    .await
+                {
+                    Ok(channel) => {
+                        info!("Connected to HTTP gRPC service via {}", pipe);
+                        return Ok(HomeHttpClient::new(channel));
+                    }
+                    Err(err) => {
+                        warn!(error = %err, "HTTP pipe {} connection failed", pipe);
+                        last_error = Some(err);
+                    }
+                }
+            }
 
-            info!("Successfully connected to HTTP gRPC service.");
-            Ok(HomeHttpClient::new(channel))
+            let err = last_error
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "no pipe candidates available".to_string());
+            let msg = format!(
+                "Failed to connect to HTTP service: {}. Is the service running?",
+                err
+            );
+            error!("{}", msg);
+            Err(msg)
         })
         .await
 }
@@ -202,7 +230,10 @@ pub async fn http_list_routes() -> Result<ListRoutesOut, String> {
     let routes = list
         .routes
         .into_iter()
-        .map(|r| RouteOut { host: r.host, port: r.port })
+        .map(|r| RouteOut {
+            host: r.host,
+            port: r.port,
+        })
         .collect();
     info!(total, "HTTP route list retrieved");
     Ok(ListRoutesOut { routes })
