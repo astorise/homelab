@@ -1,6 +1,6 @@
 app=home-lab
 version=0.1.0
-tag=0e90f17
-sha=0e90f17
+tag=18e1a7d
+sha=18e1a7d
 run=
-built=2025-10-23T13:23:55.407Z
+built=2025-10-23T19:24:13.051Z
