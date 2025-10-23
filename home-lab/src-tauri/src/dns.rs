@@ -11,7 +11,7 @@ use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient};
 use tokio::sync::OnceCell;
 use tonic::transport::{Endpoint, Uri};
 use tower::service_fn;
-use tracing::{debug, error, info, instrument};
+use tracing::{debug, error, info, instrument, warn};
 
 // gRPC generated code
 mod proto {
@@ -35,6 +35,17 @@ type DnsClient = HomeDnsClient<tonic::transport::Channel>;
 
 static CLIENT: OnceCell<DnsClient> = OnceCell::const_new();
 
+fn pipe_candidates() -> &'static [&'static str] {
+    #[cfg(debug_assertions)]
+    {
+        &[NAMED_PIPE_NAME, r"\\.\\pipe\\home-dns"]
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        &[NAMED_PIPE_NAME]
+    }
+}
+
 #[pin_project]
 struct SendablePipeClient {
     #[pin]
@@ -49,7 +60,6 @@ impl SendablePipeClient {
 
 // Safety: Named pipe handles can be used from any thread; we wrap the client to satisfy tonic's Send bound.
 unsafe impl Send for SendablePipeClient {}
-
 
 impl AsyncRead for SendablePipeClient {
     fn poll_read(
@@ -83,24 +93,43 @@ impl AsyncWrite for SendablePipeClient {
 async fn get_client() -> Result<&'static DnsClient, String> {
     CLIENT
         .get_or_try_init(|| async {
-            info!("Connecting to DNS gRPC service at {}", NAMED_PIPE_NAME);
-            let channel = Endpoint::try_from("http://[::]:50052") // Dummy URI
-                .unwrap()
-                .connect_with_connector(service_fn(|_uri: Uri| async {
-                    ClientOptions::new()
-                        .open(NAMED_PIPE_NAME)
-                        .map(SendablePipeClient::new)
-                        .map(TokioIo::new)
-                }))
-                .await
-                .map_err(|e| {
-                    let msg = format!("Failed to connect to DNS service: {}. Is the service running?", e);
-                    error!(error = %e, "DNS service connection failed");
-                    msg
-                })?;
+            let mut last_error = None;
+            for pipe in pipe_candidates() {
+                info!("Attempting DNS gRPC connection via {}", pipe);
+                let pipe_path = pipe.to_string();
+                match Endpoint::try_from("http://[::]:50052")
+                    .unwrap()
+                    .connect_with_connector(service_fn(move |_uri: Uri| {
+                        let path = pipe_path.clone();
+                        async move {
+                            ClientOptions::new()
+                                .open(&path)
+                                .map(SendablePipeClient::new)
+                                .map(TokioIo::new)
+                        }
+                    }))
+                    .await
+                {
+                    Ok(channel) => {
+                        info!("Connected to DNS gRPC service via {}", pipe);
+                        return Ok(HomeDnsClient::new(channel));
+                    }
+                    Err(err) => {
+                        warn!(error = %err, "DNS pipe {} connection failed", pipe);
+                        last_error = Some(err);
+                    }
+                }
+            }
 
-            info!("Successfully connected to DNS gRPC service.");
-            Ok(HomeDnsClient::new(channel))
+            let err = last_error
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "no pipe candidates available".to_string());
+            let msg = format!(
+                "Failed to connect to DNS service: {}. Is the service running?",
+                err
+            );
+            error!("{}", msg);
+            Err(msg)
         })
         .await
 }

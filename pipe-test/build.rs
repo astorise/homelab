@@ -10,7 +10,7 @@ fn main() {
     ];
 
     tonic_prost_build::configure()
-        .build_client(false)
+        .build_client(true)
         .build_server(false)
         .compile_protos(&protos, &include_dirs)
         .expect("compile protos");

@@ -210,8 +210,7 @@ fn check_rpc(service: ServiceKind, override_endpoints: &[String]) -> Result<()> 
                             endpoint, err, code
                         );
                         if is_transient_rpc_error(code) {
-                            last_failure =
-                                Some(format!("call endpoint '{endpoint}': {}", err));
+                            last_failure = Some(format!("call endpoint '{endpoint}': {}", err));
                             continue;
                         } else {
                             return Err(anyhow!(
