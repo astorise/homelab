@@ -3430,13 +3430,17 @@ name = "pipe-test"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "local-rpc",
- "prost 0.12.6",
+ "hyper-util",
+ "pin-project",
+ "prost 0.14.1",
  "prost-build 0.12.6",
  "protoc-bin-vendored",
+ "tokio",
+ "tonic 0.14.2",
  "tonic-build 0.14.2",
+ "tonic-prost",
  "tonic-prost-build",
- "windows-sys 0.61.2",
+ "tower 0.5.2",
 ]
 
 [[package]]

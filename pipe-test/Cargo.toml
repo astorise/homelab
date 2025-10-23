@@ -5,9 +5,13 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1"
-windows-sys = { version = "0.61", features = ["Win32_System_Rpc"] }
-prost = "0.12"
-local-rpc = { path = "../local-rpc" }
+hyper-util = { version = "0.1", features = ["tokio"] }
+pin-project = "1.1"
+prost = "0.14"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net"] }
+tonic = { version = "0.14", features = ["transport"] }
+tonic-prost = "0.14"
+tower = "0.5.2"
 
 [build-dependencies]
 tonic-build = "0.14"
