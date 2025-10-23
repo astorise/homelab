@@ -16,8 +16,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
-tonic-build = { version = "0.11", features = ["prost", "transport"] }
-prost-build = "0.12"
+tonic-prost-build = { version = "0.14", features = ["transport"] }
 protoc-bin-vendored = "3"
 
 [dependencies]
@@ -26,7 +25,7 @@ tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
-prost = "0.12"
+prost = "0.14"
 anyhow = "1"
 tauri-plugin-log = "2"
 log = "0.4"
@@ -38,8 +37,9 @@ resvg = "0.45"
 usvg = "0.45"
 tiny-skia = "0.11"
 png = "0.18"
-tonic = { version = "0.11", features = ["transport"] }
-tower = "0.4"
+tonic = { version = "0.14", features = ["transport"] }
+tonic-prost = "0.14"
+tower = "0.5.2"
 tokio-stream = "0.1.15"
 futures-util = "0.3.30"
 pin-project = "1.1.5"

@@ -103,9 +103,9 @@ fn main() {
         println!("cargo:rerun-if-changed={}", f.display());
     }
 
-    tonic_build::configure()
+    tonic_prost_build::configure()
         .build_client(true)
         .build_server(false)
-        .compile(&files, &include_dirs)
+        .compile_protos(&files, &include_dirs)
         .expect("failed to compile .proto files");
 }

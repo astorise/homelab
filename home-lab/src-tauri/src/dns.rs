@@ -1,3 +1,4 @@
+use hyper_util::rt::TokioIo;
 use pin_project::pin_project;
 use serde::Serialize;
 use std::{
@@ -89,6 +90,7 @@ async fn get_client() -> Result<&'static DnsClient, String> {
                     ClientOptions::new()
                         .open(NAMED_PIPE_NAME)
                         .map(SendablePipeClient::new)
+                        .map(TokioIo::new)
                 }))
                 .await
                 .map_err(|e| {
