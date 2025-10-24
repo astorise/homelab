@@ -175,9 +175,49 @@ export async function dns_list_records() {
   return Array.isArray(res) ? res : (res?.records ?? []);
 }
 
-export async function dns_add_record(record) { return safeInvoke('dns_add_record', { record }); }
+function normalizeDnsAddArgs(arg1, arg2, arg3, arg4) {
+  if (arg1 && typeof arg1 === 'object') {
+    const { name, rrtype, value, ttl } = arg1;
+    return { name, rrtype, value, ttl };
+  }
+  return { name: arg1, rrtype: arg2, value: arg3, ttl: arg4 };
+}
 
-export async function dns_remove_record(id) { return safeInvoke('dns_remove_record', { id }); }
+function normalizeDnsRemoveArgs(arg1, arg2, arg3) {
+  if (arg1 && typeof arg1 === 'object') {
+    const { name, rrtype, value } = arg1;
+    return { name, rrtype, value };
+  }
+  if (arg2 && typeof arg2 === 'object') {
+    const { rrtype, value } = arg2;
+    return { name: arg1, rrtype, value };
+  }
+  return { name: arg1, rrtype: arg2, value: arg3 };
+}
+
+export async function dns_add_record(arg1, arg2, arg3, arg4) {
+  const payload = normalizeDnsAddArgs(arg1, arg2, arg3, arg4);
+  const name = (payload?.name || '').trim();
+  const rrtype = (payload?.rrtype || '').toUpperCase();
+  const value = (payload?.value || '').trim();
+  const ttl = Number.isFinite(payload?.ttl) ? payload.ttl : Number.parseInt(payload?.ttl, 10);
+  const safeTtl = Number.isFinite(ttl) && ttl > 0 ? ttl : 300;
+  if (!name) throw new Error('Le nom de l\'enregistrement est requis.');
+  if (!rrtype) throw new Error('Le type d\'enregistrement est requis.');
+  if (!value) throw new Error('La valeur de l\'enregistrement est requise.');
+  return safeInvoke('dns_add_record', { name, rrtype, value, ttl: safeTtl });
+}
+
+export async function dns_remove_record(arg1, arg2, arg3) {
+  const payload = normalizeDnsRemoveArgs(arg1, arg2, arg3);
+  const name = (payload?.name || '').trim();
+  const rrtype = (payload?.rrtype || '').toUpperCase();
+  const value = (payload?.value || '').trim();
+  if (!name) throw new Error('Le nom de l\'enregistrement est requis pour la suppression.');
+  if (!rrtype) throw new Error('Le type d\'enregistrement est requis pour la suppression.');
+  if (!value) throw new Error('La valeur de l\'enregistrement est requise pour la suppression.');
+  return safeInvoke('dns_remove_record', { name, rrtype, value });
+}
 
 export async function http_get_status() { return safeInvoke('http_get_status'); }
 
@@ -192,6 +232,19 @@ export async function http_list_routes() {
   return Array.isArray(res) ? res : (res?.routes ?? []);
 }
 
-export async function http_add_route(route) { return safeInvoke('http_add_route', { route }); }
+export async function http_add_route(arg1, arg2) {
+  const payload = typeof arg1 === 'object' && arg1 !== null ? arg1 : { host: arg1, port: arg2 };
+  const host = (payload?.host || '').trim();
+  const portNum = Number.isFinite(payload?.port)
+    ? payload.port
+    : Number.parseInt(payload?.port, 10);
+  if (!host) throw new Error('L\'hôte est requis.');
+  if (!Number.isFinite(portNum) || portNum < 0) throw new Error('Le port fourni est invalide.');
+  return safeInvoke('http_add_route', { host, port: portNum });
+}
 
-export async function http_remove_route(id) { return safeInvoke('http_remove_route', { id }); }
+export async function http_remove_route(arg1) {
+  const host = typeof arg1 === 'object' && arg1 !== null ? arg1.host || arg1.id : arg1;
+  if (!host) throw new Error('L\'hôte est requis pour la suppression.');
+  return safeInvoke('http_remove_route', { host });
+}
