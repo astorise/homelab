@@ -39,7 +39,7 @@
     "resources": {
       "resources/logs": "logs",
       "resources/conf": "conf",
-      "resources/bin": "bin
+      "resources/bin": "bin",
       "resources/wsl": "wsl",
       "icons": "icons",
       "resources/version.txt": "version.txt"
