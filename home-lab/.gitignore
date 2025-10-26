@@ -6,15 +6,13 @@ yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
 lerna-debug.log*
-!src-tauri/resources/logs/
-!src-tauri/resources/logs/*.log
-!src-tauri/resources/logs/*.log
 
 node_modules
 dist
 dist-ssr
 *.local
-
+/target/
+/src-tauri/bin/*
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

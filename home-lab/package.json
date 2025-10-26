@@ -1,13 +1,29 @@
 {
   "name": "home-lab",
   "private": true,
-  "workspaces": ["frontend"],
+  "version": "0.1.0",
+  "type": "module",
   "scripts": {
     "tauri": "tauri",
-    "dev": "npm --prefix ./frontend run dev",
-    "build:frontend": "npm --prefix ./frontend ci && npm --prefix ./frontend run build"
+    "dev": "vite --host localhost --port 5173 --strictPort",
+    "prebuild": "node scripts/write-version.mjs",
+    "tauri:mock": "set VITE_TAURI_MOCK=1&& tauri dev",
+    "tauri:no-svc": "set NO_DEV_SERVICES=1&& tauri dev",
+    "tauri:verbose": "set RUST_LOG=debug&& tauri dev",
+    "build": "vite build",
+    "tauri:msi:services": "powershell -NoProfile -ExecutionPolicy Bypass -File ..\\scripts\\tauri-msi-relink.ps1 -Build -Relink",
+    "preview": "vite preview"
   },
   "devDependencies": {
-    "@tauri-apps/cli": "^2.7"
+    "@tailwindcss/postcss": "^4.1.12",
+    "@tauri-apps/cli": "^2.9.1",
+    "autoprefixer": "^10.4.21",
+    "postcss": "^8.5.6",
+    "tailwindcss": "^4.1.12",
+    "tailwindcss-cli": "^0.1.2",
+    "vite": "^7"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.9.0"
   }
 }

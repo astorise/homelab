@@ -1,8 +1,10 @@
 [workspace]
 members = [
   "home-dns",
-  "home-proxy",
+  "home-http",
   "home-lab/src-tauri",
+  "pipe-test",
+  "service-tester"
 ]
 resolver = "3"
 
@@ -13,5 +15,9 @@ repository = "https://github.com/example/homelab"
 [workspace.dependencies]
 sysinfo = "0.37.0"
 tokio = "1.47.1"
-tokio-tungstenite = "0.27.0"
+tokio-tungstenite = "0.28.0"
 windows-service = "0.8.0"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

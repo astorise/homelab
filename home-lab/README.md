@@ -1,7 +1,18 @@
-# Tauri + Vanilla
+# Home Lab UI
 
-This template should help get you started developing with Tauri in vanilla HTML, CSS and Javascript.
+This Tauri + Vite application now uses Tailwind CSS for styling.
 
-## Recommended IDE Setup
+## Development
 
-- [VS Code](https://code.visualstudio.com/) + [Tauri](https://marketplace.visualstudio.com/items?itemName=tauri-apps.tauri-vscode) + [rust-analyzer](https://marketplace.visualstudio.com/items?itemName=rust-lang.rust-analyzer)
+```bash
+npm run dev        # start Vite dev server
+npm run tauri dev  # start Tauri desktop app
+```
+
+## Components
+
+- `<dns-status>`: displays the DNS service state and log level.
+- `<dns-records>`: shows available DNS records.
+- `<http-status>`: displays the HTTP service state and log level.
+- `<http-routes>`: shows configured HTTP routes.
+- `<toast-container>`: hosts transient error messages; use `showError(message)` to display a toast.

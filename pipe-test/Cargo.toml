@@ -1,0 +1,21 @@
+[package]
+name = "pipe-test"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+hyper-util = { version = "0.1", features = ["tokio"] }
+pin-project = "1.1"
+prost = "0.14"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net"] }
+tonic = { version = "0.14", features = ["transport"] }
+tonic-prost = "0.14"
+tower = "0.5.2"
+
+[build-dependencies]
+tonic-build = "0.14"
+tonic-prost-build = "0.14"
+prost-build = "0.12"
+protoc-bin-vendored = "3"
+

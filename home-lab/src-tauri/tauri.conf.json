@@ -4,9 +4,9 @@
   "version": "0.1.0",
   "identifier": "name.astori.home-lab",
   "build": {
-    "beforeDevCommand": "npm --prefix ./frontend ci && npm --prefix ./frontend run dev",
-    "beforeBuildCommand": "npm --prefix ./frontend ci && npm --prefix ./frontend run build",
-    "frontendDist": "../frontend/dist",
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist",
     "devUrl": "http://localhost:5173"
   },
   "app": {
@@ -23,10 +23,12 @@
       "csp": null
     }
   },
-  
   "bundle": {
     "active": true,
-    "targets": ["nsis", "msi"],               
+    "targets": [
+      "nsis",
+      "msi"
+    ],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -34,12 +36,13 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "resources": [
-       "resources/conf/*",
-      "resources/home-dns.exe",
-      "resources/home-proxy.exe",
-      "icons/**/*"
-    ],
+    "resources": {
+      "resources/logs": "logs",
+      "resources/conf": "conf",
+      "resources/bin": "bin",
+      "icons": "icons",
+      "resources/version.txt": "version.txt"
+    },
     "windows": {
       "nsis": {
         "installMode": "perMachine",
@@ -47,7 +50,13 @@
       },
       "wix": {
         "fragmentPaths": [
-          "resources/install-services.wxi"
+          "resources/install-services.wxs"
+        ],
+        "componentGroupRefs": [
+          "ServicesComponents"
+        ],
+        "featureRefs": [
+          "ServicesFeature"
         ]
       }
     }

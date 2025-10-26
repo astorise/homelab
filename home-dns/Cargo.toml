@@ -5,9 +5,8 @@ edition = "2024"
 build = "build.rs"
 
 [dependencies]
+windows-sys = { version = "0.61.0", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Memory"] }
 sysinfo = { workspace = true }
-tokio = { version = "1.39", features = ["rt-multi-thread", "macros", "time", "sync"] }
-tokio-tungstenite = { workspace = true }
 windows-service = { workspace = true }
 anyhow = "1.0"
 serde = { version = "1.0", features = ["derive"] }
@@ -16,13 +15,18 @@ serde_json = "1.0"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 log = "0.4"
 flexi_logger = { version = "0.31", default-features = false, features = ["colors"] }
-tonic = { version = "0.11", features = ["transport"] }
 prost = "0.12"
-tokio-util = "0.7"
 parking_lot = "0.12"
-futures-util = "0.3"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net"] }
+tonic = { version = "0.11", features = ["transport"] }
+tower-http = { version = "0.6.0", features = ["cors"] }
+tokio-stream = "0.1.15"
+futures-util = "0.3.30"
+pin-project = "1.1.5"
+hyper-util = { version = "0.1", features = ["tokio"] }
 
 [build-dependencies]
-tonic-build = "0.11"
+tonic-build = { version = "0.11", features = ["prost"] }
 prost-build = "0.12"
 protoc-bin-vendored = "3"
+chrono = "0.4"

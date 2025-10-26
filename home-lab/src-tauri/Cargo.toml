@@ -1,36 +1,61 @@
 [package]
-name = "homelab-tauri"
+name = "home-lab"
 version = "0.1.0"
+description = "A Tauri App"
+authors = ["you"]
 edition = "2021"
-description = "Tauri v2 app with gRPC client over Windows named pipe"
-license = "MIT"
-authors = ["Sebastien"]
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [lib]
-name = "homelab_tauri"
-path = "src/lib.rs"
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "home_lab_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+tonic-prost-build = { version = "0.14", features = ["transport"] }
+protoc-bin-vendored = "3"
+
+[dependencies]
+tauri = { version = "2.9", features = ["tray-icon"] }
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+prost = "0.14"
+anyhow = "1"
+tauri-plugin-log = "2"
+log = "0.4"
+dirs = "6"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+tracing-appender = "0.2"
+resvg = "0.45"
+usvg = "0.45"
+tiny-skia = "0.11"
+png = "0.18"
+tonic = { version = "0.14", features = ["transport"] }
+tonic-prost = "0.14"
+tower = "0.5.2"
+tokio-stream = "0.1.15"
+futures-util = "0.3.30"
+pin-project = "1.1.5"
+hyper-util = { version = "0.1", features = ["tokio"] }
+
 
 [[bin]]
 name = "homelab-tauri"
 path = "src/main.rs"
 
-[dependencies]
-tauri = { version = "2", features = ["tray-icon"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
-# IMPORTANT: include 'codegen' so generated code compiles
-tonic = { version = "0.11", features = ["transport", "codegen"] }
-prost = "0.12"
-serde = { version = "1", features = ["derive"] }
-anyhow = "1"
-tower = { version = "0.5", features = ["util"] }
 
-# Rasterisation SVG
-resvg = "0.45"
-usvg = "0.45"
-tiny-skia = "0.11"
-png = "0.17"
 
-[build-dependencies]
-tonic-build = "0.11"
-prost-build = "0.12"
-protoc-bin-vendored = "3"
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Controls_Dialogs",
+] }

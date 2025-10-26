@@ -1,162 +1,168 @@
-#![cfg_attr(all(not(debug_assertions), target_os = "windows"), windows_subsystem = "windows")]
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use tauri::Manager;
-use serde::Serialize;
-use std::time::Duration;
-use anyhow::Result;
-use tonic::transport::{Channel, Endpoint, Uri};
-use tower::service_fn;
-use tokio::net::windows::named_pipe::ClientOptions;
 use std::sync::Arc;
+use std::{fs, path::PathBuf};
+#[cfg(debug_assertions)]
+use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
+use tracing::{error, info, warn};
+use tracing_appender::{non_blocking::WorkerGuard, rolling};
+use tracing_subscriber::{fmt, EnvFilter};
+
+#[cfg(all(debug_assertions, target_os = "windows"))]
+mod dev_services;
+mod dns;
+mod http;
 mod icons;
 mod menu;
-mod proxy;
-use crate::proxy::{
-    proxy_get_status,
-    proxy_stop_service,
-    proxy_reload_config,
-    proxy_list_routes,
-    proxy_add_route,
-    proxy_remove_route,
-};
+mod ui;
 
+static mut LOG_GUARD: Option<WorkerGuard> = None;
 
-// === gRPC generated modules (prost/tonic) ===
-pub mod homedns {
-    pub mod homedns {
-        pub mod v1 {
-            tonic::include_proto!("homedns.v1");
+fn default_log_filter() -> &'static str {
+    if cfg!(debug_assertions) {
+        "debug,tauri=info"
+    } else {
+        "info"
+    }
+}
+
+fn log_dir() -> PathBuf {
+    // 1. ProgramData (preferred when the app is installed)
+    if let Some(pd) = std::env::var_os("PROGRAMDATA") {
+        return PathBuf::from(pd).join("home-lab").join("logs");
+    }
+    // 2. LocalAppData (user scope, common during development)
+    if let Some(la) = std::env::var_os("LOCALAPPDATA") {
+        return PathBuf::from(la).join("home-lab").join("logs");
+    }
+    // 3. Temp (always available)
+    if let Some(t) = std::env::var_os("TEMP").or_else(|| std::env::var_os("TMP")) {
+        return PathBuf::from(t).join("home-lab").join("logs");
+    }
+    // 4. Current directory (last resort)
+    PathBuf::from(".").join("home-lab").join("logs")
+}
+
+fn init_file_logger() {
+    let dir = log_dir();
+    if let Err(e) = fs::create_dir_all(&dir) {
+        eprintln!("Unable to create {}: {e}", dir.display());
+    }
+
+    let filter_directive =
+        std::env::var("RUST_LOG").unwrap_or_else(|_| default_log_filter().to_string());
+    let filter = EnvFilter::try_new(filter_directive.clone())
+        .unwrap_or_else(|_| EnvFilter::new(default_log_filter()));
+
+    let file_appender = rolling::daily(&dir, "app.log");
+    let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+
+    let builder = fmt()
+        .with_env_filter(filter)
+        .with_writer(non_blocking)
+        .with_ansi(false)
+        .with_level(true)
+        .with_target(true)
+        .with_file(true)
+        .with_line_number(true)
+        .with_thread_ids(true)
+        .with_thread_names(true);
+
+    match builder.try_init() {
+        Ok(()) => {
+            unsafe {
+                LOG_GUARD = Some(guard);
+            }
+            info!("File logger initialised in {}", dir.display());
+        }
+        Err(err) => {
+            drop(guard);
+            let fallback_filter = EnvFilter::try_new(filter_directive)
+                .unwrap_or_else(|_| EnvFilter::new(default_log_filter()));
+            if fmt()
+                .with_env_filter(fallback_filter)
+                .with_ansi(false)
+                .with_level(true)
+                .with_target(true)
+                .with_file(true)
+                .with_line_number(true)
+                .with_thread_ids(true)
+                .with_thread_names(true)
+                .try_init()
+                .is_ok()
+            {
+                warn!("File logger initialisation failed: {err}. Logging to console instead.");
+            } else {
+                eprintln!("Logger initialisation failed: {err}");
+            }
         }
     }
 }
-use homedns::homedns::v1::home_dns_client::HomeDnsClient;
-use homedns::homedns::v1::*;
 
-const PIPE_NAME: &str = r"\\.\pipe\home-dns";
-
-async fn dns_make_channel() -> Result<Channel> {
-    // Endpoint URI is dummy; transport comes from the connector (named pipe stream).
-    let ep = Endpoint::try_from("http://localhost:50051")?
-        .connect_timeout(Duration::from_secs(5))
-        .tcp_nodelay(true);
-    let path = PIPE_NAME.to_string();
-    let ch = ep.connect_with_connector(service_fn(move |_uri: Uri| {
-        let path = path.clone();
-        async move {
-            // Open the named pipe client; succeeds when the server pipe exists.
-            let client = ClientOptions::new().open(&path)?;
-            Ok::<_, std::io::Error>(client)
-        }
-    })).await?;
-    Ok(ch)
-}
-
-fn map_err<E: std::fmt::Display>(e: E) -> String { e.to_string() }
-
-#[derive(Serialize)]
-struct AckOut { ok: bool, message: String }
-
-#[derive(Serialize)]
-struct StatusOut { state: String, log_level: String }
-
-#[derive(Serialize)]
-struct RecordOut { name: String, a: Vec<String>, aaaa: Vec<String>, ttl: u32 }
-
-#[derive(Serialize)]
-struct ListRecordsOut { records: Vec<RecordOut> }
-
-#[tauri::command]
-async fn ping() -> String { "pong".into() }
-
-#[tauri::command]
-async fn dns_get_status() -> Result<StatusOut, String> {
-    let ch = dns_make_channel().await.map_err(map_err)?;
-    let mut client = HomeDnsClient::new(ch);
-    let resp = client.get_status(tonic::Request::new(Empty{})).await.map_err(map_err)?;
-    let s = resp.into_inner();
-    Ok(StatusOut{ state: s.state, log_level: s.log_level })
-}
-
-#[tauri::command]
-async fn dns_stop_service() -> Result<AckOut, String> {
-    let ch = dns_make_channel().await.map_err(map_err)?;
-    let mut client = HomeDnsClient::new(ch);
-    let resp = client.stop_service(tonic::Request::new(Empty{})).await.map_err(map_err)?;
-    let a = resp.into_inner();
-    Ok(AckOut{ ok: a.ok, message: a.message })
-}
-
-#[tauri::command]
-async fn dns_reload_config() -> Result<AckOut, String> {
-    let ch = dns_make_channel().await.map_err(map_err)?;
-    let mut client = HomeDnsClient::new(ch);
-    let resp = client.reload_config(tonic::Request::new(Empty{})).await.map_err(map_err)?;
-    let a = resp.into_inner();
-    Ok(AckOut{ ok: a.ok, message: a.message })
-}
-
-#[tauri::command]
-async fn dns_list_records() -> Result<ListRecordsOut, String> {
-    let ch = dns_make_channel().await.map_err(map_err)?;
-    let mut client = HomeDnsClient::new(ch);
-    let resp = client.list_records(tonic::Request::new(Empty{})).await.map_err(map_err)?;
-    let list = resp.into_inner();
-    let out = ListRecordsOut {
-        records: list.records.into_iter().map(|r| RecordOut {
-            name: r.name, a: r.a, aaaa: r.aaaa, ttl: r.ttl
-        }).collect()
-    };
-    Ok(out)
-}
-
-#[tauri::command]
-async fn dns_add_record(name: String, rrtype: String, value: String, ttl: u32) -> Result<AckOut, String> {
-    let ch = dns_make_channel().await.map_err(map_err)?;
-    let mut client = HomeDnsClient::new(ch);
-    let req = AddRecordRequest { name, rrtype, value, ttl };
-    let resp = client.add_record(tonic::Request::new(req)).await.map_err(map_err)?;
-    let a = resp.into_inner();
-    Ok(AckOut{ ok: a.ok, message: a.message })
-}
-
-#[tauri::command]
-async fn dns_remove_record(name: String, rrtype: String, value: String) -> Result<AckOut, String> {
-    let ch = dns_make_channel().await.map_err(map_err)?;
-    let mut client = HomeDnsClient::new(ch);
-    let req = RemoveRecordRequest { name, rrtype, value };
-    let resp = client.remove_record(tonic::Request::new(req)).await.map_err(map_err)?;
-    let a = resp.into_inner();
-    Ok(AckOut{ ok: a.ok, message: a.message })
-}
-
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    std::env::set_var("RUST_BACKTRACE", "1");
+
+    // ⚠️ Initialise AVANT le Builder pour garantir la création du dossier/log
+    init_file_logger();
+    info!("boot…");
+
     tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![
-            ping,
-            dns_get_status,
-            dns_stop_service,
-            dns_reload_config,
-            dns_list_records,
-            dns_add_record,
-            dns_remove_record,
-            proxy::proxy_get_status,
-            proxy::proxy_stop_service,
-            proxy::proxy_reload_config,
-            proxy::proxy_list_routes,
-            proxy::proxy_add_route,
-            proxy::proxy_remove_route,
-        ])
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close(); // n'arrête pas l'app
+                let _ = window.hide(); // cache la fenêtre
+            }
+        })
         .setup(|app| {
-                     let loaded_icons = Arc::new(crate::icons::Icons::load(&app.handle(), 20)?);
+            let loaded_icons = Arc::new(crate::icons::Icons::load(&app.handle(), 20)?);
             crate::menu::setup_ui(&app.handle(), loaded_icons)?;
+
+            // En dev sur Windows, lance les services en mode console et redirige leurs logs
+            #[cfg(all(debug_assertions, target_os = "windows"))]
+            {
+                let _ = crate::dev_services::spawn(&app.handle());
+            }
+
+            // En dev, assure que la fenêtre principale est visible
+            // (sinon on a tendance à ouvrir le serveur Vite dans un navigateur externe,
+            //  où l'API Tauri n'est pas disponible).
+            #[cfg(debug_assertions)]
+            {
+                if let Some(main) = app.get_webview_window("main") {
+                    let _ = main.show();
+                    let _ = main.set_focus();
+                } else {
+                    // Si aucune fenêtre 'main' n'existe (ex: config la masque/retard), on la crée.
+                    let win = WebviewWindowBuilder::new(app, "main", WebviewUrl::default())
+                        .title("Home Lab")
+                        .center()
+                        .build()?;
+                    let _ = win.show();
+                    let _ = win.set_focus();
+                }
+            }
             Ok(())
         })
-        .on_window_event(|window, event| {
-      if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-        api.prevent_close();           // n'arrête pas l'app
-        let _ = window.hide();         // cache la fenêtre
-      }
-    })
+        .invoke_handler(tauri::generate_handler![
+            // Tes handlers d’origine :
+            dns::dns_get_status,
+            dns::dns_stop_service,
+            dns::dns_reload_config,
+            dns::dns_list_records,
+            dns::dns_add_record,
+            dns::dns_remove_record,
+            http::http_get_status,
+            http::http_stop_service,
+            http::http_reload_config,
+            http::http_list_routes,
+            http::http_add_route,
+            http::http_remove_route,
+            ui::ui_log,
+        ])
         .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .unwrap_or_else(|e| {
+            error!("erreur critique: {:?}", e);
+            panic!("Erreur Tauri: {:?}", e);
+        });
 }

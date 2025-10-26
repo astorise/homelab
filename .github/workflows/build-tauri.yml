@@ -9,13 +9,13 @@ jobs:
   build-docker-image:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - run: docker build -t env-dev-image -f docker/Dockerfile .
+      - uses: actions/checkout@v5
+      - run: docker build -t env-dev-image -f docker-image/Dockerfile .
       - run: |
           cid=$(docker create env-dev-image)
           docker export "$cid" -o env-dev-image.tar
           docker rm "$cid"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: env-dev-image.tar
           path: env-dev-image.tar
@@ -45,14 +45,14 @@ jobs:
           RUSTFLAGS: "-C target-feature=+crt-static"
         run: |
           cargo build -p home-dns   --release --target x86_64-pc-windows-gnu
-          cargo build -p home-proxy --release --target x86_64-pc-windows-gnu
+          cargo build -p home-http --release --target x86_64-pc-windows-gnu
           ls -lah target/x86_64-pc-windows-gnu/release
           mkdir -p services-win
           cp target/x86_64-pc-windows-gnu/release/home-dns.exe   services-win/
-          cp target/x86_64-pc-windows-gnu/release/home-proxy.exe services-win/
+          cp target/x86_64-pc-windows-gnu/release/home-http.exe services-win/
 
       - name: Upload services artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: services-win
           path: services-win/*
@@ -60,24 +60,54 @@ jobs:
   # === OPTION RECOMMANDÉE: installateur Windows officiel (runner Windows) ===
   build-tauri-win:
     runs-on: windows-latest
-    needs: build-services
+    needs: [build-services, build-docker-image]
     steps:
       - uses: actions/checkout@v5
 
-      - name: Download services artifacts into Tauri resources
-        uses: actions/download-artifact@v5
+      - name: Clear bundled services directory
+        shell: pwsh
+        run: |
+          $bin = 'home-lab/src-tauri/resources/bin'
+          if (Test-Path $bin) {
+            Get-ChildItem $bin -Filter '*.exe' -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+          } else {
+            New-Item -ItemType Directory -Path $bin | Out-Null
+          }
+
+      - name: Download services artifacts into resources/bin
+        uses: actions/download-artifact@v6
         with:
           name: services-win
+          path: home-lab/src-tauri/resources/bin
+
+      - name: Download Docker image into Tauri resources
+        uses: actions/download-artifact@v6
+        with:
+          name: env-dev-image.tar
           path: home-lab/src-tauri/resources
+
+      - name: Rename Docker image
+        run: mv home-lab/src-tauri/resources/env-dev-image.tar home-lab/src-tauri/resources/homelab-img.tar
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: '22'
-
+      
+      - name: import windows certificate
+        if: matrix.platform == 'windows-latest'
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+        run: |
+          New-Item -ItemType directory -Path certificate
+          Set-Content -Path certificate/tempCert.txt -Value $env:WINDOWS_CERTIFICATE
+          certutil -decode certificate/tempCert.txt certificate/certificate.pfx
+          Remove-Item -path certificate -include tempCert.txt
+          Import-PfxCertificate -FilePath certificate/certificate.pfx -CertStoreLocation Cert:\CurrentUser\My -Password (ConvertTo-SecureString -String $env:WINDOWS_CERTIFICATE_PASSWORD -Force -AsPlainText)
       - name: Install frontend deps + Tauri CLI
         working-directory: home-lab
         shell: pwsh
@@ -97,7 +127,7 @@ jobs:
             ${{ runner.os }}-node-
 
       - name: Build Tauri (Windows - NSIS + MSI)
-        uses: tauri-apps/tauri-action@v0.5.22
+        uses: tauri-apps/tauri-action@v0.5.23
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_BUNDLE_DEBUG: "true"
@@ -106,14 +136,14 @@ jobs:
           projectPath: ./home-lab
 
       - name: Upload NSIS setup
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: nsis-setup
           path: target/release/bundle/nsis/*.exe
           if-no-files-found: error
 
       - name: Upload MSI package
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: msi-package
           path: target/release/bundle/msi/*.msi

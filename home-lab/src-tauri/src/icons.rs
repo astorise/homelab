@@ -1,9 +1,4 @@
-use std::{
-    collections::HashMap,
-    fs,
-    path::PathBuf,
-    sync::Mutex,
-};
+use std::{collections::HashMap, fs, path::PathBuf, sync::Mutex};
 
 use tauri::{image::Image, AppHandle, Manager};
 
@@ -14,6 +9,7 @@ use resvg::{
 
 /// États d'icônes (détermine la couleur appliquée)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[allow(dead_code)]
 pub enum IconState {
     Ok,
     Warning,
@@ -72,7 +68,12 @@ impl Icons {
 
     /// Récupère une icône (par ex. `get("dns", IconState::Ok, app)`).
     /// Retourne directement un `tauri::image::Image<'static>`.
-    pub fn get(&self, name: &str, state: IconState, app: &AppHandle) -> tauri::Result<Image<'static>> {
+    pub fn get(
+        &self,
+        name: &str,
+        state: IconState,
+        app: &AppHandle,
+    ) -> tauri::Result<Image<'static>> {
         let key = (name.to_string(), state);
 
         // 1) cache pixels -> Image
@@ -83,17 +84,11 @@ impl Icons {
         // 2) charge + recolorise
         let svg_path = resolve_icon_path(app, name)?;
         let svg_bytes = fs::read(&svg_path).map_err(|e| {
-            tauri::Error::AssetNotFound(format!(
-                "Impossible de lire {}: {e}",
-                svg_path.display()
-            ))
+            tauri::Error::AssetNotFound(format!("Impossible de lire {}: {e}", svg_path.display()))
         })?;
 
         let svg_text = String::from_utf8(svg_bytes).map_err(|e| {
-            tauri::Error::AssetNotFound(format!(
-                "SVG invalide (UTF-8) {}: {e}",
-                svg_path.display()
-            ))
+            tauri::Error::AssetNotFound(format!("SVG invalide (UTF-8) {}: {e}", svg_path.display()))
         })?;
 
         let recolored = recolor_svg(&svg_text, color_for_state(state));
@@ -121,9 +116,8 @@ fn resolve_icon_path(app: &AppHandle, name: &str) -> tauri::Result<PathBuf> {
 /// Parse l’SVG et render dans un Pixmap (resvg 0.44 n’a plus FitTo).
 fn rasterize_svg_to_image(svg_bytes: &[u8], size: u32) -> tauri::Result<Image<'static>> {
     let opt = Options::default();
-    let tree: Tree = usvg::Tree::from_data(svg_bytes, &opt).map_err(|e| {
-        tauri::Error::AssetNotFound(format!("Erreur parsing SVG: {e:?}"))
-    })?;
+    let tree: Tree = usvg::Tree::from_data(svg_bytes, &opt)
+        .map_err(|e| tauri::Error::AssetNotFound(format!("Erreur parsing SVG: {e:?}")))?;
 
     // Récupère taille logique du SVG
     let ws = tree.size().width();
