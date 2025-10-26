@@ -90,3 +90,4 @@ class DnsRecords extends HTMLElement {
 }
 
 customElements.define('dns-records', DnsRecords);
+
