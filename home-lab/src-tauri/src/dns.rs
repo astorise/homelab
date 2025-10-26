@@ -26,10 +26,8 @@ use proto::homedns::v1::home_dns_client::HomeDnsClient;
 use proto::homedns::v1::{AddRecordRequest, Empty, RemoveRecordRequest};
 
 // The name of the named pipe the gRPC server is listening on.
-#[cfg(debug_assertions)]
-const NAMED_PIPE_NAME: &str = r"\\.\\pipe\\home-dns-dev";
-#[cfg(not(debug_assertions))]
-const NAMED_PIPE_NAME: &str = r"\\.\\pipe\\home-dns";
+const PIPE_RELEASE: &str = r"\\.\pipe\home-dns";
+const PIPE_DEV: &str = r"\\.\pipe\home-dns-dev";
 
 type DnsClient = HomeDnsClient<tonic::transport::Channel>;
 
@@ -38,11 +36,11 @@ static CLIENT: OnceCell<DnsClient> = OnceCell::const_new();
 fn pipe_candidates() -> &'static [&'static str] {
     #[cfg(debug_assertions)]
     {
-        &[NAMED_PIPE_NAME, r"\\.\\pipe\\home-dns"]
+        &[PIPE_DEV, PIPE_RELEASE]
     }
     #[cfg(not(debug_assertions))]
     {
-        &[NAMED_PIPE_NAME]
+        &[PIPE_RELEASE, PIPE_DEV]
     }
 }
 
@@ -115,7 +113,7 @@ async fn get_client() -> Result<&'static DnsClient, String> {
                         return Ok(HomeDnsClient::new(channel));
                     }
                     Err(err) => {
-                        warn!(error = %err, "DNS pipe {} connection failed", pipe);
+                        warn!(error = ?err, "DNS pipe {} connection failed", pipe);
                         last_error = Some(err);
                     }
                 }

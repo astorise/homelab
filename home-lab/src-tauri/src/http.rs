@@ -26,10 +26,8 @@ use proto::homehttp::v1::home_http_client::HomeHttpClient;
 use proto::homehttp::v1::{AddRouteRequest, Empty, RemoveRouteRequest};
 
 // The name of the named pipe the gRPC server is listening on.
-#[cfg(debug_assertions)]
-const NAMED_PIPE_NAME: &str = r"\\.\pipe\home-http-dev";
-#[cfg(not(debug_assertions))]
-const NAMED_PIPE_NAME: &str = r"\\.\pipe\home-http";
+const PIPE_RELEASE: &str = r"\\.\pipe\home-http";
+const PIPE_DEV: &str = r"\\.\pipe\home-http-dev";
 
 type HttpClient = HomeHttpClient<tonic::transport::Channel>;
 
@@ -38,11 +36,11 @@ static CLIENT: OnceCell<HttpClient> = OnceCell::const_new();
 fn pipe_candidates() -> &'static [&'static str] {
     #[cfg(debug_assertions)]
     {
-        &[NAMED_PIPE_NAME, r"\\.\\pipe\\home-http"]
+        &[PIPE_DEV, PIPE_RELEASE]
     }
     #[cfg(not(debug_assertions))]
     {
-        &[NAMED_PIPE_NAME]
+        &[PIPE_RELEASE, PIPE_DEV]
     }
 }
 
@@ -116,7 +114,7 @@ async fn get_client() -> Result<&'static HttpClient, String> {
                         return Ok(HomeHttpClient::new(channel));
                     }
                     Err(err) => {
-                        warn!(error = %err, "HTTP pipe {} connection failed", pipe);
+                        warn!(error = ?err, "HTTP pipe {} connection failed", pipe);
                         last_error = Some(err);
                     }
                 }
