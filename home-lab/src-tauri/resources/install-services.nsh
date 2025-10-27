@@ -61,6 +61,9 @@ Var UNINS_DNS_OK
   StrCmp $LOG_HANDLE "" +2
   FileWrite $LOG_HANDLE "sc start HomeHttpService => rc=$0 out=$1$\r$\n"
     ; Exécution après installation
+  ; Forcer l’élévation (si pas déjà perMachine)
+  ; et lancer WSL sans distribution
+  nsExec::ExecToLog 'powershell -ExecutionPolicy Bypass -Command "wsl --install --no-distribution"'
   ; Close log file if opened
   StrCmp $LOG_HANDLE "" +2
   FileClose $LOG_HANDLE
