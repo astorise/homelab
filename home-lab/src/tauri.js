@@ -255,9 +255,8 @@ export async function http_remove_route(arg1) {
   const host = typeof arg1 === 'object' && arg1 !== null ? arg1.host || arg1.id : arg1;
   if (!host) throw new Error('L\'hôte est requis pour la suppression.');
   return safeInvoke('http_remove_route', { host });
-
+}
 
 export async function wsl_import_instance(options = {}) {
   return safeInvoke('wsl_import_instance', options);
-
 }
