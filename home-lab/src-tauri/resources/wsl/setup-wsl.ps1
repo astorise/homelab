@@ -45,10 +45,20 @@ function Import-Distro {
     }
 
     Write-Info "Import de la distribution $Name depuis $TarPath"
-    $args = @('--import', $Name, $TargetDir, $TarPath, '--version', '2')
-    $p = Start-Process -FilePath 'wsl.exe' -ArgumentList $args -Wait -PassThru -NoNewWindow
-    if ($p.ExitCode -ne 0) {
-        throw "Import WSL échoué (code $($p.ExitCode))"
+    $args = @("--import", $Name, $TargetDir, $TarPath, "--version", "2")
+    $std = & wsl.exe @args 2>&1
+    $exitCode = $LASTEXITCODE
+
+    if ($exitCode -ne 0) {
+        $details = ($std | Where-Object { $_ -and $_.Trim().Length -gt 0 }) -join "`n"
+        if ($details) {
+            throw "Import WSL echoue (code $exitCode) :`n$details"
+        }
+        throw "Import WSL echoue (code $exitCode)"
+    }
+
+    if ($std) {
+        Write-Info ("wsl.exe a renvoye:" + [Environment]::NewLine + ($std -join [Environment]::NewLine))
     }
 }
 
