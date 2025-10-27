@@ -22,7 +22,6 @@
                   ExeCommand='[SystemFolder]sc.exe start HomeDnsService' Return="ignore" />
     <CustomAction Id="StartHomeHttp" Directory="INSTALLDIR" Execute="deferred" Impersonate="no"
                   ExeCommand='[SystemFolder]sc.exe start HomeHttpService' Return="ignore" />
-
     <!-- Uninstall: prefer binary uninstallers; rely on ServiceControl as safety net -->
     <CustomAction Id="UninstallHomeDns" Directory="INSTALLDIR" Execute="deferred" Impersonate="no"
                   ExeCommand='"[INSTALLDIR]bin\home-dns.exe" uninstall' Return="ignore" />

@@ -15,6 +15,7 @@ mod http;
 mod icons;
 mod menu;
 mod ui;
+mod wsl;
 
 static mut LOG_GUARD: Option<WorkerGuard> = None;
 
@@ -158,6 +159,7 @@ pub fn run() {
             http::http_list_routes,
             http::http_add_route,
             http::http_remove_route,
+            wsl::wsl_import_instance,
             ui::ui_log,
         ])
         .run(tauri::generate_context!())

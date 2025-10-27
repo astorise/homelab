@@ -29,6 +29,7 @@ use proto::homedns::v1::{AddRecordRequest, Empty, RemoveRecordRequest};
 const PIPE_RELEASE: &str = r"\\.\pipe\home-dns";
 const PIPE_DEV: &str = r"\\.\pipe\home-dns-dev";
 
+
 type DnsClient = HomeDnsClient<tonic::transport::Channel>;
 
 static CLIENT: OnceCell<DnsClient> = OnceCell::const_new();
