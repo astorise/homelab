@@ -80,14 +80,18 @@ jobs:
           name: services-win
           path: home-lab/src-tauri/resources/bin
 
-      - name: Download Docker image into Tauri resources
+      - name: Download Docker image into Tauri WSL resources
         uses: actions/download-artifact@v6
         with:
           name: env-dev-image.tar
-          path: home-lab/src-tauri/resources
+          path: home-lab/src-tauri/resources/wsl
 
-      - name: Rename Docker image
-        run: mv home-lab/src-tauri/resources/env-dev-image.tar home-lab/src-tauri/resources/homelab-img.tar
+      - name: Rename Docker image artifact to WSL rootfs
+        shell: pwsh
+        run: |
+          Move-Item -LiteralPath 'home-lab/src-tauri/resources/wsl/env-dev-image.tar' `
+                    -Destination 'home-lab/src-tauri/resources/wsl/wsl-rootfs.tar' `
+                    -Force
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
