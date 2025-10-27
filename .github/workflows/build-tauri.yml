@@ -127,7 +127,7 @@ jobs:
             ${{ runner.os }}-node-
 
       - name: Build Tauri (Windows - NSIS + MSI)
-        uses: tauri-apps/tauri-action@v0.5.23
+        uses: tauri-apps/tauri-action@v0.5.24
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_BUNDLE_DEBUG: "true"
