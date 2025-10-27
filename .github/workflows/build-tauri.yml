@@ -15,7 +15,7 @@ jobs:
           cid=$(docker create env-dev-image)
           docker export "$cid" -o env-dev-image.tar
           docker rm "$cid"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: env-dev-image.tar
           path: env-dev-image.tar
@@ -52,7 +52,7 @@ jobs:
           cp target/x86_64-pc-windows-gnu/release/home-http.exe services-win/
 
       - name: Upload services artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: services-win
           path: services-win/*
@@ -75,13 +75,13 @@ jobs:
           }
 
       - name: Download services artifacts into resources/bin
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v6
         with:
           name: services-win
           path: home-lab/src-tauri/resources/bin
 
       - name: Download Docker image into Tauri resources
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v6
         with:
           name: env-dev-image.tar
           path: home-lab/src-tauri/resources
@@ -136,14 +136,14 @@ jobs:
           projectPath: ./home-lab
 
       - name: Upload NSIS setup
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: nsis-setup
           path: target/release/bundle/nsis/*.exe
           if-no-files-found: error
 
       - name: Upload MSI package
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: msi-package
           path: target/release/bundle/msi/*.msi

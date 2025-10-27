@@ -5,6 +5,7 @@ class DnsStatus extends HTMLElement {
     super();
     this._retryHandle = null;
     this._hasSuccessfulLoad = false;
+    this._lastError = null;
   }
 
   connectedCallback() {
@@ -28,6 +29,9 @@ class DnsStatus extends HTMLElement {
   }
 
   renderLoading() {
+    const errorHint = this._lastError
+      ? `<p class="text-sm text-red-600 mt-2">Dernière erreur: ${this._lastError}</p>`
+      : `<p class="text-sm text-gray-500">Tentative automatique toutes les 2&nbsp;s...</p>`;
     this.innerHTML = `
       <div class="p-4 bg-gray-100 rounded">
         <h2 class="font-bold mb-2">DNS Status</h2>
@@ -35,6 +39,7 @@ class DnsStatus extends HTMLElement {
           <span class="spinner" aria-hidden="true"></span>
           <span>Connexion en cours...</span>
         </div>
+        ${errorHint}
       </div>`;
   }
 
@@ -64,11 +69,14 @@ class DnsStatus extends HTMLElement {
     try {
       const status = await dns_get_status();
       this._hasSuccessfulLoad = true;
+       this._lastError = null;
       this.renderSuccess(status);
     } catch (err) {
+      const message = err?.message || String(err);
+      this._lastError = message;
       if (this._hasSuccessfulLoad) {
         this.renderError(err);
-        showError(err.message || String(err));
+        showError(message);
       } else {
         this.renderLoading();
       }
@@ -78,4 +86,3 @@ class DnsStatus extends HTMLElement {
 }
 
 customElements.define('dns-status', DnsStatus);
-
