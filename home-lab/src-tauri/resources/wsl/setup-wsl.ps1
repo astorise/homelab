@@ -101,11 +101,32 @@ function Convert-ToWslPath {
     )
 
     $full = Convert-Path -LiteralPath $WindowsPath
-    $linux = (& wsl.exe -d $Distro -- wslpath -a "$full" 2>$null)
-    if ($LASTEXITCODE -ne 0 -or -not $linux) {
-        throw "Conversion en chemin WSL échouée pour $full"
+
+    $linux = & wsl.exe -d $Distro -- wslpath -a $full 2>&1
+    if ($LASTEXITCODE -eq 0 -and $linux) {
+        return $linux.Trim()
     }
-    return $linux.Trim()
+
+    if ($LASTEXITCODE -ne 0 -and $linux) {
+        $errorDetails = ($linux | Where-Object { $_ -and $_.Trim().Length -gt 0 }) -join "`n"
+    }
+
+    $normalized = $full
+    if ($normalized.StartsWith('\\?\')) {
+        $normalized = $normalized.Substring(4)
+    }
+
+    if ($normalized -match '^(?<drive>[A-Za-z]):(?<tail>\\.*)$') {
+        $drive = $Matches['drive'].ToLowerInvariant()
+        $tail = $Matches['tail'] -replace '\\', '/'
+        return "/mnt/$drive$tail"
+    }
+
+    if ($errorDetails) {
+        throw "Conversion en chemin WSL echouee pour $full :`n$errorDetails"
+    }
+
+    throw "Conversion en chemin WSL echouee pour $full"
 }
 
 function Escape-ShellSingleQuotes {
