@@ -289,7 +289,13 @@ export async function http_remove_route(arg1) {
 }
 
 export async function wsl_import_instance(options = {}) {
-  return safeInvoke('wsl_import_instance', options);
+  const payload = { ...options };
+  // eslint-disable-next-line no-console
+  console.info('[tauri.js] wsl_import_instance invoked', payload);
+  const result = await safeInvoke('wsl_import_instance', payload);
+  // eslint-disable-next-line no-console
+  console.info('[tauri.js] wsl_import_instance result', result);
+  return result;
 }
 
 export async function wsl_list_instances() {

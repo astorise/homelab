@@ -66,7 +66,7 @@ fn run_wsl_setup(app: &AppHandle, force_import: bool) -> Result<ProvisionResult>
     let resource_dir = app
         .path()
         .resource_dir()
-        .context("Impossible de récupérer le dossier des ressources")?;
+        .context("Impossible de recuperer le dossier des ressources")?;
     let wsl_dir = resource_dir.join("wsl");
     let script_path = wsl_dir.join("setup-wsl.ps1");
     if !script_path.exists() {
@@ -110,29 +110,39 @@ fn run_wsl_setup(app: &AppHandle, force_import: bool) -> Result<ProvisionResult>
 
     let output = command
         .output()
-        .with_context(|| "Impossible d'exécuter setup-wsl.ps1".to_string())?;
+        .with_context(|| "Impossible d'executer setup-wsl.ps1".to_string())?;
 
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
 
     if output.status.success() {
+        if !stdout.is_empty() {
+            info!(target: "wsl", "setup-wsl.ps1 stdout:\n{stdout}");
+        }
         if !stderr.is_empty() {
             warn!(target: "wsl", "setup-wsl.ps1 stderr: {stderr}");
         }
         let mut message = if !stdout.is_empty() {
             stdout
         } else {
-            String::from("Instance WSL importée avec succès.")
+            String::from("Instance WSL importee avec succes.")
         };
         if !stderr.is_empty() {
             if !message.is_empty() {
-                message.push_str("\n");
+                message.push('\n');
             }
             message.push_str(&stderr);
         }
-        info!(target: "wsl", "Import WSL terminé");
+        info!(target: "wsl", "Import WSL termine");
         Ok(ProvisionResult { ok: true, message })
     } else {
+        error!(
+            target: "wsl",
+            status = %output.status,
+            stdout = %stdout,
+            stderr = %stderr,
+            "setup-wsl.ps1 a echoue"
+        );
         let code = output
             .status
             .code()
@@ -143,7 +153,7 @@ fn run_wsl_setup(app: &AppHandle, force_import: bool) -> Result<ProvisionResult>
             combined = stdout;
         }
         if combined.is_empty() {
-            combined = format!("setup-wsl.ps1 a échoué (code {code})");
+            combined = format!("setup-wsl.ps1 a echoue (code {code})");
         }
         Err(anyhow!(combined))
     }

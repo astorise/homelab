@@ -203,7 +203,11 @@ class WslInstanceManager extends HTMLElement {
     if (this._busyAction) return;
     this.setBusy(force ? 'force' : 'import', force ? 'Réimport forcé en cours…' : 'Import en cours…');
     try {
+      // eslint-disable-next-line no-console
+      console.info('[WslInstanceManager] Import WSL demande', { force });
       const result = await wsl_import_instance({ force });
+      // eslint-disable-next-line no-console
+      console.info('[WslInstanceManager] Import WSL termine', result);
       if (!result?.ok) {
         throw new Error(result?.message || 'Import WSL échoué.');
       }
@@ -213,6 +217,8 @@ class WslInstanceManager extends HTMLElement {
         this._message = result.message || 'Instance importée.';
       }
     } catch (err) {
+      // eslint-disable-next-line no-console
+      console.error('[WslInstanceManager] Erreur import WSL', err);
       const message = err?.message || String(err);
       showError(message);
       this._messageState = 'error';

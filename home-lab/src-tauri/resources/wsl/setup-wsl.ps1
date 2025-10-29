@@ -97,6 +97,10 @@ function Remove-Distro {
                 Start-Sleep -Milliseconds 500
             }
         }
+        if (Test-Path -LiteralPath $TargetDir) {
+            throw "Le dossier existant $TargetDir n'a pas pu etre supprime malgre $maxAttempts tentatives."
+        }
+        Write-Info "Dossier $TargetDir supprime."
     }
 }
 
@@ -192,13 +196,24 @@ try {
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
     Ensure-WslBinary
 
+    Write-Info "Parametres d'execution :"
+    Write-Info "  - ForceImport = $($ForceImport.IsPresent)"
+    Write-Info "  - InstallDir  = $InstallDir"
+    Write-Info "  - Rootfs      = $Rootfs"
+
     $distros = @(Get-RegisteredDistros)
+    $detected = if ($distros.Count -gt 0) { $distros -join ', ' } else { '(aucune)' }
+    Write-Info "Distributions detectees : $detected"
+
     $alreadyPresent = $distros -contains $DistroName
 
     if ($ForceImport.IsPresent -and $alreadyPresent) {
+        Write-Info "Reimport force demande : suppression de $DistroName"
         Remove-Distro -Name $DistroName -TargetDir $InstallDir
         $distros = @(Get-RegisteredDistros)
         $alreadyPresent = $distros -contains $DistroName
+    } elseif ($ForceImport.IsPresent) {
+        Write-Info "Reimport force demande mais $DistroName est absent."
     }
 
     $needsImport = $ForceImport.IsPresent -or -not $alreadyPresent
