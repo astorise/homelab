@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use anyhow::{anyhow, Context, Result};
+use regex::Regex;
 use serde::Serialize;
 use tauri::{AppHandle, Manager};
 use tracing::{error, info, warn};
@@ -10,6 +11,20 @@ use tracing::{error, info, warn};
 pub struct ProvisionResult {
     ok: bool,
     message: String,
+}
+
+#[derive(Serialize)]
+pub struct WslOperationResult {
+    ok: bool,
+    message: String,
+}
+
+#[derive(Serialize, Clone, Debug)]
+pub struct WslInstance {
+    name: String,
+    state: String,
+    version: Option<String>,
+    is_default: bool,
 }
 
 fn resolve_install_dir(app: &AppHandle) -> Result<PathBuf> {
@@ -132,4 +147,163 @@ fn run_wsl_setup(app: &AppHandle, force_import: bool) -> Result<ProvisionResult>
         }
         Err(anyhow!(combined))
     }
+}
+
+fn parse_wsl_list_output(output: &str) -> Result<Vec<WslInstance>> {
+    let splitter = Regex::new(r"\s{2,}")?;
+    let mut instances = Vec::new();
+    let mut header_skipped = false;
+
+    for raw_line in output.lines() {
+        let trimmed = raw_line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        if !header_skipped {
+            header_skipped = true;
+            // Première ligne = en-tête (NAME/STATE/VERSION ou équivalent localisé).
+            continue;
+        }
+
+        let working = raw_line.trim_start();
+        let (is_default, without_marker) = if working.starts_with('*') {
+            (true, working.trim_start_matches('*').trim_start())
+        } else {
+            (false, working)
+        };
+
+        let columns: Vec<&str> = splitter
+            .split(without_marker)
+            .filter_map(|chunk| {
+                let value = chunk.trim();
+                if value.is_empty() {
+                    None
+                } else {
+                    Some(value)
+                }
+            })
+            .collect();
+
+        if columns.is_empty() {
+            continue;
+        }
+
+        let name = columns[0].to_string();
+        let state = columns
+            .get(1)
+            .map(|v| v.to_string())
+            .unwrap_or_else(String::new);
+        let version = columns
+            .get(2)
+            .map(|v| v.trim())
+            .filter(|v| !v.is_empty())
+            .map(|v| v.to_string());
+
+        instances.push(WslInstance {
+            name,
+            state,
+            version,
+            is_default,
+        });
+    }
+
+    Ok(instances)
+}
+
+fn collect_wsl_instances() -> Result<Vec<WslInstance>> {
+    let output = Command::new("wsl.exe")
+        .args(["--list", "--verbose", "--all"])
+        .output()
+        .context("Impossible d'exécuter wsl.exe --list --verbose --all")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let message = if !stderr.is_empty() {
+            stderr
+        } else if !stdout.is_empty() {
+            stdout
+        } else {
+            "wsl.exe --list a échoué".to_string()
+        };
+        return Err(anyhow!(message));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_wsl_list_output(stdout.as_ref())
+}
+
+fn run_wsl_unregister(name: &str) -> Result<WslOperationResult> {
+    if name.trim().is_empty() {
+        return Err(anyhow!("Le nom de l'instance WSL est requis"));
+    }
+
+    let output = Command::new("wsl.exe")
+        .args(["--unregister", name])
+        .output()
+        .with_context(|| format!("Impossible de supprimer l'instance WSL {name}"))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+
+    if output.status.success() {
+        let mut message = if !stdout.is_empty() {
+            stdout
+        } else {
+            format!("Instance WSL '{name}' supprimée.")
+        };
+        if !stderr.is_empty() {
+            if !message.is_empty() {
+                message.push('\n');
+            }
+            message.push_str(&stderr);
+        }
+        Ok(WslOperationResult { ok: true, message })
+    } else {
+        let mut combined = stderr;
+        if combined.is_empty() {
+            combined = stdout;
+        }
+        if combined.is_empty() {
+            combined = format!("Échec de la suppression de l'instance '{name}'.");
+        }
+        Err(anyhow!(combined))
+    }
+}
+
+#[tauri::command]
+pub async fn wsl_list_instances() -> Result<Vec<WslInstance>, String> {
+    info!(target: "wsl", "Listing des instances WSL");
+    tauri::async_runtime::spawn_blocking(collect_wsl_instances)
+        .await
+        .map_err(|e| {
+            error!(target: "wsl", "Erreur JoinHandle (list): {e}");
+            format!("Erreur interne: {e}")
+        })
+        .and_then(|result| result.map_err(|e| e.to_string()))
+}
+
+#[tauri::command]
+pub async fn wsl_remove_instance(name: String) -> Result<WslOperationResult, String> {
+    let trimmed = name.trim().to_string();
+    if trimmed.is_empty() {
+        return Err("Le nom de l'instance est requis.".into());
+    }
+
+    info!(target: "wsl", instance = %trimmed, "Suppression d'une instance WSL demandée");
+
+    let instance_name = trimmed.clone();
+    tauri::async_runtime::spawn_blocking(move || run_wsl_unregister(&instance_name))
+        .await
+        .map_err(|e| {
+            error!(target: "wsl", "Erreur JoinHandle (remove): {e}");
+            format!("Erreur interne: {e}")
+        })
+        .and_then(|result| {
+            result.map_err(|e| {
+                error!(target: "wsl", "Échec suppression WSL: {e}");
+                e.to_string()
+            })
+        })
 }

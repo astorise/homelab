@@ -50,6 +50,12 @@ const __MOCK = {
       { host: 'grafana.home', port: 3000 },
     ],
   },
+  wsl: {
+    instances: [
+      { name: 'home-lab', state: 'Running', version: '2', is_default: false },
+      { name: 'Ubuntu-22.04', state: 'Stopped', version: '2', is_default: false },
+    ],
+  },
 };
 
 async function mockInvoke(cmd, args = {}) {
@@ -130,10 +136,35 @@ async function mockInvoke(cmd, args = {}) {
     }
 
     case 'wsl_import_instance': {
+      if (!__MOCK.wsl.instances.some((inst) => inst.name === 'home-lab')) {
+        __MOCK.wsl.instances.push({
+          name: 'home-lab',
+          state: 'Stopped',
+          version: '2',
+          is_default: false,
+        });
+      }
       return {
         ok: true,
         message: args?.force ? 'Réimport forcé (mock).' : 'Import WSL simulé (mock).',
       };
+    }
+
+    case 'wsl_list_instances': {
+      return __MOCK.wsl.instances.map((inst) => ({ ...inst }));
+    }
+
+    case 'wsl_remove_instance': {
+      const name = (args?.name || args?.id || '').trim();
+      if (!name) {
+        return { ok: false, message: "Nom d'instance invalide." };
+      }
+      const before = __MOCK.wsl.instances.length;
+      __MOCK.wsl.instances = __MOCK.wsl.instances.filter((inst) => inst.name !== name);
+      const removed = __MOCK.wsl.instances.length !== before;
+      return removed
+        ? { ok: true, message: `Instance ${name} supprimée (mock).` }
+        : { ok: false, message: `Instance ${name} introuvable (mock).` };
     }
 
     default:
@@ -259,4 +290,17 @@ export async function http_remove_route(arg1) {
 
 export async function wsl_import_instance(options = {}) {
   return safeInvoke('wsl_import_instance', options);
+}
+
+export async function wsl_list_instances() {
+  const res = await safeInvoke('wsl_list_instances');
+  return Array.isArray(res) ? res : res?.instances ?? [];
+}
+
+export async function wsl_remove_instance(name) {
+  const value = typeof name === 'string' ? name.trim() : '';
+  if (!value) {
+    throw new Error("Le nom de l'instance WSL est requis.");
+  }
+  return safeInvoke('wsl_remove_instance', { name: value });
 }
