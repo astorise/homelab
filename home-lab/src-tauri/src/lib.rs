@@ -160,6 +160,8 @@ pub fn run() {
             http::http_add_route,
             http::http_remove_route,
             wsl::wsl_import_instance,
+            wsl::wsl_list_instances,
+            wsl::wsl_remove_instance,
             ui::ui_log,
         ])
         .run(tauri::generate_context!())

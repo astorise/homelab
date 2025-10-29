@@ -1949,6 +1949,7 @@ dependencies = [
  "png 0.18.0",
  "prost 0.14.1",
  "protoc-bin-vendored",
+ "regex",
  "resvg",
  "serde",
  "serde_json",
