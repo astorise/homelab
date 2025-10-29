@@ -23,7 +23,7 @@ function Ensure-WslBinary {
 function Get-RegisteredDistros {
     $list = & wsl.exe -l -q 2>$null
     if ($LASTEXITCODE -ne 0) {
-        throw "Impossible de récupérer la liste des distributions WSL (code $LASTEXITCODE)."
+        throw "Impossible de recuperer la liste des distributions WSL (code $LASTEXITCODE)."
     }
     $list | Where-Object { $_ -and ($_.Trim().Length -gt 0) } | ForEach-Object { $_.Trim() }
 }
@@ -40,7 +40,7 @@ function Import-Distro {
     }
 
     if (-not (Test-Path -LiteralPath $TargetDir)) {
-        Write-Info "Création du dossier cible $TargetDir"
+        Write-Info "Creation du dossier cible $TargetDir"
         New-Item -ItemType Directory -Path $TargetDir -Force | Out-Null
     }
 
@@ -62,17 +62,55 @@ function Import-Distro {
     }
 }
 
+function Remove-Distro {
+    param(
+        [string]$Name,
+        [string]$TargetDir
+    )
+
+    Write-Info "Suppression de la distribution $Name existante"
+    $std = & wsl.exe --unregister $Name 2>&1
+    $exitCode = $LASTEXITCODE
+
+    if ($exitCode -ne 0) {
+        $details = ($std | Where-Object { $_ -and $_.Trim().Length -gt 0 }) -join "`n"
+        if ($details) {
+            throw "Suppression WSL echoue (code $exitCode) :`n$details"
+        }
+        throw "Suppression WSL echoue (code $exitCode)"
+    }
+
+    if ($std) {
+        Write-Info ("wsl.exe a renvoye:" + [Environment]::NewLine + ($std -join [Environment]::NewLine))
+    }
+
+    $maxAttempts = 10
+    if (Test-Path -LiteralPath $TargetDir) {
+        for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+            try {
+                Remove-Item -LiteralPath $TargetDir -Recurse -Force -ErrorAction Stop
+                break
+            } catch {
+                if ($attempt -eq $maxAttempts) {
+                    throw "Impossible de supprimer le dossier existant $TargetDir : $($_.Exception.Message)"
+                }
+                Start-Sleep -Milliseconds 500
+            }
+        }
+    }
+}
+
 function Get-LatestK3sReleaseTag {
     $uri = 'https://api.github.com/repos/k3s-io/k3s/releases/latest'
     $headers = @{ 'User-Agent' = 'home-lab-installer' }
     try {
         $resp = Invoke-RestMethod -Uri $uri -Headers $headers
         if (-not $resp.tag_name) {
-            throw 'Réponse GitHub inattendue (tag_name absent).'
+            throw 'Reponse GitHub inattendue (tag_name absent).'
         }
         return [string]$resp.tag_name
     } catch {
-        throw "Impossible de récupérer la version k3s: $($_.Exception.Message)"
+        throw "Impossible de recuperer la version k3s: $($_.Exception.Message)"
     }
 }
 
@@ -84,11 +122,11 @@ function Download-K3sBinary {
     $downloadUri = "https://github.com/k3s-io/k3s/releases/download/$Tag/k3s"
     $tempFile = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), "k3s-$Tag")
 
-    Write-Info "Téléchargement de k3s ($Tag) ..."
+    Write-Info "Telechargement de k3s ($Tag) ..."
     try {
         Invoke-WebRequest -Uri $downloadUri -OutFile $tempFile -UseBasicParsing | Out-Null
     } catch {
-        throw "Téléchargement de k3s échoué: $($_.Exception.Message)"
+        throw "Telechargement de k3s echoue: $($_.Exception.Message)"
     }
 
     return $tempFile
@@ -146,7 +184,7 @@ function Install-K3sBinary {
     Write-Info "Installation de k3s dans la distribution $Distro"
     $p = Start-Process -FilePath 'wsl.exe' -ArgumentList @('-d', $Distro, '--', 'sh', '-c', $cmd) -Wait -PassThru -NoNewWindow
     if ($p.ExitCode -ne 0) {
-        throw "Installation de k3s échouée (code $($p.ExitCode))"
+        throw "Installation de k3s echouee (code $($p.ExitCode))"
     }
 }
 
@@ -155,12 +193,20 @@ try {
     Ensure-WslBinary
 
     $distros = @(Get-RegisteredDistros)
-    $needsImport = $ForceImport.IsPresent -or -not ($distros -contains $DistroName)
+    $alreadyPresent = $distros -contains $DistroName
+
+    if ($ForceImport.IsPresent -and $alreadyPresent) {
+        Remove-Distro -Name $DistroName -TargetDir $InstallDir
+        $distros = @(Get-RegisteredDistros)
+        $alreadyPresent = $distros -contains $DistroName
+    }
+
+    $needsImport = $ForceImport.IsPresent -or -not $alreadyPresent
 
     if ($needsImport) {
         Import-Distro -Name $DistroName -TargetDir $InstallDir -TarPath $Rootfs
     } else {
-        Write-Info "Distribution $DistroName déjà présente, import ignoré."
+        Write-Info "Distribution $DistroName deja presente, import ignore."
     }
 
     $tag = Get-LatestK3sReleaseTag
@@ -174,7 +220,7 @@ try {
         }
     }
 
-    Write-Info "Configuration WSL terminée."
+    Write-Info "Configuration WSL terminee."
     exit 0
 } catch {
     Write-Error "[wsl-setup] $($_.Exception.Message)"
