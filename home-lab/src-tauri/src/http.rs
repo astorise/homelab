@@ -8,7 +8,6 @@ use std::{
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient};
-use tokio::sync::OnceCell;
 use tonic::transport::{Endpoint, Uri};
 use tower::service_fn;
 use tracing::{debug, error, info, instrument, warn};
@@ -30,8 +29,6 @@ const PIPE_RELEASE: &str = r"\\.\pipe\home-http";
 const PIPE_DEV: &str = r"\\.\pipe\home-http-dev";
 
 type HttpClient = HomeHttpClient<tonic::transport::Channel>;
-
-static CLIENT: OnceCell<HttpClient> = OnceCell::const_new();
 
 fn pipe_candidates() -> &'static [&'static str] {
     #[cfg(debug_assertions)]
@@ -89,48 +86,44 @@ impl AsyncWrite for SendablePipeClient {
 }
 
 // Establishes a connection to the gRPC service over a named pipe.
-async fn get_client() -> Result<&'static HttpClient, String> {
-    CLIENT
-        .get_or_try_init(|| async {
-            let mut last_error = None;
-            for pipe in pipe_candidates() {
-                info!("Attempting HTTP gRPC connection via {}", pipe);
-                let pipe_path = pipe.to_string();
-                match Endpoint::try_from("http://[::]:50051")
-                    .unwrap()
-                    .connect_with_connector(service_fn(move |_uri: Uri| {
-                        let path = pipe_path.clone();
-                        async move {
-                            ClientOptions::new()
-                                .open(&path)
-                                .map(SendablePipeClient::new)
-                                .map(TokioIo::new)
-                        }
-                    }))
-                    .await
-                {
-                    Ok(channel) => {
-                        info!("Connected to HTTP gRPC service via {}", pipe);
-                        return Ok(HomeHttpClient::new(channel));
-                    }
-                    Err(err) => {
-                        warn!(error = ?err, "HTTP pipe {} connection failed", pipe);
-                        last_error = Some(err);
-                    }
+async fn connect_client() -> Result<HttpClient, String> {
+    let mut last_error = None;
+    for pipe in pipe_candidates() {
+        info!("Attempting HTTP gRPC connection via {}", pipe);
+        let pipe_path = pipe.to_string();
+        match Endpoint::try_from("http://[::]:50051")
+            .unwrap()
+            .connect_with_connector(service_fn(move |_uri: Uri| {
+                let path = pipe_path.clone();
+                async move {
+                    ClientOptions::new()
+                        .open(&path)
+                        .map(SendablePipeClient::new)
+                        .map(TokioIo::new)
                 }
+            }))
+            .await
+        {
+            Ok(channel) => {
+                info!("Connected to HTTP gRPC service via {}", pipe);
+                return Ok(HomeHttpClient::new(channel));
             }
+            Err(err) => {
+                warn!(error = ?err, "HTTP pipe {} connection failed", pipe);
+                last_error = Some(err);
+            }
+        }
+    }
 
-            let err = last_error
-                .map(|e| e.to_string())
-                .unwrap_or_else(|| "no pipe candidates available".to_string());
-            let msg = format!(
-                "Failed to connect to HTTP service: {}. Is the service running?",
-                err
-            );
-            error!("{}", msg);
-            Err(msg)
-        })
-        .await
+    let err = last_error
+        .map(|e| e.to_string())
+        .unwrap_or_else(|| "no pipe candidates available".to_string());
+    let msg = format!(
+        "Failed to connect to HTTP service: {}. Is the service running?",
+        err
+    );
+    error!("{}", msg);
+    Err(msg)
 }
 
 // Data structures for Tauri commands (serializable)
@@ -163,9 +156,8 @@ pub struct ListRoutesOut {
 #[instrument(level = "debug")]
 pub async fn http_get_status() -> Result<StatusOut, String> {
     debug!("Requesting HTTP service status");
-    let client = get_client().await?;
+    let mut client = connect_client().await?;
     let response = client
-        .clone()
         .get_status(Empty {})
         .await
         .map_err(|e| e.to_string())?;
@@ -181,9 +173,8 @@ pub async fn http_get_status() -> Result<StatusOut, String> {
 #[instrument(level = "debug")]
 pub async fn http_reload_config() -> Result<AckOut, String> {
     debug!("Sending HTTP reload configuration command");
-    let client = get_client().await?;
+    let mut client = connect_client().await?;
     let response = client
-        .clone()
         .reload_config(Empty {})
         .await
         .map_err(|e| e.to_string())?;
@@ -199,9 +190,8 @@ pub async fn http_reload_config() -> Result<AckOut, String> {
 #[instrument(level = "debug")]
 pub async fn http_stop_service() -> Result<AckOut, String> {
     debug!("Sending HTTP stop service command");
-    let client = get_client().await?;
+    let mut client = connect_client().await?;
     let response = client
-        .clone()
         .stop_service(Empty {})
         .await
         .map_err(|e| e.to_string())?;
@@ -217,9 +207,8 @@ pub async fn http_stop_service() -> Result<AckOut, String> {
 #[instrument(level = "debug")]
 pub async fn http_list_routes() -> Result<ListRoutesOut, String> {
     debug!("Requesting HTTP route list");
-    let client = get_client().await?;
+    let mut client = connect_client().await?;
     let response = client
-        .clone()
         .list_routes(Empty {})
         .await
         .map_err(|e| e.to_string())?;
@@ -241,13 +230,9 @@ pub async fn http_list_routes() -> Result<ListRoutesOut, String> {
 #[instrument(level = "debug")]
 pub async fn http_add_route(host: String, port: u32) -> Result<AckOut, String> {
     debug!(host = %host, port, "Adding HTTP route via RPC");
-    let client = get_client().await?;
+    let mut client = connect_client().await?;
     let req = AddRouteRequest { host, port };
-    let response = client
-        .clone()
-        .add_route(req)
-        .await
-        .map_err(|e| e.to_string())?;
+    let response = client.add_route(req).await.map_err(|e| e.to_string())?;
     let ack = response.into_inner();
     info!(ok = ack.ok, message = %ack.message, "HTTP add route acknowledged");
     Ok(AckOut {
@@ -260,13 +245,9 @@ pub async fn http_add_route(host: String, port: u32) -> Result<AckOut, String> {
 #[instrument(level = "debug")]
 pub async fn http_remove_route(host: String) -> Result<AckOut, String> {
     debug!(host = %host, "Removing HTTP route via RPC");
-    let client = get_client().await?;
+    let mut client = connect_client().await?;
     let req = RemoveRouteRequest { host };
-    let response = client
-        .clone()
-        .remove_route(req)
-        .await
-        .map_err(|e| e.to_string())?;
+    let response = client.remove_route(req).await.map_err(|e| e.to_string())?;
     let ack = response.into_inner();
     info!(ok = ack.ok, message = %ack.message, "HTTP remove route acknowledged");
     Ok(AckOut {

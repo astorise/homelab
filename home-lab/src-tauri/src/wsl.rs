@@ -278,7 +278,6 @@ fn collect_wsl_instances() -> Result<Vec<WslInstance>> {
     parse_wsl_list_output(stdout.as_str())
 }
 
-
 fn run_wsl_unregister(name: &str) -> Result<WslOperationResult> {
     if name.trim().is_empty() {
         return Err(anyhow!("Le nom de l'instance WSL est requis"));
@@ -318,6 +317,29 @@ fn run_wsl_unregister(name: &str) -> Result<WslOperationResult> {
         );
         Ok(WslOperationResult { ok: true, message })
     } else {
+        let lower_stdout = stdout_trim.to_lowercase();
+        let lower_stderr = stderr_trim.to_lowercase();
+        let not_found = lower_stdout.contains("wsl_e_distro_not_found")
+            || lower_stderr.contains("wsl_e_distro_not_found")
+            || lower_stdout.contains("no distribution")
+            || lower_stderr.contains("no distribution")
+            || lower_stdout.contains("aucune distribution")
+            || lower_stderr.contains("aucune distribution");
+
+        if not_found {
+            info!(
+                target: "wsl",
+                instance = name,
+                stdout = %stdout_trim,
+                stderr = %stderr_trim,
+                "Suppression WSL consideree comme deja effectuee (distribution absente)"
+            );
+            return Ok(WslOperationResult {
+                ok: true,
+                message: format!("Instance WSL '{name}' introuvable ou deja supprimee."),
+            });
+        }
+
         let mut combined = stderr_trim.to_string();
         if combined.is_empty() {
             combined = stdout_trim.to_string();
@@ -341,8 +363,6 @@ fn run_wsl_unregister(name: &str) -> Result<WslOperationResult> {
         Err(anyhow!(combined))
     }
 }
-
-
 
 #[tauri::command]
 pub async fn wsl_list_instances() -> Result<Vec<WslInstance>, String> {
