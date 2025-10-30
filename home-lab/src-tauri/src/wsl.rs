@@ -27,6 +27,26 @@ pub struct WslInstance {
     is_default: bool,
 }
 
+fn decode_cli_output(data: &[u8]) -> String {
+    if data.is_empty() {
+        return String::new();
+    }
+
+    if let Ok(utf8) = std::str::from_utf8(data) {
+        return utf8.to_string();
+    }
+
+    if data.len() % 2 == 0 {
+        let utf16: Vec<u16> = data
+            .chunks_exact(2)
+            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+            .collect();
+        return String::from_utf16_lossy(&utf16);
+    }
+
+    String::from_utf8_lossy(data).into_owned()
+}
+
 fn resolve_install_dir(app: &AppHandle) -> Result<PathBuf> {
     if let Some(pd) = std::env::var_os("PROGRAMDATA") {
         return Ok(PathBuf::from(pd).join("home-lab").join("wsl"));
@@ -112,8 +132,8 @@ fn run_wsl_setup(app: &AppHandle, force_import: bool) -> Result<ProvisionResult>
         .output()
         .with_context(|| "Impossible d'executer setup-wsl.ps1".to_string())?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = decode_cli_output(&output.stdout);
+    let stderr = decode_cli_output(&output.stderr);
 
     if output.status.success() {
         if !stdout.is_empty() {
@@ -225,62 +245,104 @@ fn collect_wsl_instances() -> Result<Vec<WslInstance>> {
     let output = Command::new("wsl.exe")
         .args(["--list", "--verbose", "--all"])
         .output()
-        .context("Impossible d'exécuter wsl.exe --list --verbose --all")?;
+        .context("Impossible d'executer wsl.exe --list --verbose --all")?;
+
+    let stdout = decode_cli_output(&output.stdout);
+    let stderr = decode_cli_output(&output.stderr);
 
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let message = if !stderr.is_empty() {
-            stderr
-        } else if !stdout.is_empty() {
-            stdout
+        let stdout_trim = stdout.trim();
+        let stderr_trim = stderr.trim();
+        let lower_stdout = stdout_trim.to_lowercase();
+        let lower_stderr = stderr_trim.to_lowercase();
+        let no_distro = lower_stdout.contains("no installed distributions")
+            || lower_stdout.contains("aucune distribution install")
+            || lower_stderr.contains("no installed distributions")
+            || lower_stderr.contains("aucune distribution install");
+
+        if no_distro {
+            info!(target: "wsl", "wsl.exe indique qu'aucune distribution n'est installee");
+            return Ok(Vec::new());
+        }
+
+        let message = if !stderr_trim.is_empty() {
+            stderr_trim.to_string()
+        } else if !stdout_trim.is_empty() {
+            stdout_trim.to_string()
         } else {
-            "wsl.exe --list a échoué".to_string()
+            "wsl.exe --list a echoue".to_string()
         };
         return Err(anyhow!(message));
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    parse_wsl_list_output(stdout.as_ref())
+    parse_wsl_list_output(stdout.as_str())
 }
+
 
 fn run_wsl_unregister(name: &str) -> Result<WslOperationResult> {
     if name.trim().is_empty() {
         return Err(anyhow!("Le nom de l'instance WSL est requis"));
     }
 
+    info!(target: "wsl", instance = name, "Appel wsl.exe --unregister");
+
     let output = Command::new("wsl.exe")
         .args(["--unregister", name])
         .output()
         .with_context(|| format!("Impossible de supprimer l'instance WSL {name}"))?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = decode_cli_output(&output.stdout);
+    let stderr = decode_cli_output(&output.stderr);
+    let stdout_trim = stdout.trim();
+    let stderr_trim = stderr.trim();
 
     if output.status.success() {
-        let mut message = if !stdout.is_empty() {
-            stdout
+        let mut message = if !stdout_trim.is_empty() {
+            stdout_trim.to_string()
         } else {
-            format!("Instance WSL '{name}' supprimée.")
+            format!("Instance WSL '{name}' supprimee.")
         };
-        if !stderr.is_empty() {
+        if !stderr_trim.is_empty() && stderr_trim != message {
             if !message.is_empty() {
                 message.push('\n');
             }
-            message.push_str(&stderr);
+            message.push_str(stderr_trim);
         }
+        info!(
+            target: "wsl",
+            instance = name,
+            status = %output.status,
+            stdout = %stdout_trim,
+            stderr = %stderr_trim,
+            "Instance WSL supprimee"
+        );
         Ok(WslOperationResult { ok: true, message })
     } else {
-        let mut combined = stderr;
+        let mut combined = stderr_trim.to_string();
         if combined.is_empty() {
-            combined = stdout;
+            combined = stdout_trim.to_string();
         }
         if combined.is_empty() {
-            combined = format!("Échec de la suppression de l'instance '{name}'.");
+            let code = output
+                .status
+                .code()
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "(code inconnu)".into());
+            combined = format!("Suppression de l'instance '{name}' a echoue (code {code})");
         }
+        error!(
+            target: "wsl",
+            instance = name,
+            status = %output.status,
+            stdout = %stdout_trim,
+            stderr = %stderr_trim,
+            "Suppression WSL a echoue"
+        );
         Err(anyhow!(combined))
     }
 }
+
+
 
 #[tauri::command]
 pub async fn wsl_list_instances() -> Result<Vec<WslInstance>, String> {
