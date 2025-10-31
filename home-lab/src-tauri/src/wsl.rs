@@ -1,9 +1,8 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-use anyhow::{anyhow, Context, Result};
 use regex::Regex;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager};
 use tracing::{error, info, warn};
 
@@ -376,9 +375,14 @@ pub async fn wsl_list_instances() -> Result<Vec<WslInstance>, String> {
         .and_then(|result| result.map_err(|e| e.to_string()))
 }
 
+#[derive(serde::Deserialize)]
+pub struct WslRemoveInstanceArgs {
+    name: String,
+}
+
 #[tauri::command]
-pub async fn wsl_remove_instance(name: String) -> Result<WslOperationResult, String> {
-    let trimmed = name.trim().to_string();
+pub async fn wsl_remove_instance(args: WslRemoveInstanceArgs) -> Result<WslOperationResult, String> {
+    let trimmed = args.name.trim().to_string();
     if trimmed.is_empty() {
         return Err("Le nom de l'instance est requis.".into());
     }
