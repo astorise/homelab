@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 use std::process::Command;
 
+use anyhow::{anyhow, Context, Result};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager};
@@ -375,7 +376,7 @@ pub async fn wsl_list_instances() -> Result<Vec<WslInstance>, String> {
         .and_then(|result| result.map_err(|e| e.to_string()))
 }
 
-#[derive(serde::Deserialize)]
+#[derive(Deserialize)]
 pub struct WslRemoveInstanceArgs {
     name: String,
 }
