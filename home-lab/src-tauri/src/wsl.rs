@@ -3,7 +3,7 @@ use std::process::Command;
 
 use anyhow::{anyhow, Context, Result};
 use regex::Regex;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use tauri::{AppHandle, Manager};
 use tracing::{error, info, warn};
 
@@ -376,22 +376,19 @@ pub async fn wsl_list_instances() -> Result<Vec<WslInstance>, String> {
         .and_then(|result| result.map_err(|e| e.to_string()))
 }
 
-#[derive(Deserialize)]
-pub struct WslRemoveInstanceArgs {
-    name: String,
-}
-
 #[tauri::command]
-pub async fn wsl_remove_instance(args: WslRemoveInstanceArgs) -> Result<WslOperationResult, String> {
-    let trimmed = args.name.trim().to_string();
-    if trimmed.is_empty() {
+pub async fn wsl_remove_instance(name: String) -> Result<WslOperationResult, String> {
+    let instance_name = name.trim().to_string();
+    if instance_name.is_empty() {
         return Err("Le nom de l'instance est requis.".into());
     }
 
-    info!(target: "wsl", instance = %trimmed, "Suppression d'une instance WSL demandée");
+    info!(target: "wsl", instance = %instance_name, "Suppression d'une instance WSL demandée");
 
-    let instance_name = trimmed.clone();
-    tauri::async_runtime::spawn_blocking(move || run_wsl_unregister(&instance_name))
+    tauri::async_runtime::spawn_blocking({
+        let instance_name = instance_name.clone();
+        move || run_wsl_unregister(&instance_name)
+    })
         .await
         .map_err(|e| {
             error!(target: "wsl", "Erreur JoinHandle (remove): {e}");
