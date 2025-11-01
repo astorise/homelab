@@ -73,6 +73,33 @@ fn format_cli_command(program: &str, args: &[&str]) -> String {
     format!("{} {}", program, rendered_args.join(" "))
 }
 
+fn sanitize_cli_field(value: &str) -> String {
+    fn is_disallowed(c: char) -> bool {
+        matches!(
+            c,
+            '\u{200b}'
+                | '\u{200c}'
+                | '\u{200d}'
+                | '\u{200e}'
+                | '\u{200f}'
+                | '\u{202a}'
+                | '\u{202b}'
+                | '\u{202c}'
+                | '\u{202d}'
+                | '\u{202e}'
+                | '\u{2066}'
+                | '\u{2067}'
+                | '\u{2068}'
+                | '\u{2069}'
+                | '\u{feff}'
+                | '\u{fffd}'
+        ) || c.is_control()
+    }
+
+    let filtered: String = value.chars().filter(|c| !is_disallowed(*c)).collect();
+    filtered.trim().to_string()
+}
+
 fn resolve_install_dir(app: &AppHandle) -> Result<PathBuf> {
     if let Some(pd) = std::env::var_os("PROGRAMDATA") {
         return Ok(PathBuf::from(pd).join("home-lab").join("wsl"));
@@ -274,16 +301,26 @@ fn parse_wsl_list_output(output: &str) -> Result<Vec<WslInstance>> {
             continue;
         }
 
-        let name = columns[0].to_string();
+        let name = sanitize_cli_field(columns[0]);
+        if name.is_empty() {
+            warn!(
+                target: "wsl",
+                line = %escape_for_log(raw_line),
+                "Nom d'instance WSL vide apres nettoyage; ligne ignoree"
+            );
+            continue;
+        }
         let state = columns
             .get(1)
-            .map(|v| v.to_string())
+            .map(|v| sanitize_cli_field(v))
             .unwrap_or_else(String::new);
-        let version = columns
-            .get(2)
-            .map(|v| v.trim())
-            .filter(|v| !v.is_empty())
-            .map(|v| v.to_string());
+        let version = columns.get(2).map(|v| sanitize_cli_field(v)).and_then(|v| {
+            if v.is_empty() {
+                None
+            } else {
+                Some(v)
+            }
+        });
 
         instances.push(WslInstance {
             name,
@@ -480,11 +517,26 @@ pub async fn wsl_list_instances() -> Result<Vec<WslInstance>, String> {
 
 #[tauri::command]
 pub async fn wsl_remove_instance(name: String) -> Result<WslOperationResult, String> {
-    let instance_name = name.trim().to_string();
-    if instance_name.is_empty() {
+    let raw_trimmed = name.trim();
+    if raw_trimmed.is_empty() {
         return Err("Le nom de l'instance est requis.".into());
     }
 
+    let sanitized = sanitize_cli_field(raw_trimmed);
+    if sanitized.is_empty() {
+        return Err("Le nom de l'instance est invalide.".into());
+    }
+
+    if sanitized != raw_trimmed {
+        info!(
+            target: "wsl",
+            instance_raw = %escape_for_log(raw_trimmed),
+            instance_sanitized = %escape_for_log(&sanitized),
+            "Nom d'instance WSL nettoyé avant suppression"
+        );
+    }
+
+    let instance_name = sanitized;
     let instance_debug = escape_for_log(&instance_name);
     info!(
         target: "wsl",

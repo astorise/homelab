@@ -46,6 +46,9 @@ futures-util = "0.3.30"
 pin-project = "1.1.5"
 hyper-util = { version = "0.1", features = ["tokio"] }
 
+[dev-dependencies]
+tempfile = "3"
+
 
 [[bin]]
 name = "homelab-tauri"

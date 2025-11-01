@@ -1957,6 +1957,7 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-log",
  "tauri-plugin-opener",
+ "tempfile",
  "tiny-skia",
  "tokio",
  "tokio-stream",
