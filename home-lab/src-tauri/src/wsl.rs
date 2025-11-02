@@ -262,7 +262,7 @@ fn run_wsl_setup(app: &AppHandle, force_import: bool) -> Result<ProvisionResult>
 }
 
 fn parse_wsl_list_output(output: &str) -> Result<Vec<WslInstance>> {
-    let splitter = Regex::new(r"\s{2,}")?;
+    let entry_re = Regex::new(r"^(?P<name>.+?)\s{2,}(?P<state>\S.*?)(?:\s{2,}(?P<version>\S+))?$")?;
     let mut instances = Vec::new();
     let mut header_skipped = false;
 
@@ -285,23 +285,29 @@ fn parse_wsl_list_output(output: &str) -> Result<Vec<WslInstance>> {
             (false, working)
         };
 
-        let columns: Vec<&str> = splitter
-            .split(without_marker)
-            .filter_map(|chunk| {
-                let value = chunk.trim();
-                if value.is_empty() {
-                    None
-                } else {
-                    Some(value)
-                }
-            })
-            .collect();
-
-        if columns.is_empty() {
+        if without_marker.is_empty() {
+            warn!(
+                target: "wsl",
+                line = %escape_for_log(raw_line),
+                "Ligne WSL vide apres retrait du marqueur par defaut; ignoree"
+            );
             continue;
         }
 
-        let name = sanitize_cli_field(columns[0]);
+        let Some(caps) = entry_re.captures(without_marker) else {
+            warn!(
+                target: "wsl",
+                line = %escape_for_log(without_marker),
+                "Impossible d'analyser la ligne WSL; ligne ignoree"
+            );
+            continue;
+        };
+
+        let name_raw = caps.name("name").map(|m| m.as_str()).unwrap_or_default();
+        let state_raw = caps.name("state").map(|m| m.as_str()).unwrap_or_default();
+        let version_raw = caps.name("version").map(|m| m.as_str());
+
+        let name = sanitize_cli_field(name_raw);
         if name.is_empty() {
             warn!(
                 target: "wsl",
@@ -310,17 +316,12 @@ fn parse_wsl_list_output(output: &str) -> Result<Vec<WslInstance>> {
             );
             continue;
         }
-        let state = columns
-            .get(1)
-            .map(|v| sanitize_cli_field(v))
-            .unwrap_or_else(String::new);
-        let version = columns.get(2).map(|v| sanitize_cli_field(v)).and_then(|v| {
-            if v.is_empty() {
-                None
-            } else {
-                Some(v)
-            }
-        });
+
+        let state = sanitize_cli_field(state_raw);
+        let version =
+            version_raw
+                .map(sanitize_cli_field)
+                .and_then(|v| if v.is_empty() { None } else { Some(v) });
 
         instances.push(WslInstance {
             name,
