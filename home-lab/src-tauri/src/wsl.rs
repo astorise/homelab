@@ -1,5 +1,9 @@
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::{Mutex, OnceLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 use regex::Regex;
@@ -73,6 +77,56 @@ fn format_cli_command(program: &str, args: &[&str]) -> String {
     format!("{} {}", program, rendered_args.join(" "))
 }
 
+static WSL_LOG_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn wsl_log_lock() -> &'static Mutex<()> {
+    WSL_LOG_LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn wsl_log_file_path() -> PathBuf {
+    let base = std::env::var_os("PROGRAMDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir());
+    base.join("home-lab").join("logs").join("wsl-actions.log")
+}
+
+fn epoch_timestamp() -> String {
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(duration) => {
+            let secs = duration.as_secs();
+            let millis = duration.subsec_millis();
+            format!("{secs}.{millis:03}")
+        }
+        Err(_) => "0".to_string(),
+    }
+}
+
+fn append_wsl_log(message: &str) -> std::io::Result<()> {
+    let path = wsl_log_file_path();
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+
+    writeln!(file, "[{}] {}", epoch_timestamp(), message)?;
+    Ok(())
+}
+
+fn log_wsl_event(message: impl AsRef<str>) {
+    let sanitized = message.as_ref().replace('\r', "\\r").replace('\n', "\\n");
+
+    let lock = wsl_log_lock().lock();
+    if let Ok(_guard) = lock {
+        if let Err(err) = append_wsl_log(&sanitized) {
+            warn!(target: "wsl", "Echec ecriture log WSL: {err}");
+        }
+    } else {
+        warn!(target: "wsl", "Impossible d'obtenir le verrou du journal WSL");
+    }
+}
+
 fn sanitize_cli_field(value: &str) -> String {
     fn is_disallowed(c: char) -> bool {
         matches!(
@@ -119,17 +173,20 @@ pub async fn wsl_import_instance(
     let force_import = force.unwrap_or(false);
     let handle = app.clone();
 
+    log_wsl_event(format!("Demande d'import WSL (force={})", force_import));
     info!(target: "wsl", force = force_import, "Demande d'import WSL reçue");
 
     tauri::async_runtime::spawn_blocking(move || run_wsl_setup(&handle, force_import))
         .await
         .map_err(|e| {
             error!(target: "wsl", "Erreur JoinHandle: {e}");
+            log_wsl_event(format!("Erreur JoinHandle pendant l'import WSL: {e}"));
             format!("Erreur interne: {e}")
         })
         .and_then(|result| {
             result.map_err(|e| {
                 error!(target: "wsl", "Échec import WSL: {e}");
+                log_wsl_event(format!("Échec import WSL: {e}"));
                 e.to_string()
             })
         })
@@ -164,6 +221,13 @@ fn run_wsl_setup(app: &AppHandle, force_import: bool) -> Result<ProvisionResult>
         force = force_import,
         "Lancement de setup-wsl.ps1"
     );
+    log_wsl_event(format!(
+        "Lancement de setup-wsl.ps1 (force={}, script={}, rootfs={}, install={})",
+        force_import,
+        script_path.display(),
+        rootfs_path.display(),
+        install_dir.display()
+    ));
 
     let mut command = Command::new("powershell.exe");
     command
@@ -196,6 +260,10 @@ fn run_wsl_setup(app: &AppHandle, force_import: bool) -> Result<ProvisionResult>
         command = %command_preview,
         "Execution d'une commande WSL (setup)"
     );
+    log_wsl_event(format!(
+        "Execution commande WSL (setup): {}",
+        command_preview
+    ));
 
     let output = command
         .output()
@@ -216,6 +284,10 @@ fn run_wsl_setup(app: &AppHandle, force_import: bool) -> Result<ProvisionResult>
         stderr = %stderr_log,
         "Commande WSL terminee (setup)"
     );
+    log_wsl_event(format!(
+        "Commande terminee (setup) status={} stdout={} stderr={}",
+        output.status, stdout_log, stderr_log
+    ));
 
     if output.status.success() {
         if !stdout_trim.is_empty() {
@@ -236,6 +308,7 @@ fn run_wsl_setup(app: &AppHandle, force_import: bool) -> Result<ProvisionResult>
             message.push_str(stderr_trim);
         }
         info!(target: "wsl", "Import WSL termine");
+        log_wsl_event(format!("Import WSL termine: {}", escape_for_log(&message)));
         Ok(ProvisionResult { ok: true, message })
     } else {
         error!(
@@ -245,6 +318,10 @@ fn run_wsl_setup(app: &AppHandle, force_import: bool) -> Result<ProvisionResult>
             stderr = %stderr_log,
             "setup-wsl.ps1 a echoue"
         );
+        log_wsl_event(format!(
+            "setup-wsl.ps1 a echoue: status={} stdout={} stderr={}",
+            output.status, stdout_log, stderr_log
+        ));
         let code = output
             .status
             .code()
@@ -338,6 +415,7 @@ fn collect_wsl_instances() -> Result<Vec<WslInstance>> {
     let args = ["--list", "--verbose", "--all"];
     let command_line = format_cli_command("wsl.exe", &args);
 
+    log_wsl_event(format!("Execution commande WSL (list): {command_line}"));
     let output = Command::new("wsl.exe")
         .args(args)
         .output()
@@ -358,6 +436,10 @@ fn collect_wsl_instances() -> Result<Vec<WslInstance>> {
         stderr = %stderr_log,
         "Commande WSL terminee"
     );
+    log_wsl_event(format!(
+        "Commande terminee (list) status={} stdout={} stderr={}",
+        output.status, stdout_log, stderr_log
+    ));
 
     if !output.status.success() {
         let lower_stdout = stdout_trim.to_lowercase();
@@ -369,6 +451,7 @@ fn collect_wsl_instances() -> Result<Vec<WslInstance>> {
 
         if no_distro {
             info!(target: "wsl", "wsl.exe indique qu'aucune distribution n'est installee");
+            log_wsl_event("wsl.exe indique qu'aucune distribution n'est installee");
             return Ok(Vec::new());
         }
 
@@ -379,6 +462,7 @@ fn collect_wsl_instances() -> Result<Vec<WslInstance>> {
         } else {
             "wsl.exe --list a echoue".to_string()
         };
+        log_wsl_event(format!("Echec wsl.exe --list --verbose --all: {message}"));
         return Err(anyhow!(message));
     }
 
@@ -396,6 +480,13 @@ fn collect_wsl_instances() -> Result<Vec<WslInstance>> {
             version_debug = %escape_for_log(version_ref),
             "Instance WSL detectee"
         );
+        log_wsl_event(format!(
+            "Instance detectee: name={} state={} version={} default={}",
+            escape_for_log(&inst.name),
+            escape_for_log(&inst.state),
+            escape_for_log(version_ref),
+            inst.is_default
+        ));
     }
 
     Ok(instances)
@@ -416,6 +507,10 @@ fn run_wsl_unregister(name: &str) -> Result<WslOperationResult> {
         command = %command_line,
         "Execution d'une commande WSL"
     );
+    log_wsl_event(format!(
+        "Suppression WSL demandee pour {} via {}",
+        instance_debug, command_line
+    ));
 
     let output = Command::new("wsl.exe")
         .args(["--unregister", name])
@@ -451,6 +546,13 @@ fn run_wsl_unregister(name: &str) -> Result<WslOperationResult> {
             stderr = %stderr_log,
             "Instance WSL supprimee"
         );
+        log_wsl_event(format!(
+            "Instance WSL supprimee: {} message={} stdout={} stderr={}",
+            instance_debug,
+            escape_for_log(&message),
+            stdout_log,
+            stderr_log
+        ));
         Ok(WslOperationResult { ok: true, message })
     } else {
         let lower_stdout = stdout_trim.to_lowercase();
@@ -472,6 +574,10 @@ fn run_wsl_unregister(name: &str) -> Result<WslOperationResult> {
                 stderr = %stderr_log,
                 "Suppression WSL consideree comme deja effectuee (distribution absente)"
             );
+            log_wsl_event(format!(
+                "Suppression WSL consideree comme deja effectuee (absente): {}",
+                instance_debug
+            ));
             return Ok(WslOperationResult {
                 ok: true,
                 message: format!("Instance WSL '{name}' introuvable ou deja supprimee."),
@@ -500,6 +606,13 @@ fn run_wsl_unregister(name: &str) -> Result<WslOperationResult> {
             stderr = %stderr_log,
             "Suppression WSL a echoue"
         );
+        log_wsl_event(format!(
+            "Suppression WSL a echoue: {} message={} stdout={} stderr={}",
+            instance_debug,
+            escape_for_log(&combined),
+            stdout_log,
+            stderr_log
+        ));
         Err(anyhow!(combined))
     }
 }
@@ -507,10 +620,12 @@ fn run_wsl_unregister(name: &str) -> Result<WslOperationResult> {
 #[tauri::command]
 pub async fn wsl_list_instances() -> Result<Vec<WslInstance>, String> {
     info!(target: "wsl", "Listing des instances WSL");
+    log_wsl_event("Listing des instances WSL");
     tauri::async_runtime::spawn_blocking(collect_wsl_instances)
         .await
         .map_err(|e| {
             error!(target: "wsl", "Erreur JoinHandle (list): {e}");
+            log_wsl_event(format!("Erreur JoinHandle lors du listing WSL: {e}"));
             format!("Erreur interne: {e}")
         })
         .and_then(|result| result.map_err(|e| e.to_string()))
@@ -535,6 +650,11 @@ pub async fn wsl_remove_instance(name: String) -> Result<WslOperationResult, Str
             instance_sanitized = %escape_for_log(&sanitized),
             "Nom d'instance WSL nettoyé avant suppression"
         );
+        log_wsl_event(format!(
+            "Nom d'instance WSL nettoye avant suppression: brut={} nettoye={}",
+            escape_for_log(raw_trimmed),
+            escape_for_log(&sanitized)
+        ));
     }
 
     let instance_name = sanitized;
@@ -545,6 +665,10 @@ pub async fn wsl_remove_instance(name: String) -> Result<WslOperationResult, Str
         instance_debug = %instance_debug,
         "Suppression d'une instance WSL demandée"
     );
+    log_wsl_event(format!(
+        "Suppression d'une instance WSL demandee: {}",
+        instance_debug
+    ));
 
     tauri::async_runtime::spawn_blocking({
         let instance_name = instance_name.clone();
@@ -553,11 +677,13 @@ pub async fn wsl_remove_instance(name: String) -> Result<WslOperationResult, Str
     .await
     .map_err(|e| {
         error!(target: "wsl", "Erreur JoinHandle (remove): {e}");
+        log_wsl_event(format!("Erreur JoinHandle (remove): {e}"));
         format!("Erreur interne: {e}")
     })
     .and_then(|result| {
         result.map_err(|e| {
             error!(target: "wsl", "Échec suppression WSL: {e}");
+            log_wsl_event(format!("Échec suppression WSL: {e}"));
             e.to_string()
         })
     })
