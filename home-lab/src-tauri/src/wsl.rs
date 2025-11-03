@@ -159,6 +159,30 @@ fn sanitize_cli_field(value: &str) -> String {
     filtered.trim().to_string()
 }
 
+fn sanitize_wsl_instance_name(raw: &str) -> Result<String> {
+    let sanitized = sanitize_cli_field(raw);
+    if sanitized.is_empty() {
+        return Err(anyhow!("Le nom de l'instance WSL est requis."));
+    }
+
+    if sanitized.len() > 60 {
+        return Err(anyhow!(
+            "Le nom de l'instance WSL est trop long (60 caractères maximum)."
+        ));
+    }
+
+    let valid = sanitized
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ' '));
+    if !valid {
+        return Err(anyhow!(
+            "Le nom de l'instance WSL ne peut contenir que des lettres, chiffres, espaces, points, tirets ou underscores."
+        ));
+    }
+
+    Ok(sanitized)
+}
+
 fn resolve_install_dir(app: &AppHandle) -> Result<PathBuf> {
     if let Some(pd) = std::env::var_os("PROGRAMDATA") {
         return Ok(PathBuf::from(pd).join("home-lab").join("wsl"));
@@ -174,30 +198,53 @@ fn resolve_install_dir(app: &AppHandle) -> Result<PathBuf> {
 pub async fn wsl_import_instance(
     app: AppHandle,
     force: Option<bool>,
+    name: Option<String>,
 ) -> Result<ProvisionResult, String> {
     let force_import = force.unwrap_or(false);
+    let provided_name = name.unwrap_or_else(|| "home-lab-k3s".to_string());
+    let sanitized_name = sanitize_wsl_instance_name(&provided_name).map_err(|e| {
+        error!(target: "wsl", error = %e, "Nom d'instance WSL invalide");
+        e.to_string()
+    })?;
+    let sanitized_debug = escape_for_log(&sanitized_name);
     let handle = app.clone();
+    let instance_name = sanitized_name.clone();
 
-    log_wsl_event(format!("Demande d'import WSL (force={})", force_import));
-    info!(target: "wsl", force = force_import, "Demande d'import WSL reçue");
+    log_wsl_event(format!(
+        "Demande d'import WSL (force={}, instance={})",
+        force_import, sanitized_debug
+    ));
+    info!(
+        target: "wsl",
+        force = force_import,
+        instance = %sanitized_name,
+        instance_debug = %sanitized_debug,
+        "Demande d'import WSL reçue"
+    );
 
-    tauri::async_runtime::spawn_blocking(move || run_wsl_setup(&handle, force_import))
+    tauri::async_runtime::spawn_blocking(move || run_wsl_setup(&handle, force_import, &instance_name))
         .await
         .map_err(|e| {
             error!(target: "wsl", "Erreur JoinHandle: {e}");
-            log_wsl_event(format!("Erreur JoinHandle pendant l'import WSL: {e}"));
+            log_wsl_event(format!(
+                "Erreur JoinHandle pendant l'import WSL (instance={}): {e}",
+                sanitized_debug
+            ));
             format!("Erreur interne: {e}")
         })
         .and_then(|result| {
             result.map_err(|e| {
                 error!(target: "wsl", "Échec import WSL: {e}");
-                log_wsl_event(format!("Échec import WSL: {e}"));
+                log_wsl_event(format!(
+                    "Échec import WSL pour l'instance {}: {e}",
+                    sanitized_debug
+                ));
                 e.to_string()
             })
         })
 }
 
-fn run_wsl_setup(app: &AppHandle, force_import: bool) -> Result<ProvisionResult> {
+fn run_wsl_setup(app: &AppHandle, force_import: bool, instance_name: &str) -> Result<ProvisionResult> {
     let resource_dir = app
         .path()
         .resource_dir()
@@ -216,7 +263,8 @@ fn run_wsl_setup(app: &AppHandle, force_import: bool) -> Result<ProvisionResult>
         return Err(anyhow!("Archive rootfs introuvable dans {:?}", rootfs_path));
     }
 
-    let install_dir = resolve_install_dir(app)?;
+    let install_dir = (resolve_install_dir(app)?).join(instance_name);
+    let instance_debug = escape_for_log(instance_name);
 
     info!(
         target: "wsl",
@@ -224,11 +272,14 @@ fn run_wsl_setup(app: &AppHandle, force_import: bool) -> Result<ProvisionResult>
         rootfs = %rootfs_path.display(),
         install = %install_dir.display(),
         force = force_import,
+        instance = %instance_name,
+        instance_debug = %instance_debug,
         "Lancement de setup-wsl.ps1"
     );
     log_wsl_event(format!(
-        "Lancement de setup-wsl.ps1 (force={}, script={}, rootfs={}, install={})",
+        "Lancement de setup-wsl.ps1 (force={}, instance={}, script={}, rootfs={}, install={})",
         force_import,
+        instance_debug,
         script_path.display(),
         rootfs_path.display(),
         install_dir.display()
@@ -244,17 +295,20 @@ fn run_wsl_setup(app: &AppHandle, force_import: bool) -> Result<ProvisionResult>
         .arg("-InstallDir")
         .arg(&install_dir)
         .arg("-Rootfs")
-        .arg(&rootfs_path);
+        .arg(&rootfs_path)
+        .arg("-DistroName")
+        .arg(instance_name);
 
     if force_import {
         command.arg("-ForceImport");
     }
 
     let mut command_preview = format!(
-        "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"{}\" -InstallDir \"{}\" -Rootfs \"{}\"",
+        "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"{}\" -InstallDir \"{}\" -Rootfs \"{}\" -DistroName \"{}\"",
         script_path.display(),
         install_dir.display(),
-        rootfs_path.display()
+        rootfs_path.display(),
+        instance_name
     );
     if force_import {
         command_preview.push_str(" -ForceImport");
@@ -304,7 +358,7 @@ fn run_wsl_setup(app: &AppHandle, force_import: bool) -> Result<ProvisionResult>
         let mut message = if !stdout_trim.is_empty() {
             stdout_trim.to_string()
         } else {
-            String::from("Instance WSL importee avec succes.")
+            format!("Instance WSL '{instance_name}' importee avec succes.")
         };
         if !stderr_trim.is_empty() {
             if !message.is_empty() {
@@ -312,8 +366,17 @@ fn run_wsl_setup(app: &AppHandle, force_import: bool) -> Result<ProvisionResult>
             }
             message.push_str(stderr_trim);
         }
-        info!(target: "wsl", "Import WSL termine");
-        log_wsl_event(format!("Import WSL termine: {}", escape_for_log(&message)));
+        info!(
+            target: "wsl",
+            instance = %instance_name,
+            instance_debug = %instance_debug,
+            "Import WSL termine"
+        );
+        log_wsl_event(format!(
+            "Import WSL termine pour {}: {}",
+            instance_debug,
+            escape_for_log(&message)
+        ));
         Ok(ProvisionResult { ok: true, message })
     } else {
         error!(
@@ -324,8 +387,8 @@ fn run_wsl_setup(app: &AppHandle, force_import: bool) -> Result<ProvisionResult>
             "setup-wsl.ps1 a echoue"
         );
         log_wsl_event(format!(
-            "setup-wsl.ps1 a echoue: status={} stdout={} stderr={}",
-            output.status, stdout_log, stderr_log
+            "setup-wsl.ps1 a echoue pour {}: status={} stdout={} stderr={}",
+            instance_debug, output.status, stdout_log, stderr_log
         ));
         let code = output
             .status
@@ -643,10 +706,8 @@ pub async fn wsl_remove_instance(name: String) -> Result<WslOperationResult, Str
         return Err("Le nom de l'instance est requis.".into());
     }
 
-    let sanitized = sanitize_cli_field(raw_trimmed);
-    if sanitized.is_empty() {
-        return Err("Le nom de l'instance est invalide.".into());
-    }
+    let sanitized = sanitize_wsl_instance_name(raw_trimmed)
+        .map_err(|e| e.to_string())?;
 
     if sanitized != raw_trimmed {
         info!(
@@ -688,7 +749,10 @@ pub async fn wsl_remove_instance(name: String) -> Result<WslOperationResult, Str
     .and_then(|result| {
         result.map_err(|e| {
             error!(target: "wsl", "Échec suppression WSL: {e}");
-            log_wsl_event(format!("Échec suppression WSL: {e}"));
+            log_wsl_event(format!(
+                "Échec suppression WSL pour {}: {e}",
+                instance_debug
+            ));
             e.to_string()
         })
     })

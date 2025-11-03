@@ -136,17 +136,37 @@ async function mockInvoke(cmd, args = {}) {
     }
 
     case 'wsl_import_instance': {
-      if (!__MOCK.wsl.instances.some((inst) => inst.name === 'home-lab')) {
-        __MOCK.wsl.instances.push({
-          name: 'home-lab',
-          state: 'Stopped',
-          version: '2',
-          is_default: false,
-        });
+      const rawName = typeof args?.name === 'string' ? args.name.trim() : 'home-lab-k3s';
+      if (!rawName) {
+        return { ok: false, message: "Nom d'instance invalide (mock)." };
       }
+      const normalized = rawName.toLowerCase();
+      const existsIndex = __MOCK.wsl.instances.findIndex(
+        (inst) => (inst?.name || '').toLowerCase() === normalized,
+      );
+
+      if (existsIndex !== -1 && !args?.force) {
+        return { ok: false, message: `Instance ${rawName} existe déjà (mock).` };
+      }
+
+      const instance = {
+        name: rawName,
+        state: 'Stopped',
+        version: '2',
+        is_default: false,
+      };
+
+      if (existsIndex === -1) {
+        __MOCK.wsl.instances.push(instance);
+      } else {
+        __MOCK.wsl.instances.splice(existsIndex, 1, instance);
+      }
+
       return {
         ok: true,
-        message: args?.force ? 'Réimport forcé (mock).' : 'Import WSL simulé (mock).',
+        message: args?.force
+          ? `Instance ${rawName} réimportée (mock).`
+          : `Instance ${rawName} importée (mock).`,
       };
     }
 
@@ -290,6 +310,12 @@ export async function http_remove_route(arg1) {
 
 export async function wsl_import_instance(options = {}) {
   const payload = { ...options };
+  if (payload.name !== undefined) {
+    payload.name = String(payload.name ?? '').trim();
+    if (!payload.name) {
+      throw new Error("Le nom de l'instance WSL est requis.");
+    }
+  }
   // eslint-disable-next-line no-console
   console.info('[tauri.js] wsl_import_instance invoked', payload);
   const result = await safeInvoke('wsl_import_instance', payload);

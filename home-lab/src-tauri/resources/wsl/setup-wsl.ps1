@@ -197,6 +197,7 @@ try {
     Ensure-WslBinary
 
     Write-Info "Parametres d'execution :"
+    Write-Info "  - DistroName = $DistroName"
     Write-Info "  - ForceImport = $($ForceImport.IsPresent)"
     Write-Info "  - InstallDir  = $InstallDir"
     Write-Info "  - Rootfs      = $Rootfs"
