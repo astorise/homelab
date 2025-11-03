@@ -36,16 +36,29 @@ fn decode_cli_output(data: &[u8]) -> String {
         return String::new();
     }
 
-    if let Ok(utf8) = std::str::from_utf8(data) {
-        return utf8.to_string();
-    }
+    let looks_utf16 = data.len() % 2 == 0
+        && data
+            .iter()
+            .enumerate()
+            .all(|(idx, byte)| idx % 2 == 1 && *byte == 0 || idx % 2 == 0);
 
-    if data.len() % 2 == 0 {
+    if looks_utf16 {
         let utf16: Vec<u16> = data
             .chunks_exact(2)
             .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
             .collect();
         return String::from_utf16_lossy(&utf16);
+    }
+
+    if let Ok(utf8) = std::str::from_utf8(data) {
+        if utf8.contains('\0') && data.len() % 2 == 0 {
+            let utf16: Vec<u16> = data
+                .chunks_exact(2)
+                .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+                .collect();
+            return String::from_utf16_lossy(&utf16);
+        }
+        return utf8.to_string();
     }
 
     String::from_utf8_lossy(data).into_owned()
