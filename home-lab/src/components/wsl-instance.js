@@ -199,13 +199,77 @@ class WslInstanceManager extends HTMLElement {
     }
   }
 
+  getExistingInstanceNames() {
+    return this._instances
+      .map((inst) => (inst?.name || '').trim())
+      .filter((name) => name.length > 0);
+  }
+
+  suggestInstanceName() {
+    const base = 'home-lab-k3s';
+    const names = new Set(
+      this.getExistingInstanceNames().map((name) => name.toLowerCase()),
+    );
+    if (!names.has(base)) {
+      return base;
+    }
+
+    for (let index = 2; index < 1000; index += 1) {
+      const candidate = `${base}-${index}`;
+      if (!names.has(candidate.toLowerCase())) {
+        return candidate;
+      }
+    }
+    return base;
+  }
+
+  requestInstanceName(force) {
+    const defaultName = force && this._instances.length > 0
+      ? this._instances[0]?.name
+      : this.suggestInstanceName();
+    const promptMessage = force
+      ? 'Nom de l\'instance WSL à réimporter'
+      : 'Nom de la nouvelle instance WSL';
+    const value = typeof window !== 'undefined'
+      ? window.prompt(promptMessage, defaultName || '')
+      : '';
+    if (value === null) {
+      return null;
+    }
+    const trimmed = (value || '').trim();
+    if (!trimmed) {
+      showError("Le nom de l'instance WSL est requis.");
+      return null;
+    }
+
+    if (!force) {
+      const lower = trimmed.toLowerCase();
+      const exists = this.getExistingInstanceNames().some((name) => name.toLowerCase() === lower);
+      if (exists) {
+        showError(`Une instance WSL nommée « ${trimmed} » existe déjà.`);
+        return null;
+      }
+    }
+
+    return trimmed;
+  }
+
   async runImport(force) {
     if (this._busyAction) return;
-    this.setBusy(force ? 'force' : 'import', force ? 'Réimport forcé en cours…' : 'Import en cours…');
+
+    const name = this.requestInstanceName(force);
+    if (!name) {
+      return;
+    }
+
+    this.setBusy(
+      force ? 'force' : 'import',
+      force ? `Réimport forcé de ${name} en cours…` : `Import de ${name} en cours…`,
+    );
     try {
       // eslint-disable-next-line no-console
-      console.info('[WslInstanceManager] Import WSL demande', { force });
-      const result = await wsl_import_instance({ force });
+      console.info('[WslInstanceManager] Import WSL demande', { force, name });
+      const result = await wsl_import_instance({ force, name });
       // eslint-disable-next-line no-console
       console.info('[WslInstanceManager] Import WSL termine', result);
       if (!result?.ok) {
@@ -214,7 +278,9 @@ class WslInstanceManager extends HTMLElement {
       const refreshed = await this.loadInstances();
       if (refreshed) {
         this._messageState = 'success';
-        this._message = result.message || 'Instance importée.';
+        this._message = result.message || (force
+          ? `Instance ${name} réimportée.`
+          : `Instance ${name} importée.`);
       }
     } catch (err) {
       // eslint-disable-next-line no-console
