@@ -192,6 +192,30 @@ function Install-K3sBinary {
     }
 }
 
+function Invoke-K3sBootstrap {
+    param(
+        [string]$Distro,
+        [int]$TimeoutSeconds = 180
+    )
+
+    Write-Info "Initialisation de k3s (bootstrap) dans $Distro"
+    $cmd = "set -euo pipefail; BOOTSTRAP_ONLY=1 BOOTSTRAP_TIMEOUT=$TimeoutSeconds /usr/local/bin/k3s-init.sh"
+    $std = & wsl.exe -d $Distro -- sh -c $cmd 2>&1
+    $exitCode = $LASTEXITCODE
+
+    if ($exitCode -ne 0) {
+        $details = ($std | Where-Object { $_ -and $_.Trim().Length -gt 0 }) -join "`n"
+        if ($details) {
+            throw "Initialisation k3s echouee (code $exitCode) :`n$details"
+        }
+        throw "Initialisation k3s echouee (code $exitCode)"
+    }
+
+    if ($std) {
+        Write-Info ("k3s-init.sh a renvoye :" + [Environment]::NewLine + ($std -join [Environment]::NewLine))
+    }
+}
+
 try {
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
     Ensure-WslBinary
@@ -228,8 +252,25 @@ try {
     $tag = Get-LatestK3sReleaseTag
     $binary = Download-K3sBinary -Tag $tag
 
+    $shouldBootstrap = $needsImport
+    if ($shouldBootstrap) {
+        Write-Info "Instance nouvellement importee : bootstrap k3s requis."
+    } else {
+        Write-Info "Verification de la presence du kubeconfig k3s dans $DistroName"
+        & wsl.exe -d $DistroName -- test -s /etc/rancher/k3s/k3s.yaml 2>$null
+        if ($LASTEXITCODE -ne 0) {
+            $shouldBootstrap = $true
+            Write-Info "kubeconfig k3s manquant : bootstrap sera lance."
+        } else {
+            Write-Info "kubeconfig k3s deja present : bootstrap ignore."
+        }
+    }
+
     try {
         Install-K3sBinary -Distro $DistroName -WindowsBinaryPath $binary
+        if ($shouldBootstrap) {
+            Invoke-K3sBootstrap -Distro $DistroName
+        }
     } finally {
         if (Test-Path -LiteralPath $binary) {
             Remove-Item -LiteralPath $binary -Force -ErrorAction SilentlyContinue
