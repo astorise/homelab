@@ -222,29 +222,35 @@ pub async fn wsl_import_instance(
         "Demande d'import WSL reçue"
     );
 
-    tauri::async_runtime::spawn_blocking(move || run_wsl_setup(&handle, force_import, &instance_name))
-        .await
-        .map_err(|e| {
-            error!(target: "wsl", "Erreur JoinHandle: {e}");
+    tauri::async_runtime::spawn_blocking(move || {
+        run_wsl_setup(&handle, force_import, &instance_name)
+    })
+    .await
+    .map_err(|e| {
+        error!(target: "wsl", "Erreur JoinHandle: {e}");
+        log_wsl_event(format!(
+            "Erreur JoinHandle pendant l'import WSL (instance={}): {e}",
+            sanitized_debug
+        ));
+        format!("Erreur interne: {e}")
+    })
+    .and_then(|result| {
+        result.map_err(|e| {
+            error!(target: "wsl", "Échec import WSL: {e}");
             log_wsl_event(format!(
-                "Erreur JoinHandle pendant l'import WSL (instance={}): {e}",
+                "Échec import WSL pour l'instance {}: {e}",
                 sanitized_debug
             ));
-            format!("Erreur interne: {e}")
+            e.to_string()
         })
-        .and_then(|result| {
-            result.map_err(|e| {
-                error!(target: "wsl", "Échec import WSL: {e}");
-                log_wsl_event(format!(
-                    "Échec import WSL pour l'instance {}: {e}",
-                    sanitized_debug
-                ));
-                e.to_string()
-            })
-        })
+    })
 }
 
-fn run_wsl_setup(app: &AppHandle, force_import: bool, instance_name: &str) -> Result<ProvisionResult> {
+fn run_wsl_setup(
+    app: &AppHandle,
+    force_import: bool,
+    instance_name: &str,
+) -> Result<ProvisionResult> {
     let resource_dir = app
         .path()
         .resource_dir()
@@ -407,19 +413,33 @@ fn run_wsl_setup(app: &AppHandle, force_import: bool, instance_name: &str) -> Re
 }
 
 fn parse_wsl_list_output(output: &str) -> Result<Vec<WslInstance>> {
-    let entry_re = Regex::new(r"^(?P<name>.+?)\s{2,}(?P<state>\S.*?)(?:\s{2,}(?P<version>\S+))?$")?;
+    let split_re = Regex::new(r"\s{2,}")?;
     let mut instances = Vec::new();
-    let mut header_skipped = false;
+
+    let is_name_header = |value: &str| {
+        let lower = value.to_lowercase();
+        matches!(
+            lower.as_str(),
+            "name" | "nom" | "distribution" | "distribution name"
+        )
+    };
+
+    let is_state_header = |value: &str| {
+        let lower = value.to_lowercase();
+        matches!(
+            lower.as_str(),
+            "state" | "etat" | "état" | "status" | "statut"
+        )
+    };
+
+    let is_version_header = |value: &str| {
+        let lower = value.to_lowercase();
+        matches!(lower.as_str(), "version" | "wsl version")
+    };
 
     for raw_line in output.lines() {
         let trimmed = raw_line.trim();
         if trimmed.is_empty() {
-            continue;
-        }
-
-        if !header_skipped {
-            header_skipped = true;
-            // Première ligne = en-tête (NAME/STATE/VERSION ou équivalent localisé).
             continue;
         }
 
@@ -439,20 +459,18 @@ fn parse_wsl_list_output(output: &str) -> Result<Vec<WslInstance>> {
             continue;
         }
 
-        let Some(caps) = entry_re.captures(without_marker) else {
+        let parts: Vec<&str> = split_re.splitn(without_marker, 3).collect();
+
+        if parts.len() < 2 {
             warn!(
                 target: "wsl",
                 line = %escape_for_log(without_marker),
-                "Impossible d'analyser la ligne WSL; ligne ignoree"
+                "Impossible d'analyser la ligne WSL (colonnes insuffisantes); ignoree"
             );
             continue;
-        };
+        }
 
-        let name_raw = caps.name("name").map(|m| m.as_str()).unwrap_or_default();
-        let state_raw = caps.name("state").map(|m| m.as_str()).unwrap_or_default();
-        let version_raw = caps.name("version").map(|m| m.as_str());
-
-        let name = sanitize_cli_field(name_raw);
+        let name = sanitize_cli_field(parts[0]);
         if name.is_empty() {
             warn!(
                 target: "wsl",
@@ -462,11 +480,35 @@ fn parse_wsl_list_output(output: &str) -> Result<Vec<WslInstance>> {
             continue;
         }
 
-        let state = sanitize_cli_field(state_raw);
-        let version =
-            version_raw
-                .map(sanitize_cli_field)
-                .and_then(|v| if v.is_empty() { None } else { Some(v) });
+        let state = sanitize_cli_field(parts[1]);
+        if state.is_empty() {
+            warn!(
+                target: "wsl",
+                line = %escape_for_log(raw_line),
+                "Etat WSL vide apres nettoyage; ligne ignoree"
+            );
+            continue;
+        }
+
+        let version = parts
+            .get(2)
+            .map(|value| sanitize_cli_field(value))
+            .and_then(|value| if value.is_empty() { None } else { Some(value) });
+
+        if is_name_header(&name)
+            && (is_state_header(&state)
+                || version
+                    .as_ref()
+                    .map(|v| is_version_header(v))
+                    .unwrap_or(false))
+        {
+            info!(
+                target: "wsl",
+                line = %escape_for_log(raw_line),
+                "Ligne WSL detectee comme en-tete; ignoree"
+            );
+            continue;
+        }
 
         instances.push(WslInstance {
             name,
@@ -706,8 +748,7 @@ pub async fn wsl_remove_instance(name: String) -> Result<WslOperationResult, Str
         return Err("Le nom de l'instance est requis.".into());
     }
 
-    let sanitized = sanitize_wsl_instance_name(raw_trimmed)
-        .map_err(|e| e.to_string())?;
+    let sanitized = sanitize_wsl_instance_name(raw_trimmed).map_err(|e| e.to_string())?;
 
     if sanitized != raw_trimmed {
         info!(
