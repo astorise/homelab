@@ -3,11 +3,17 @@ param(
     [string]$DistroName = 'home-lab-k3s',
     [string]$InstallDir = (Join-Path ${env:ProgramData} 'home-lab\\wsl'),
     [string]$Rootfs     = (Join-Path $PSScriptRoot 'wsl-rootfs.tar'),
-    [switch]$ForceImport
+    [switch]$ForceImport,
+    [string]$CacheDir   = (Join-Path ${env:ProgramData} 'home-lab\\cache'),
+    [int]$ApiPort       = 6550
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+
+if ($ApiPort -lt 1 -or $ApiPort -gt 65535) {
+    throw "ApiPort invalide ($ApiPort). La valeur doit etre comprise entre 1 et 65535."
+}
 
 function Write-Info {
     param([string]$Message)
@@ -120,20 +126,53 @@ function Get-LatestK3sReleaseTag {
 
 function Download-K3sBinary {
     param(
-        [string]$Tag
+        [string]$Tag,
+        [string]$CacheRoot
     )
 
-    $downloadUri = "https://github.com/k3s-io/k3s/releases/download/$Tag/k3s"
-    $tempFile = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), "k3s-$Tag")
+    if (-not (Test-Path -LiteralPath $CacheRoot)) {
+        Write-Info "Creation du cache $CacheRoot"
+        New-Item -ItemType Directory -Path $CacheRoot -Force | Out-Null
+    }
 
-    Write-Info "Telechargement de k3s ($Tag) ..."
+    $k3sCacheRoot = Join-Path $CacheRoot 'k3s'
+    if (-not (Test-Path -LiteralPath $k3sCacheRoot)) {
+        New-Item -ItemType Directory -Path $k3sCacheRoot -Force | Out-Null
+    }
+
+    $versionDir = Join-Path $k3sCacheRoot $Tag
+    $binaryPath = Join-Path $versionDir 'k3s'
+
+    if (Test-Path -LiteralPath $binaryPath) {
+        $size = (Get-Item -LiteralPath $binaryPath).Length
+        if ($size -gt 0) {
+            Write-Info "k3s ($Tag) deja present dans le cache : $binaryPath"
+            return $binaryPath
+        }
+        Write-Info "k3s ($Tag) detecte dans le cache mais fichier vide. Nouveau telechargement."
+    } else {
+        Write-Info "k3s ($Tag) absent du cache. Telechargement en cours ..."
+    }
+
+    if (-not (Test-Path -LiteralPath $versionDir)) {
+        New-Item -ItemType Directory -Path $versionDir -Force | Out-Null
+    }
+
+    $downloadUri = "https://github.com/k3s-io/k3s/releases/download/$Tag/k3s"
+    $tempFile = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), ("k3s-{0}-{1}" -f $Tag, [Guid]::NewGuid().ToString('N')))
+
     try {
         Invoke-WebRequest -Uri $downloadUri -OutFile $tempFile -UseBasicParsing | Out-Null
     } catch {
+        if (Test-Path -LiteralPath $tempFile) {
+            Remove-Item -LiteralPath $tempFile -Force -ErrorAction SilentlyContinue
+        }
         throw "Telechargement de k3s echoue: $($_.Exception.Message)"
     }
 
-    return $tempFile
+    Move-Item -LiteralPath $tempFile -Destination $binaryPath -Force
+    Write-Info "k3s ($Tag) stocke dans le cache : $binaryPath"
+    return $binaryPath
 }
 
 function Convert-ToWslPath {
@@ -144,7 +183,8 @@ function Convert-ToWslPath {
 
     $full = Convert-Path -LiteralPath $WindowsPath
 
-    $linux = & wsl.exe -d $Distro -- wslpath -a $full 2>&1
+    $escapedForWsl = $full -replace '\\', '\\\\'
+    $linux = & wsl.exe -d $Distro -- wslpath -a $escapedForWsl 2>&1
     if ($LASTEXITCODE -eq 0 -and $linux) {
         return $linux.Trim()
     }
@@ -183,27 +223,192 @@ function Install-K3sBinary {
     )
 
     $linuxPath = Convert-ToWslPath -Distro $Distro -WindowsPath $WindowsBinaryPath
-    $escaped = Escape-ShellSingleQuotes -Value $linuxPath
-    $cmd = "set -euo pipefail; install -m 0755 '$escaped' /usr/local/bin/k3s"
-    Write-Info "Installation de k3s dans la distribution $Distro"
-    $p = Start-Process -FilePath 'wsl.exe' -ArgumentList @('-d', $Distro, '--', 'sh', '-c', $cmd) -Wait -PassThru -NoNewWindow
-    if ($p.ExitCode -ne 0) {
-        throw "Installation de k3s echouee (code $($p.ExitCode))"
+    $target = '/usr/local/bin/k3s'
+
+    Write-Info "Mise a disposition de k3s dans la distribution $Distro"
+    & wsl.exe -d $Distro -- rm -f $target 2>$null | Out-Null
+
+    $linkOutput = & wsl.exe -d $Distro -- ln -s $linuxPath $target 2>&1
+    if ($LASTEXITCODE -eq 0) {
+        if ($linkOutput) {
+            Write-Info ("ln -s a renvoye :" + [Environment]::NewLine + ($linkOutput -join [Environment]::NewLine))
+        }
+        Write-Info "Lien symbolique cree vers le cache k3s."
+        return
     }
+
+    if ($linkOutput) {
+        Write-Info ("Impossible de creer le lien symbolique : " + [Environment]::NewLine + ($linkOutput -join [Environment]::NewLine))
+    } else {
+        Write-Info "Impossible de creer le lien symbolique : ln -s a renvoye le code $LASTEXITCODE"
+    }
+
+    $installOutput = & wsl.exe -d $Distro -- install -m 0755 $linuxPath $target 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        $details = ($installOutput | Where-Object { $_ -and $_.Trim().Length -gt 0 }) -join "`n"
+        if ($details) {
+            throw "Installation de k3s echouee (code $LASTEXITCODE) :`n$details"
+        }
+        throw "Installation de k3s echouee (code $LASTEXITCODE)"
+    }
+
+    if ($installOutput) {
+        Write-Info ("install a renvoye :" + [Environment]::NewLine + ($installOutput -join [Environment]::NewLine))
+    }
+    Write-Info "Copie de k3s dans le filesystem WSL (fallback)."
 }
 
 function Invoke-K3sBootstrap {
     param(
         [string]$Distro,
+        [int]$ApiPort,
         [int]$TimeoutSeconds = 180
     )
 
-    Write-Info "Initialisation de k3s (bootstrap) dans $Distro"
-    $cmd = "set -euo pipefail; BOOTSTRAP_ONLY=1 BOOTSTRAP_TIMEOUT=$TimeoutSeconds /usr/local/bin/k3s-init.sh"
+    Write-Info "Initialisation de k3s (bootstrap) dans $Distro sur le port $ApiPort"
+    $range = "{0}-{0}" -f $ApiPort
+
+    $updateEnvTemplate = @'
+set -euo pipefail
+cat <<'EOF' >/etc/k3s-env
+WSL_ROLE=server
+PORT_RANGE=__RANGE__
+EOF
+'@
+    $updateEnvScript = $updateEnvTemplate -replace '__RANGE__', $range
+    $updateEnvScript = $updateEnvScript -replace "`r`n", "`n"
+    $envStd = & wsl.exe -d $Distro -- sh -c $updateEnvScript 2>&1
+    $envExit = $LASTEXITCODE
+    if ($envExit -ne 0) {
+        $details = ($envStd | Where-Object { $_ -and $_.Trim().Length -gt 0 }) -join "`n"
+        if ($details) {
+            throw "Mise a jour de /etc/k3s-env echouee (code $envExit) :`n$details"
+        }
+        throw "Mise a jour de /etc/k3s-env echouee (code $envExit)"
+    }
+    if ($envStd) {
+        Write-Info ("Mise a jour /etc/k3s-env :" + [Environment]::NewLine + ($envStd -join [Environment]::NewLine))
+    }
+
+    $rangeEscaped = Escape-ShellSingleQuotes -Value $range
+    $configTemplate = @'
+set -euo pipefail
+mkdir -p /etc/rancher/k3s
+cat <<'EOF' >/etc/rancher/k3s/config.yaml
+write-kubeconfig-mode: "0644"
+node-ip: 127.0.0.1
+https-listen-port: __PORT__
+EOF
+'@
+    $configScript = $configTemplate -replace '__PORT__', $ApiPort
+    $configScript = $configScript -replace "`r`n", "`n"
+    $cfgStd = & wsl.exe -d $Distro -- sh -c $configScript 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        $details = ($cfgStd | Where-Object { $_ -and $_.Trim().Length -gt 0 }) -join "`n"
+        if ($details) {
+            throw "Mise a jour de /etc/rancher/k3s/config.yaml echouee :`n$details"
+        }
+        throw "Mise a jour de /etc/rancher/k3s/config.yaml echouee."
+    }
+    if ($cfgStd) {
+        Write-Info ("Mise a jour config.yaml :" + [Environment]::NewLine + ($cfgStd -join [Environment]::NewLine))
+    }
+
+    Write-Info "Utilisation du bootstrap integre (mode degrade)."
+    Write-Info "Validation du kubeconfig via bootstrap degrade."
+    $bootstrapScriptTemplate = @'
+#!/bin/sh
+set -eu
+
+PORT={0}
+TIMEOUT={1}
+CONFIG_DIR=/etc/rancher/k3s
+KUBECONFIG_PATH=$CONFIG_DIR/k3s.yaml
+ADMIN_KUBECONFIG=/var/lib/rancher/k3s/server/cred/admin.kubeconfig
+
+echo "[k3s-bootstrap] Mode degrade actif, port: $PORT"
+
+mkdir -p "$CONFIG_DIR" /root/.kube
+
+if [ ! -f "$CONFIG_DIR/config.yaml" ]; then
+    cat <<'EOC' >"$CONFIG_DIR/config.yaml"
+write-kubeconfig-mode: "0644"
+https-listen-port: {0}
+EOC
+fi
+
+/usr/local/bin/k3s server --https-listen-port "$PORT" --disable traefik --write-kubeconfig "$KUBECONFIG_PATH" --write-kubeconfig-mode 0644 &
+K3S_PID=$!
+
+trap 'kill "$K3S_PID" 2>/dev/null || true' INT TERM EXIT
+
+elapsed=0
+while [ "$elapsed" -lt "$TIMEOUT" ]; do
+    if [ -s "$KUBECONFIG_PATH" ]; then
+        install -m 0600 "$KUBECONFIG_PATH" /root/.kube/config
+        kill "$K3S_PID" 2>/dev/null || true
+        wait "$K3S_PID" 2>/dev/null || true
+        trap - INT TERM EXIT
+        exit 0
+    fi
+
+    if [ -s "$ADMIN_KUBECONFIG" ]; then
+        install -m 0644 "$ADMIN_KUBECONFIG" "$KUBECONFIG_PATH"
+        install -m 0600 "$KUBECONFIG_PATH" /root/.kube/config
+        kill "$K3S_PID" 2>/dev/null || true
+        wait "$K3S_PID" 2>/dev/null || true
+        trap - INT TERM EXIT
+        exit 0
+    fi
+
+    if ! kill -0 "$K3S_PID" 2>/dev/null; then
+        wait "$K3S_PID" || true
+        exit 1
+    fi
+
+    sleep 3
+    elapsed=$((elapsed + 3))
+done
+
+kill "$K3S_PID" 2>/dev/null || true
+wait "$K3S_PID" 2>/dev/null || true
+if [ -s "$ADMIN_KUBECONFIG" ]; then
+    install -m 0644 "$ADMIN_KUBECONFIG" "$KUBECONFIG_PATH"
+    install -m 0600 "$KUBECONFIG_PATH" /root/.kube/config
+    exit 0
+fi
+exit 1
+'@
+    $bootstrapScript = [string]::Format($bootstrapScriptTemplate, $ApiPort, $TimeoutSeconds)
+    $fallbackTemplate = @'
+set -euo pipefail
+cat <<'EOF' >/tmp/homelab-k3s-bootstrap.sh
+{0}
+EOF
+sh /tmp/homelab-k3s-bootstrap.sh
+rc=$?
+rm -f /tmp/homelab-k3s-bootstrap.sh
+exit $rc
+'@
+    $cmd = [string]::Format($fallbackTemplate, $bootstrapScript)
+
     $std = & wsl.exe -d $Distro -- sh -c $cmd 2>&1
     $exitCode = $LASTEXITCODE
 
-    if ($exitCode -ne 0) {
+    $configCheckCmd = @'
+set -e
+if [ -s /etc/rancher/k3s/k3s.yaml ]; then
+    exit 0
+fi
+if [ -s /root/.kube/config ]; then
+    exit 0
+fi
+exit 1
+'@
+    & wsl.exe -d $Distro -- sh -c $configCheckCmd 2>$null
+    $configExists = ($LASTEXITCODE -eq 0)
+
+    if ($exitCode -ne 0 -and -not $configExists) {
         $details = ($std | Where-Object { $_ -and $_.Trim().Length -gt 0 }) -join "`n"
         if ($details) {
             throw "Initialisation k3s echouee (code $exitCode) :`n$details"
@@ -211,8 +416,35 @@ function Invoke-K3sBootstrap {
         throw "Initialisation k3s echouee (code $exitCode)"
     }
 
+    if ($exitCode -ne 0 -and $configExists) {
+        Write-Info "Bootstrap k3s a renvoye le code $exitCode mais le kubeconfig est present (continuation)."
+    }
+
+    $syncScript = @'
+set -e
+if [ ! -s /etc/rancher/k3s/k3s.yaml ] && [ -s /root/.kube/config ]; then
+    install -m 0644 /root/.kube/config /etc/rancher/k3s/k3s.yaml
+fi
+'@
+    & wsl.exe -d $Distro -- sh -c $syncScript 2>$null
+    $syncExit = $LASTEXITCODE
+    if ($syncExit -ne 0) {
+        Write-Info "Synchronisation du kubeconfig depuis /root/.kube/config (code $syncExit)."
+    }
+
+    & wsl.exe -d $Distro -- test -s /etc/rancher/k3s/k3s.yaml 2>$null
+    if ($LASTEXITCODE -eq 0) {
+        $configExists = $true
+    }
+
     if ($std) {
-        Write-Info ("k3s-init.sh a renvoye :" + [Environment]::NewLine + ($std -join [Environment]::NewLine))
+        Write-Info ("Bootstrap k3s : " + [Environment]::NewLine + ($std -join [Environment]::NewLine))
+    }
+
+    Write-Info "Etat bootstrap : exit=$exitCode, kubeconfig=$configExists"
+
+    if (-not $configExists) {
+        throw "Initialisation de k3s terminee sans kubeconfig."
     }
 }
 
@@ -225,6 +457,8 @@ try {
     Write-Info "  - ForceImport = $($ForceImport.IsPresent)"
     Write-Info "  - InstallDir  = $InstallDir"
     Write-Info "  - Rootfs      = $Rootfs"
+    Write-Info "  - CacheDir    = $CacheDir"
+    Write-Info "  - ApiPort     = $ApiPort"
 
     $distros = @(Get-RegisteredDistros)
     $detected = if ($distros.Count -gt 0) { $distros -join ', ' } else { '(aucune)' }
@@ -250,7 +484,7 @@ try {
     }
 
     $tag = Get-LatestK3sReleaseTag
-    $binary = Download-K3sBinary -Tag $tag
+    $binary = Download-K3sBinary -Tag $tag -CacheRoot $CacheDir
 
     $shouldBootstrap = $needsImport
     if ($shouldBootstrap) {
@@ -266,15 +500,11 @@ try {
         }
     }
 
-    try {
-        Install-K3sBinary -Distro $DistroName -WindowsBinaryPath $binary
-        if ($shouldBootstrap) {
-            Invoke-K3sBootstrap -Distro $DistroName
-        }
-    } finally {
-        if (Test-Path -LiteralPath $binary) {
-            Remove-Item -LiteralPath $binary -Force -ErrorAction SilentlyContinue
-        }
+    Install-K3sBinary -Distro $DistroName -WindowsBinaryPath $binary
+    if ($shouldBootstrap) {
+        Invoke-K3sBootstrap -Distro $DistroName -ApiPort $ApiPort
+    } else {
+        Write-Info "Bootstrap k3s ignore (kubeconfig deja present)."
     }
 
     Write-Info "Configuration WSL terminee."
