@@ -1064,7 +1064,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -1327,20 +1327,6 @@ checksum = "dc5a4e564e38c699f2880d3fda590bedc2e69f3f84cd48b457bd892ce61d0aa9"
 dependencies = [
  "crc32fast",
  "miniz_oxide",
-]
-
-[[package]]
-name = "flexi_logger"
-version = "0.28.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cca927478b3747ba47f98af6ba0ac0daea4f12d12f55e9104071b3dc00276310"
-dependencies = [
- "chrono",
- "glob",
- "log",
- "nu-ansi-term",
- "regex",
- "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -1923,7 +1909,7 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "chrono",
- "flexi_logger 0.31.7",
+ "flexi_logger",
  "futures-util",
  "hyper-util",
  "log",
@@ -1952,7 +1938,7 @@ dependencies = [
  "anyhow",
  "bytes",
  "chrono",
- "flexi_logger 0.31.7",
+ "flexi_logger",
  "futures-util",
  "http 1.3.1",
  "http-body-util",
@@ -2874,7 +2860,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3250,7 +3236,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
- "flexi_logger 0.28.5",
+ "flexi_logger",
  "http 1.3.1",
  "http-body-util",
  "hyper 1.7.0",
