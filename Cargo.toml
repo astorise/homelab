@@ -2,6 +2,7 @@
 members = [
   "home-dns",
   "home-http",
+  "oidc-service",
   "home-lab/src-tauri",
   "pipe-test",
   "service-tester"
