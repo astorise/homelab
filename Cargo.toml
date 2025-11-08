@@ -3,8 +3,10 @@ members = [
   "home-dns",
   "home-http",
   "home-lab/src-tauri",
+  "services/oidc-service",
   "pipe-test",
-  "service-tester"
+  "service-tester",
+  "tools/setup-oidc"
 ]
 resolver = "3"
 

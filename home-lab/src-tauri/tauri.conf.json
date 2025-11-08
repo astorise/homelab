@@ -37,11 +37,13 @@
       "icons/icon.ico"
     ],
     "resources": {
-      "resources/logs": "logs",
-      "resources/conf": "conf",
-      "resources/bin": "bin",
-      "resources/wsl": "wsl",
-      "icons": "icons",
+    "resources/logs": "logs",
+    "resources/conf": "conf",
+    "resources/bin": "bin",
+    "resources/bin/oidc-service.exe": "../target/release/oidc-service.exe",
+    "resources/bin/setup-oidc.exe": "../target/release/setup-oidc.exe",
+    "resources/wsl": "wsl",
+    "icons": "icons",
       "resources/version.txt": "version.txt"
     },
     "windows": {
