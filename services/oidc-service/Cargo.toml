@@ -1,0 +1,27 @@
+[package]
+name = "oidc-service"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+axum = { version = "0.7", features = ["macros"] }
+base64 = "0.22"
+jsonwebtoken = "9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+subtle = "2"
+time = { version = "0.3", features = ["macros"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync"] }
+tokio-stream = "0.1"
+tracing = "0.1"
+uuid = { version = "1", features = ["v4"] }
+
+[target.'cfg(windows)'.dependencies]
+ctrlc = "3"
+hyper-rustls = { version = "0.27", features = ["http1"] }
+rustls = { version = "0.23", features = ["ring"] }
+rustls-pemfile = "2"
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["fmt", "std", "json"] }
+windows-service = "0.8"

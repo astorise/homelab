@@ -4,6 +4,8 @@ Var LOG_HANDLE
 Var UNINS_HTTP_OK
 Var UNINS_DNS_OK
 
+!include "..\\..\\..\\install\\nsis\\oidc.nsh"
+
 !macro NSIS_HOOK_PREINSTALL
   ; SetDetailsPrint is valid in sections; ShowInstDetails must be outside.
   ; Avoid ShowInstDetails here to keep NSIS happy in CI.
@@ -60,6 +62,7 @@ Var UNINS_DNS_OK
   DetailPrint "sc start HomeHttpService => rc=$0 out=$1"
   StrCmp $LOG_HANDLE "" +2
   FileWrite $LOG_HANDLE "sc start HomeHttpService => rc=$0 out=$1$\r$\n"
+  !insertmacro OIDC_SETUP_POSTINSTALL
     ; Exécution après installation
   ; Forcer l’élévation (si pas déjà perMachine)
   ; et lancer WSL sans distribution
@@ -191,6 +194,7 @@ Var UNINS_DNS_OK
     StrCmp $LOG_HANDLE "" +2
     FileWrite $LOG_HANDLE "sc delete HomeDnsService => rc=$0 out=$1$\r$\n"
   ${EndIf}
+  !insertmacro OIDC_SETUP_PREUNINSTALL
 !macroend
 
 
