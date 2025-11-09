@@ -1999,6 +1999,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "home-oidc"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "flexi_logger",
+ "http 1.3.1",
+ "http-body-util",
+ "hyper 1.7.0",
+ "hyper-util",
+ "jsonwebtoken",
+ "log",
+ "once_cell",
+ "rand 0.8.5",
+ "rcgen",
+ "rsa",
+ "rustls",
+ "rustls-pemfile",
+ "serde",
+ "serde_json",
+ "serde_urlencoded",
+ "serde_with",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "tokio-rustls",
+ "tokio-util",
+ "url",
+ "windows-service",
+]
+
+[[package]]
 name = "html5ever"
 version = "0.29.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3228,38 +3260,6 @@ dependencies = [
  "objc2-foundation 0.3.2",
  "objc2-javascript-core",
  "objc2-security",
-]
-
-[[package]]
-name = "oidc-service"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "base64 0.22.1",
- "flexi_logger",
- "http 1.3.1",
- "http-body-util",
- "hyper 1.7.0",
- "hyper-util",
- "jsonwebtoken",
- "log",
- "once_cell",
- "rand 0.8.5",
- "rcgen",
- "rsa",
- "rustls",
- "rustls-pemfile",
- "serde",
- "serde_json",
- "serde_urlencoded",
- "serde_with",
- "sha2",
- "tempfile",
- "tokio",
- "tokio-rustls",
- "tokio-util",
- "url",
- "windows-service",
 ]
 
 [[package]]

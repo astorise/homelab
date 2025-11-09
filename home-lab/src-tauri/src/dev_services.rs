@@ -21,7 +21,7 @@ fn cargo_bin() -> &'static str {
 
 fn fallback_rust_log() -> String {
     if cfg!(debug_assertions) {
-        "debug,home_dns=debug,home_http=debug".to_string()
+        "debug,home_dns=debug,home_http=debug,home_oidc=debug".to_string()
     } else {
         "info".to_string()
     }
@@ -65,6 +65,7 @@ impl Drop for ProcGuard {
 pub struct DevServices {
     _dns: Option<ProcGuard>,
     _http: Option<ProcGuard>,
+    _oidc: Option<ProcGuard>,
 }
 
 fn workspace_root() -> PathBuf {
@@ -119,7 +120,7 @@ pub fn spawn(app: &AppHandle<Wry>) -> Result<()> {
 
     #[cfg(all(debug_assertions, target_os = "windows"))]
     {
-        info!("Spawning dev services: home-dns & home-http (console)");
+        info!("Spawning dev services: home-dns, home-http & home-oidc (console)");
         // Essaye d'abord les binaires précompilés, puis fallback sur cargo run
         let bin_dir = workspace_root()
             .join("home-lab")
@@ -162,9 +163,28 @@ pub fn spawn(app: &AppHandle<Wry>) -> Result<()> {
         if http.is_none() {
             error!("Failed to spawn home-http (console)");
         }
+        let oidc = spawn_cargo_package("home-oidc", &["console"])
+            .ok()
+            .or_else(|| {
+                if cfg!(target_os = "windows") {
+                    let exe = bin_dir.join("home-oidc.exe");
+                    if exe.exists() {
+                        spawn_binary(exe, &["console"]).ok()
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            })
+            .map(|c| ProcGuard::new("home-oidc", c));
+        if oidc.is_none() {
+            error!("Failed to spawn home-oidc (console)");
+        }
         app.manage(DevServices {
             _dns: dns,
             _http: http,
+            _oidc: oidc,
         });
     }
     Ok(())

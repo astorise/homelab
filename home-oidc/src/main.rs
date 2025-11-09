@@ -61,12 +61,12 @@ use windows_service::{
     service_manager::{ServiceInfo, ServiceManager, ServiceManagerAccess},
 };
 
-const SERVICE_NAME: &str = "OidcService";
-const SERVICE_DISPLAY_NAME: &str = "OIDC Service";
+const SERVICE_NAME: &str = "HomeOidcService";
+const SERVICE_DISPLAY_NAME: &str = "Home OIDC Service";
 const SERVICE_DESCRIPTION: &str = "Minimal HTTPS OIDC provider with HTTP mirror";
 
 fn program_data_dir() -> PathBuf {
-    PathBuf::from(r"C:\\ProgramData\\oidc-service\\oidc")
+    PathBuf::from(r"C:\\ProgramData\\home-oidc\\oidc")
 }
 
 fn logs_dir() -> PathBuf {
@@ -195,7 +195,7 @@ fn init_logger(level: log::LevelFilter) -> Result<()> {
         .log_to_file(
             FileSpec::default()
                 .directory(dir)
-                .basename("oidc-service")
+                .basename("home-oidc")
                 .suffix("log"),
         )
         .duplicate_to_stderr(Duplicate::Error)
@@ -1023,7 +1023,7 @@ fn run_service() -> Result<()> {
 
 #[cfg(windows)]
 fn usage() {
-    eprintln!("Usage: oidc-service [run|install|uninstall|console]");
+    eprintln!("Usage: home-oidc [run|install|uninstall|console]");
 }
 
 #[cfg(windows)]
