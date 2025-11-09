@@ -11,63 +11,63 @@ fn main() {
     // If missing, try to build the services and/or copy from common target locations
     #[cfg(target_os = "windows")]
     {
-        let need_dns = !dst_bin.join("home-dns.exe").exists();
-        let need_http = !dst_bin.join("home-http.exe").exists();
-        if need_dns || need_http {
+        let services = [
+            ("home-dns", "home-dns.exe"),
+            ("home-http", "home-http.exe"),
+            ("home-oidc", "home-oidc.exe"),
+        ];
+        let missing_initial: Vec<_> = services
+            .iter()
+            .filter(|(_, exe)| !dst_bin.join(exe).exists())
+            .collect();
+        if !missing_initial.is_empty() {
             // Try copying from typical locations first
-            for (name, rel) in [
-                ("home-dns.exe", "home-dns.exe"),
-                ("home-http.exe", "home-http.exe"),
-            ] {
+            for (pkg, exe) in services.iter() {
                 let candidates = [
-                    workspace_root.join("target").join("release").join(rel),
+                    workspace_root.join("target").join("release").join(exe),
                     workspace_root
-                        .join("home-dns")
+                        .join(pkg)
                         .join("target")
                         .join("release")
-                        .join(rel),
-                    workspace_root
-                        .join("home-http")
-                        .join("target")
-                        .join("release")
-                        .join(rel),
-                    manifest_path.join("bin").join(rel),
+                        .join(exe),
+                    manifest_path.join("bin").join(exe),
                 ];
                 for c in candidates.iter() {
                     if c.exists() {
-                        let _ = std::fs::copy(c, dst_bin.join(name));
+                        let _ = std::fs::copy(c, dst_bin.join(exe));
                         break;
                     }
                 }
             }
 
             // If still missing, build them now (best effort)
-            let still_need =
-                !dst_bin.join("home-dns.exe").exists() || !dst_bin.join("home-http.exe").exists();
+            let still_missing: Vec<_> = services
+                .iter()
+                .filter(|(_, exe)| !dst_bin.join(exe).exists())
+                .collect();
+            let still_need = !still_missing.is_empty();
             if still_need {
-                println!(
-                    "cargo:warning=Building service binaries (home-dns, home-http) for bundling..."
-                );
-                let status = std::process::Command::new("cargo")
-                    .args(["build", "-p", "home-dns", "-p", "home-http", "--release"])
+                println!("cargo:warning=Building service binaries (home-dns, home-http, home-oidc) for bundling...");
+                let mut cmd = std::process::Command::new("cargo");
+                cmd.arg("build");
+                for (pkg, _) in services.iter() {
+                    cmd.arg("-p").arg(pkg);
+                }
+                cmd.arg("--release");
+                let status = cmd
                     .current_dir(workspace_root)
                     .status()
                     .expect("failed to spawn cargo build for services");
                 if status.success() {
-                    let _ = std::fs::copy(
-                        workspace_root
-                            .join("target")
-                            .join("release")
-                            .join("home-dns.exe"),
-                        dst_bin.join("home-dns.exe"),
-                    );
-                    let _ = std::fs::copy(
-                        workspace_root
-                            .join("target")
-                            .join("release")
-                            .join("home-http.exe"),
-                        dst_bin.join("home-http.exe"),
-                    );
+                    for (_, exe) in services.iter() {
+                        let _ = std::fs::copy(
+                            workspace_root
+                                .join("target")
+                                .join("release")
+                                .join(exe),
+                            dst_bin.join(exe),
+                        );
+                    }
                 } else {
                     println!("cargo:warning=Service binaries not built; installer will not manage services.");
                 }
@@ -77,7 +77,7 @@ fn main() {
 
     // Always prefer files from src-tauri/bin if present (developer override)
     let src_bin = manifest_path.join("bin");
-    for name in ["home-dns.exe", "home-http.exe"] {
+    for name in ["home-dns.exe", "home-http.exe", "home-oidc.exe"] {
         let src = src_bin.join(name);
         let dst = dst_bin.join(name);
         println!("cargo:rerun-if-changed={}", src.display());

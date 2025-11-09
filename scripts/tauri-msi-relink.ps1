@@ -89,10 +89,12 @@ function Install-MsiWithLog($msiPath) {
 
 function Verify-Services {
   Write-Host '=== Service status ==='
-  $svcs = Get-Service -Name HomeDnsService, HomeHttpService -ErrorAction SilentlyContinue |
+  $svcs = Get-Service -Name HomeDnsService, HomeHttpService, HomeOidcService -ErrorAction SilentlyContinue |
     Select-Object Name, Status, StartType
   if ($svcs) { $svcs | Format-Table -AutoSize | Out-String | Write-Host } else { Write-Host '(no services found)' }
-  return ($svcs -and ($svcs | Where-Object { $_.Name -eq 'HomeDnsService' -or $_.Name -eq 'HomeHttpService' } | Measure-Object).Count -eq 2)
+  return ($svcs -and ($svcs |
+    Where-Object { $_.Name -eq 'HomeDnsService' -or $_.Name -eq 'HomeHttpService' -or $_.Name -eq 'HomeOidcService' } |
+    Measure-Object).Count -eq 3)
 }
 
 function Ensure-ServicesIfMissing {
@@ -100,11 +102,13 @@ function Ensure-ServicesIfMissing {
   $bin = Join-Path $InstallDir 'bin'
   $dnsExe = Join-Path $bin 'home-dns.exe'
   $httpExe = Join-Path $bin 'home-http.exe'
+  $oidcExe = Join-Path $bin 'home-oidc.exe'
 
   $needDns = -not (Get-Service -Name HomeDnsService -ErrorAction SilentlyContinue)
   $needHttp = -not (Get-Service -Name HomeHttpService -ErrorAction SilentlyContinue)
+  $needOidc = -not (Get-Service -Name HomeOidcService -ErrorAction SilentlyContinue)
 
-  if (-not $needDns -and -not $needHttp) { Write-Host 'Services already present.'; return }
+  if (-not $needDns -and -not $needHttp -and -not $needOidc) { Write-Host 'Services already present.'; return }
 
   Write-Host '=== Fallback: installing missing services via bundled executables ==='
   if ($needDns -and (Test-Path $dnsExe)) {
@@ -115,10 +119,15 @@ function Ensure-ServicesIfMissing {
     Write-Host "Installing HTTP service: $httpExe install"
     & $httpExe install | Write-Host
   }
+  if ($needOidc -and (Test-Path $oidcExe)) {
+    Write-Host "Installing OIDC service: $oidcExe install"
+    & $oidcExe install | Write-Host
+  }
 
   # Try starting them (best effort)
   try { sc.exe start HomeDnsService  | Out-Null } catch {}
   try { sc.exe start HomeHttpService | Out-Null } catch {}
+  try { sc.exe start HomeOidcService | Out-Null } catch {}
 
   $ok = Verify-Services
   if (-not $ok) {
@@ -136,6 +145,13 @@ function Ensure-ServicesIfMissing {
       Write-Host "New-Service -Name HomeHttpService -BinaryPathName $binArg2 -DisplayName 'Home HTTP Service' -StartupType Automatic"
       try { New-Service -Name HomeHttpService -BinaryPathName $binArg2 -DisplayName 'Home HTTP Service' -StartupType Automatic | Out-Null } catch { Write-Warning $_ }
       try { sc.exe start HomeHttpService | Out-Null } catch { Write-Warning $_ }
+    }
+    if (-not (Get-Service -Name HomeOidcService -ErrorAction SilentlyContinue)) {
+      $oidcPath = Join-Path $bin 'home-oidc.exe'
+      $binArg3 = '"' + $oidcPath + '" run'
+      Write-Host "New-Service -Name HomeOidcService -BinaryPathName $binArg3 -DisplayName 'Home OIDC Service' -StartupType Automatic"
+      try { New-Service -Name HomeOidcService -BinaryPathName $binArg3 -DisplayName 'Home OIDC Service' -StartupType Automatic | Out-Null } catch { Write-Warning $_ }
+      try { sc.exe start HomeOidcService | Out-Null } catch { Write-Warning $_ }
     }
     Verify-Services | Out-Null
   }

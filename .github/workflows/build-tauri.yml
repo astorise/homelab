@@ -46,10 +46,12 @@ jobs:
         run: |
           cargo build -p home-dns   --release --target x86_64-pc-windows-gnu
           cargo build -p home-http --release --target x86_64-pc-windows-gnu
+          cargo build -p home-oidc --release --target x86_64-pc-windows-gnu
           ls -lah target/x86_64-pc-windows-gnu/release
           mkdir -p services-win
           cp target/x86_64-pc-windows-gnu/release/home-dns.exe   services-win/
           cp target/x86_64-pc-windows-gnu/release/home-http.exe services-win/
+          cp target/x86_64-pc-windows-gnu/release/home-oidc.exe services-win/
 
       - name: Upload services artifacts
         uses: actions/upload-artifact@v5
