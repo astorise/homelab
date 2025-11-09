@@ -40,6 +40,7 @@
       "resources/logs": "logs",
       "resources/conf": "conf",
       "resources/bin": "bin",
+      "resources/scripts": "scripts",
       "resources/wsl": "wsl",
       "icons": "icons",
       "resources/version.txt": "version.txt"
