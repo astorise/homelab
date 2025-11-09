@@ -28,7 +28,7 @@ serde_with = { version = "3.8", features = ["macros"] }
 serde_urlencoded = "0.7"
 sha2 = "0.10"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "time", "net"] }
-tokio-rustls = "0.24"
+tokio-rustls = "0.26"
 tokio-util = { version = "0.7", features = ["full"] }
 url = "2.5"
 windows-service = { workspace = true }
