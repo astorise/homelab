@@ -50,15 +50,15 @@ use tokio_rustls::TlsAcceptor;
 
 #[cfg(windows)]
 use windows_service::service::{
-    ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus, ServiceType,
+    ServiceAccess, ServiceControl, ServiceControlAccept, ServiceErrorControl, ServiceExitCode,
+    ServiceInfo, ServiceStartType, ServiceState, ServiceStatus, ServiceType,
 };
 #[cfg(windows)]
 use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
 #[cfg(windows)]
 use windows_service::{
     define_windows_service,
-    service::{ServiceAccess, ServiceErrorControl, ServiceStartType},
-    service_manager::{ServiceInfo, ServiceManager, ServiceManagerAccess},
+    service_manager::{ServiceManager, ServiceManagerAccess},
 };
 
 const SERVICE_NAME: &str = "HomeOidcService";
@@ -988,10 +988,11 @@ fn service_main(_args: Vec<OsString>) {
 #[cfg(windows)]
 fn run_service() -> Result<()> {
     let cancel = STOP_TOKEN.clone();
+    let handler_cancel = cancel.clone();
     let event_handler = move |control_event| -> ServiceControlHandlerResult {
         match control_event {
             ServiceControl::Stop | ServiceControl::Shutdown => {
-                cancel.cancel();
+                handler_cancel.cancel();
                 ServiceControlHandlerResult::NoError
             }
             _ => ServiceControlHandlerResult::NotImplemented,
@@ -1016,7 +1017,7 @@ fn run_service() -> Result<()> {
     info!("OIDC service starting");
     let material = load_key_material(&cfg)?;
     set_status(ServiceState::Running);
-    run_servers(cfg, material, cancel.clone())?;
+    run_servers(cfg, material, cancel)?;
     set_status(ServiceState::Stopped);
     Ok(())
 }
