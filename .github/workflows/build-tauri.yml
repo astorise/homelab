@@ -20,38 +20,32 @@ jobs:
           name: env-dev-image.tar
           path: env-dev-image.tar
   build-services:
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v5
-
-      - name: Install mingw for Windows cross-compile
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y mingw-w64
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: x86_64-pc-windows-gnu
+          targets: x86_64-pc-windows-msvc
 
       - name: Cache Rust (workspace)
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: services-x86_64-pc-windows-gnu
+          shared-key: services-x86_64-pc-windows-msvc
           cache-on-failure: true
 
-      - name: Build services (Windows gnu)
-        env:
-          RUSTFLAGS: "-C target-feature=+crt-static"
+      - name: Build services (Windows MSVC)
+        shell: pwsh
         run: |
-          cargo build -p home-dns   --release --target x86_64-pc-windows-gnu
-          cargo build -p home-http --release --target x86_64-pc-windows-gnu
-          cargo build -p home-oidc --release --target x86_64-pc-windows-gnu
-          ls -lah target/x86_64-pc-windows-gnu/release
-          mkdir -p services-win
-          cp target/x86_64-pc-windows-gnu/release/home-dns.exe   services-win/
-          cp target/x86_64-pc-windows-gnu/release/home-http.exe services-win/
-          cp target/x86_64-pc-windows-gnu/release/home-oidc.exe services-win/
+          cargo build -p home-dns   --release
+          cargo build -p home-http --release
+          cargo build -p home-oidc --release
+          Get-ChildItem target/release -Filter 'home-*.exe'
+          New-Item -ItemType Directory -Path services-win -Force | Out-Null
+          Copy-Item target/release/home-dns.exe   services-win/ -Force
+          Copy-Item target/release/home-http.exe  services-win/ -Force
+          Copy-Item target/release/home-oidc.exe services-win/ -Force
 
       - name: Upload services artifacts
         uses: actions/upload-artifact@v5
