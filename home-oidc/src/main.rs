@@ -29,7 +29,7 @@ use serde_with::skip_serializing_none;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::convert::TryInto;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -863,18 +863,25 @@ fn run_servers(cfg: ServiceConfig, material: KeyMaterial, cancel: CancellationTo
 
 #[cfg(windows)]
 fn install_service() -> Result<()> {
-    ensure_program_data()?;
-    let cfg = load_config_or_init()?;
-    let _material = load_key_material(&cfg)?;
-    import_certificate_to_trust_store(&certificate_path())?;
-    ensure_firewall_rule(cfg.https_port)?;
-    let exe_path = std::env::current_exe()?;
+    ensure_program_data().context("ensure program data directory")?;
+    append_install_log("=== home-oidc install_service starting ===");
+    let cfg = load_config_or_init().context("load or initialize config")?;
+    append_install_log("Configuration loaded");
+    load_key_material(&cfg).context("ensure TLS key material")?;
+    append_install_log("Key material ensured");
+    import_certificate_to_trust_store(&certificate_path())
+        .context("import certificate to Windows trust store")?;
+    append_install_log("Certificate imported (best effort)");
+    ensure_firewall_rule(cfg.https_port).context("ensure firewall rule")?;
+    append_install_log(&format!("Firewall rule verified for port {}", cfg.https_port));
+    let exe_path = std::env::current_exe().context("determine current executable path")?;
     let manager = ServiceManager::local_computer(
         None::<&str>,
         ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE,
     )?;
     if let Ok(_) = manager.open_service(SERVICE_NAME, ServiceAccess::QUERY_STATUS) {
         info!("service already installed");
+        append_install_log("Service already installed");
         return Ok(());
     }
     let service_info = ServiceInfo {
@@ -894,6 +901,7 @@ fn install_service() -> Result<()> {
         ServiceAccess::CHANGE_CONFIG | ServiceAccess::START,
     )?;
     service.set_description(SERVICE_DESCRIPTION)?;
+    append_install_log("Service registration completed");
     Ok(())
 }
 
@@ -973,6 +981,22 @@ fn ensure_firewall_rule(port: u16) -> Result<()> {
 }
 
 #[cfg(windows)]
+fn append_install_log(message: &str) {
+    use std::io::Write;
+    use std::time::SystemTime;
+
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let line = format!("[{ts}] {message}");
+    let path = program_data_dir().join("install.log");
+    if let Ok(mut file) = OpenOptions::new().append(true).create(true).open(&path) {
+        let _ = writeln!(file, "{line}");
+    }
+}
+
+#[cfg(windows)]
 static STOP_TOKEN: Lazy<CancellationToken> = Lazy::new(CancellationToken::new);
 
 #[cfg(windows)]
@@ -1043,11 +1067,19 @@ fn main() -> Result<()> {
             }
         }
         "install" => {
-            install_service()?;
-            println!(
-                "Service installed. Update {} then start the service.",
-                config_path().display()
-            );
+            match install_service() {
+                Ok(_) => {
+                    append_install_log("Install completed successfully");
+                    println!(
+                        "Service installed. Update {} then start the service.",
+                        config_path().display()
+                    );
+                }
+                Err(e) => {
+                    append_install_log(&format!("ERROR: {e:?}"));
+                    return Err(e);
+                }
+            }
         }
         "uninstall" => {
             uninstall_service()?;
