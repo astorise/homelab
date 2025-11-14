@@ -15,24 +15,24 @@
   <Fragment>
     <!-- Post-install: run "home-dns.exe install", "home-http.exe install" and "home-oidc.exe install", then start them -->
     <CustomAction Id="InstallHomeDns" Directory="INSTALLDIR" Execute="deferred" Impersonate="no"
-                  ExeCommand='"[SystemFolder]cmd.exe" /C ""[INSTALLDIR]bin\home-dns.exe" install >> "[INSTALLDIR]installer-msi.log" 2>&1"' Return="check" />
+                  ExeCommand='"[SystemFolder]cmd.exe" /C ""[INSTALLDIR]bin\home-dns.exe" install &gt;&gt; "[INSTALLDIR]installer-msi.log" 2&gt;&amp;1"' Return="check" />
     <CustomAction Id="InstallHomeHttp" Directory="INSTALLDIR" Execute="deferred" Impersonate="no"
-                  ExeCommand='"[SystemFolder]cmd.exe" /C ""[INSTALLDIR]bin\home-http.exe" install >> "[INSTALLDIR]installer-msi.log" 2>&1"' Return="check" />
+                  ExeCommand='"[SystemFolder]cmd.exe" /C ""[INSTALLDIR]bin\home-http.exe" install &gt;&gt; "[INSTALLDIR]installer-msi.log" 2&gt;&amp;1"' Return="check" />
     <CustomAction Id="InstallHomeOidc" Directory="INSTALLDIR" Execute="deferred" Impersonate="no"
-                  ExeCommand='"[SystemFolder]cmd.exe" /C ""[INSTALLDIR]bin\home-oidc.exe" install >> "[INSTALLDIR]installer-msi.log" 2>&1"' Return="check" />
+                  ExeCommand='"[SystemFolder]cmd.exe" /C ""[INSTALLDIR]bin\home-oidc.exe" install &gt;&gt; "[INSTALLDIR]installer-msi.log" 2&gt;&amp;1"' Return="check" />
     <CustomAction Id="StartHomeDns" Directory="INSTALLDIR" Execute="deferred" Impersonate="no"
-                  ExeCommand='"[SystemFolder]cmd.exe" /C ""[SystemFolder]sc.exe" start HomeDnsService >> "[INSTALLDIR]installer-msi.log" 2>&1"' Return="ignore" />
+                  ExeCommand='"[SystemFolder]cmd.exe" /C ""[SystemFolder]sc.exe" start HomeDnsService &gt;&gt; "[INSTALLDIR]installer-msi.log" 2&gt;&amp;1"' Return="ignore" />
     <CustomAction Id="StartHomeHttp" Directory="INSTALLDIR" Execute="deferred" Impersonate="no"
-                  ExeCommand='"[SystemFolder]cmd.exe" /C ""[SystemFolder]sc.exe" start HomeHttpService >> "[INSTALLDIR]installer-msi.log" 2>&1"' Return="ignore" />
+                  ExeCommand='"[SystemFolder]cmd.exe" /C ""[SystemFolder]sc.exe" start HomeHttpService &gt;&gt; "[INSTALLDIR]installer-msi.log" 2&gt;&amp;1"' Return="ignore" />
     <CustomAction Id="StartHomeOidc" Directory="INSTALLDIR" Execute="deferred" Impersonate="no"
-                  ExeCommand='"[SystemFolder]cmd.exe" /C ""[SystemFolder]sc.exe" start HomeOidcService >> "[INSTALLDIR]installer-msi.log" 2>&1"' Return="ignore" />
+                  ExeCommand='"[SystemFolder]cmd.exe" /C ""[SystemFolder]sc.exe" start HomeOidcService &gt;&gt; "[INSTALLDIR]installer-msi.log" 2&gt;&amp;1"' Return="ignore" />
     <!-- Uninstall: prefer binary uninstallers; rely on ServiceControl as safety net -->
     <CustomAction Id="UninstallHomeDns" Directory="INSTALLDIR" Execute="deferred" Impersonate="no"
-                  ExeCommand='"[SystemFolder]cmd.exe" /C ""[INSTALLDIR]bin\home-dns.exe" uninstall >> "[INSTALLDIR]installer-msi.log" 2>&1"' Return="ignore" />
+                  ExeCommand='"[SystemFolder]cmd.exe" /C ""[INSTALLDIR]bin\home-dns.exe" uninstall &gt;&gt; "[INSTALLDIR]installer-msi.log" 2&gt;&amp;1"' Return="ignore" />
     <CustomAction Id="UninstallHomeHttp" Directory="INSTALLDIR" Execute="deferred" Impersonate="no"
-                  ExeCommand='"[SystemFolder]cmd.exe" /C ""[INSTALLDIR]bin\home-http.exe" uninstall >> "[INSTALLDIR]installer-msi.log" 2>&1"' Return="ignore" />
+                  ExeCommand='"[SystemFolder]cmd.exe" /C ""[INSTALLDIR]bin\home-http.exe" uninstall &gt;&gt; "[INSTALLDIR]installer-msi.log" 2&gt;&amp;1"' Return="ignore" />
     <CustomAction Id="UninstallHomeOidc" Directory="INSTALLDIR" Execute="deferred" Impersonate="no"
-                  ExeCommand='"[SystemFolder]cmd.exe" /C ""[INSTALLDIR]bin\home-oidc.exe" uninstall >> "[INSTALLDIR]installer-msi.log" 2>&1"' Return="ignore" />
+                  ExeCommand='"[SystemFolder]cmd.exe" /C ""[INSTALLDIR]bin\home-oidc.exe" uninstall &gt;&gt; "[INSTALLDIR]installer-msi.log" 2&gt;&amp;1"' Return="ignore" />
 
     <!-- Optional traces to [INSTALLDIR]installer-msi.log to help debug inclusion -->
     <CustomAction Id="TraceInstallServices" Directory="INSTALLDIR"
