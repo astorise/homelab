@@ -16,10 +16,10 @@ use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
 use jsonwebtoken::{EncodingKey, Header};
 use log::{error, info};
-use rand::RngCore;
+use rand::{rngs::OsRng, RngCore};
 use rcgen::{CertificateParams, DnType, IsCa, KeyPair, SanType};
 use rsa::pkcs1::DecodeRsaPrivateKey;
-use rsa::pkcs8::DecodePrivateKey;
+use rsa::pkcs8::{DecodePrivateKey, EncodePrivateKey, LineEnding};
 use rsa::traits::PublicKeyParts;
 use rsa::RsaPrivateKey;
 use rustls::{Certificate as RustlsCertificate, PrivateKey as RustlsPrivateKey, ServerConfig};
@@ -278,9 +278,16 @@ fn ensure_certificate(cfg: &ServiceConfig) -> Result<()> {
             .subject_alt_names
             .push(SanType::IpAddress(IpAddr::V4(ip)));
     }
-    let key_pair = KeyPair::generate_for(&rcgen::PKCS_RSA_SHA256)?;
-    let cert = params.self_signed(&key_pair)?;
-    let key_pem = key_pair.serialize_pem();
+    let mut rng = OsRng;
+    let rsa_key = RsaPrivateKey::new(&mut rng, 4096).context("generate rsa key")?;
+    let key_pem = rsa_key
+        .to_pkcs8_pem(LineEnding::LF)
+        .context("serialize rsa key to PKCS#8")?
+        .to_string();
+    let key_pair = KeyPair::from_pem(&key_pem).context("load rcgen key pair")?;
+    let cert = params
+        .self_signed(&key_pair)
+        .context("self-sign certificate with rsa key")?;
     let cert_pem = cert.pem();
     write_atomic(&private_key_path(), key_pem.as_bytes())?;
     write_atomic(&certificate_path(), cert_pem.as_bytes())?;
