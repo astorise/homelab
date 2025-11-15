@@ -97,6 +97,7 @@ fn main() {
     let files = [
         proto_dir.join("home_dns.proto"),
         proto_dir.join("home_http.proto"),
+        proto_dir.join("home_oidc.proto"),
     ];
     let include_dirs = [proto_dir.clone()];
     for f in &files {

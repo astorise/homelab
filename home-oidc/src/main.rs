@@ -14,7 +14,7 @@ use hyper::body::{Bytes, Incoming};
 use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
-use jsonwebtoken::{EncodingKey, Header};
+use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use log::{error, info};
 use rand::{rngs::OsRng, RngCore};
 use rcgen::{CertificateParams, DnType, IsCa, KeyPair, SanType};
@@ -30,23 +30,41 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::convert::TryInto;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufReader, Write};
+use std::io::{self, BufReader, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpListener;
+#[cfg(windows)]
+use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 use tokio::runtime::Runtime;
+use tokio::sync::{Mutex as AsyncMutex, RwLock};
 use tokio_util::sync::CancellationToken;
+#[cfg(windows)]
+use tonic::transport::{server::Connected, Server};
+use tonic::{async_trait, Request as GrpcRequest, Response as GrpcResponse, Status};
 use url::Url;
 
 #[cfg(windows)]
-use log::warn;
+use pin_project::pin_project;
+use tokio_rustls::TlsAcceptor;
 #[cfg(windows)]
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+#[cfg(windows)]
+use tokio::sync::mpsc;
+#[cfg(windows)]
+use tokio_stream::wrappers::UnboundedReceiverStream;
+#[cfg(windows)]
+use std::pin::Pin;
+#[cfg(windows)]
+use std::task::{Context as TaskContext, Poll};
+
+#[cfg(windows)]
+use log::warn;
 use once_cell::sync::Lazy;
 #[cfg(windows)]
-use std::ffi::OsString;
-use tokio_rustls::TlsAcceptor;
+use std::ffi::{OsString, c_void};
 
 #[cfg(windows)]
 use windows_service::service::{
@@ -64,6 +82,30 @@ use windows_service::{
 const SERVICE_NAME: &str = "HomeOidcService";
 const SERVICE_DISPLAY_NAME: &str = "Home OIDC Service";
 const SERVICE_DESCRIPTION: &str = "Minimal HTTPS OIDC provider with HTTP mirror";
+const CLIENT_ASSERTION_JWT: &str =
+    "urn:ietf:params:oauth:client-assertion-type:jwt-bearer";
+
+#[cfg(all(debug_assertions, windows))]
+const NAMED_PIPE_NAME: &str = r"\\.\pipe\home-oidc-dev";
+#[cfg(all(not(debug_assertions), windows))]
+const NAMED_PIPE_NAME: &str = r"\\.\pipe\home-oidc";
+
+mod proto {
+    pub mod homeoidc {
+        pub mod v1 {
+            tonic::include_proto!("homeoidc.v1");
+        }
+    }
+}
+
+use proto::homeoidc::v1::home_oidc_server::{HomeOidc, HomeOidcServer};
+use proto::homeoidc::v1::list_clients_response::{
+    Client as ClientMsg, PasswordUser as PasswordUserMsg,
+};
+use proto::homeoidc::v1::{
+    Acknowledge, Empty, ListClientsResponse, RegisterClientRequest, RemoveClientRequest,
+    StatusResponse,
+};
 
 fn program_data_dir() -> PathBuf {
     PathBuf::from(r"C:\\ProgramData\\home-oidc\\oidc")
@@ -127,6 +169,32 @@ struct ClientConfig {
     audiences: Vec<String>,
     #[serde(default)]
     password_users: Vec<PasswordUser>,
+    #[serde(default)]
+    auth_method: ClientAuthMethod,
+    #[serde(default)]
+    client_public_key_pem: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ClientAuthMethod {
+    ClientSecret,
+    PrivateKeyJwt,
+}
+
+impl Default for ClientAuthMethod {
+    fn default() -> Self {
+        ClientAuthMethod::ClientSecret
+    }
+}
+
+impl ClientAuthMethod {
+    fn as_str(&self) -> &'static str {
+        match self {
+            ClientAuthMethod::ClientSecret => "client_secret_post",
+            ClientAuthMethod::PrivateKeyJwt => "private_key_jwt",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -169,6 +237,8 @@ impl Default for ServiceConfig {
                     subject: Some("demo-user".to_string()),
                     scopes: vec!["demo.read".to_string()],
                 }],
+                auth_method: ClientAuthMethod::ClientSecret,
+                client_public_key_pem: None,
             }],
             token_ttl_secs: default_token_ttl(),
             log_level: Some("info".to_string()),
@@ -390,6 +460,15 @@ struct TokenRequest {
     username: Option<String>,
     #[serde(default)]
     password: Option<String>,
+    #[serde(default)]
+    client_assertion_type: Option<String>,
+    #[serde(default)]
+    client_assertion: Option<String>,
+}
+
+fn persist_service_config(cfg: &ServiceConfig) -> Result<()> {
+    let data = serde_json::to_vec_pretty(cfg)?;
+    write_atomic(&config_path(), &data)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -404,12 +483,39 @@ struct TokenClaims {
     client_id: Option<String>,
 }
 
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum AudienceClaim {
+    Single(String),
+    Multiple(Vec<String>),
+}
+
+impl AudienceClaim {
+    fn contains(&self, expected: &str) -> bool {
+        match self {
+            AudienceClaim::Single(value) => value == expected,
+            AudienceClaim::Multiple(values) => values.iter().any(|v| v == expected),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct ClientAssertionClaims {
+    iss: String,
+    sub: String,
+    aud: AudienceClaim,
+    exp: u64,
+    iat: Option<u64>,
+    jti: Option<String>,
+}
+
 struct AppState {
     cfg: ServiceConfig,
-    clients: HashMap<String, ClientConfig>,
+    clients: RwLock<HashMap<String, ClientConfig>>,
     key: EncodingKey,
     kid: String,
     jwks_json: String,
+    token_endpoint: String,
 }
 
 impl AppState {
@@ -477,6 +583,176 @@ fn collect_supported_scopes(clients: &HashMap<String, ClientConfig>) -> Vec<Stri
     scopes
 }
 
+#[derive(Clone)]
+struct OidcGrpcService {
+    state: Arc<AppState>,
+}
+
+#[async_trait]
+impl HomeOidc for OidcGrpcService {
+    async fn get_status(
+        &self,
+        _request: GrpcRequest<Empty>,
+    ) -> Result<GrpcResponse<StatusResponse>, Status> {
+        let level = self
+            .state
+            .cfg
+            .log_level
+            .clone()
+            .unwrap_or_else(|| "info".to_string());
+        let issuer = self.state.cfg.issuer.trim_end_matches('/').to_string();
+        Ok(GrpcResponse::new(StatusResponse {
+            state: "running".to_string(),
+            log_level: level,
+            issuer,
+            token_endpoint: self.state.token_endpoint.clone(),
+        }))
+    }
+
+    async fn list_clients(
+        &self,
+        _request: GrpcRequest<Empty>,
+    ) -> Result<GrpcResponse<ListClientsResponse>, Status> {
+        let clients = self
+            .state
+            .cfg
+            .clients
+            .iter()
+            .map(|client| {
+                let password_users = client
+                    .password_users
+                    .iter()
+                    .map(|user| PasswordUserMsg {
+                        username: user.username.clone(),
+                        subject: user.subject.clone().unwrap_or_default(),
+                        scopes: user.scopes.clone(),
+                    })
+                    .collect();
+                ClientMsg {
+                    client_id: client.client_id.clone(),
+                    subject: client.subject.clone().unwrap_or_default(),
+                    allowed_scopes: client.allowed_scopes.clone(),
+                    audiences: client.audiences.clone(),
+                    password_users,
+                    auth_method: client.auth_method.as_str().to_string(),
+                    public_key_pem: client
+                        .client_public_key_pem
+                        .clone()
+                        .unwrap_or_default(),
+                }
+            })
+            .collect();
+        Ok(GrpcResponse::new(ListClientsResponse { clients }))
+    }
+
+    async fn register_client(
+        &self,
+        request: GrpcRequest<RegisterClientRequest>,
+    ) -> Result<GrpcResponse<Acknowledge>, Status> {
+        let req = request.into_inner();
+        let raw_id = req.client_id.trim();
+        if raw_id.is_empty() {
+            return Err(Status::invalid_argument("client_id required"));
+        }
+        let auth_method = match req.auth_method.trim() {
+            "" | "private_key_jwt" => ClientAuthMethod::PrivateKeyJwt,
+            other if other.eq_ignore_ascii_case("client_secret")
+                || other.eq_ignore_ascii_case("client_secret_post") =>
+            {
+                return Err(Status::invalid_argument(
+                    "client_secret clients must be managed via configuration file",
+                ))
+            }
+            other => {
+                return Err(Status::invalid_argument(format!(
+                    "unsupported auth_method '{other}'"
+                )))
+            }
+        };
+        let public_key = req.public_key_pem.trim().to_string();
+        if auth_method == ClientAuthMethod::PrivateKeyJwt && public_key.is_empty() {
+            return Err(Status::invalid_argument("public_key_pem required"));
+        }
+        let subject = if req.subject.trim().is_empty() {
+            Some(raw_id.to_string())
+        } else {
+            Some(req.subject.trim().to_string())
+        };
+        let allowed_scopes = req
+            .allowed_scopes
+            .into_iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>();
+        let audiences = req
+            .audiences
+            .into_iter()
+            .map(|a| a.trim().to_string())
+            .filter(|a| !a.is_empty())
+            .collect::<Vec<_>>();
+        let mut client = ClientConfig {
+            client_id: raw_id.to_string(),
+            client_secret: String::new(),
+            allowed_scopes,
+            subject,
+            audiences,
+            password_users: vec![],
+            auth_method: auth_method.clone(),
+            client_public_key_pem: if public_key.is_empty() {
+                None
+            } else {
+                Some(public_key.clone())
+            },
+        };
+        let mut cfg_guard = CONFIG_WRITE_LOCK.lock().await;
+        let mut cfg = load_config_or_init().map_err(|e| Status::internal(e.to_string()))?;
+        cfg.clients.retain(|c| c.client_id != client.client_id);
+        cfg.clients.push(client.clone());
+        persist_service_config(&cfg).map_err(|e| Status::internal(e.to_string()))?;
+        drop(cfg_guard);
+        {
+            let mut map = self.state.clients.write().await;
+            map.insert(client.client_id.clone(), client);
+        }
+        Ok(GrpcResponse::new(Acknowledge {
+            ok: true,
+            message: "client registered".into(),
+        }))
+    }
+
+    async fn remove_client(
+        &self,
+        request: GrpcRequest<RemoveClientRequest>,
+    ) -> Result<GrpcResponse<Acknowledge>, Status> {
+        let req = request.into_inner();
+        let raw_id = req.client_id.trim();
+        if raw_id.is_empty() {
+            return Err(Status::invalid_argument("client_id required"));
+        }
+        let mut cfg_guard = CONFIG_WRITE_LOCK.lock().await;
+        let mut cfg = load_config_or_init().map_err(|e| Status::internal(e.to_string()))?;
+        let before = cfg.clients.len();
+        cfg.clients.retain(|c| c.client_id != raw_id);
+        let removed = before != cfg.clients.len();
+        if removed {
+            persist_service_config(&cfg).map_err(|e| Status::internal(e.to_string()))?;
+        }
+        drop(cfg_guard);
+        if removed {
+            let mut map = self.state.clients.write().await;
+            map.remove(raw_id);
+        }
+        Ok(GrpcResponse::new(Acknowledge {
+            ok: removed,
+            message: if removed {
+                "client removed".into()
+            } else {
+                "client not found".into()
+            },
+        }))
+    }
+}
+
 async fn handle_request(
     req: Request<Incoming>,
     state: Arc<AppState>,
@@ -484,18 +760,28 @@ async fn handle_request(
     let path = req.uri().path().to_string();
     match (req.method(), path.as_str()) {
         (&Method::GET, "/.well-known/openid-configuration") => {
+            let issuer = state.cfg.issuer.trim_end_matches('/').to_string();
+            let token_endpoint = format!("{}/token", issuer);
+            let jwks_uri = format!("{}/jwks.json", issuer);
+            let clients_guard = state.clients.read().await;
+            let mut auth_methods = vec!["client_secret_basic".into(), "client_secret_post".into()];
+            if clients_guard
+                .values()
+                .any(|c| c.auth_method == ClientAuthMethod::PrivateKeyJwt)
+            {
+                auth_methods.push("private_key_jwt".into());
+            }
+            let scopes_supported = collect_supported_scopes(&clients_guard);
+            drop(clients_guard);
             let response = WellKnownResponse {
-                issuer: state.cfg.issuer.clone(),
+                issuer,
                 authorization_endpoint: None,
-                token_endpoint: format!("{}/token", state.cfg.issuer),
-                jwks_uri: format!("{}/jwks.json", state.cfg.issuer),
+                token_endpoint,
+                jwks_uri,
                 response_types_supported: vec!["token".into()],
                 grant_types_supported: vec!["client_credentials".into(), "password".into()],
-                token_endpoint_auth_methods_supported: vec![
-                    "client_secret_basic".into(),
-                    "client_secret_post".into(),
-                ],
-                scopes_supported: collect_supported_scopes(&state.clients),
+                token_endpoint_auth_methods_supported: auth_methods,
+                scopes_supported,
                 subject_types_supported: vec!["public".into()],
             };
             let body = serde_json::to_vec(&response)?;
@@ -545,7 +831,7 @@ async fn handle_token(
         }
     }
     let request = TokenRequest::from(params);
-    process_token_request(request, state)
+    process_token_request(request, state).await
 }
 
 impl From<HashMap<String, String>> for TokenRequest {
@@ -559,6 +845,8 @@ impl From<HashMap<String, String>> for TokenRequest {
             client_secret: map.remove("client_secret"),
             username: map.remove("username"),
             password: map.remove("password"),
+            client_assertion_type: map.remove("client_assertion_type"),
+            client_assertion: map.remove("client_assertion"),
         }
     }
 }
@@ -572,7 +860,10 @@ fn json_error(status: StatusCode, code: &str, desc: &str) -> Result<Response<Ful
         ))?)
 }
 
-fn process_token_request(req: TokenRequest, state: Arc<AppState>) -> Result<Response<Full<Bytes>>> {
+async fn process_token_request(
+    req: TokenRequest,
+    state: Arc<AppState>,
+) -> Result<Response<Full<Bytes>>> {
     if req.grant_type.is_empty() {
         return json_error(
             StatusCode::BAD_REQUEST,
@@ -590,16 +881,109 @@ fn process_token_request(req: TokenRequest, state: Arc<AppState>) -> Result<Resp
             )
         }
     };
-    let client = match state.clients.get(&client_id).cloned() {
+    let client = {
+        let guard = state.clients.read().await;
+        guard.get(&client_id).cloned()
+    };
+    let client = match client {
         Some(c) => c,
         None => return json_error(StatusCode::UNAUTHORIZED, "invalid_client", "unknown client"),
     };
-    if client.client_secret != req.client_secret.as_deref().unwrap_or_default() {
-        return json_error(
-            StatusCode::UNAUTHORIZED,
-            "invalid_client",
-            "invalid client secret",
-        );
+    match client.auth_method {
+        ClientAuthMethod::ClientSecret => {
+            if client.client_secret != req.client_secret.as_deref().unwrap_or_default() {
+                return json_error(
+                    StatusCode::UNAUTHORIZED,
+                    "invalid_client",
+                    "invalid client secret",
+                );
+            }
+        }
+        ClientAuthMethod::PrivateKeyJwt => {
+            if req
+                .client_assertion_type
+                .as_deref()
+                .map(|t| t.eq_ignore_ascii_case(CLIENT_ASSERTION_JWT))
+                != Some(true)
+            {
+                return json_error(
+                    StatusCode::UNAUTHORIZED,
+                    "invalid_client",
+                    "client assertion required",
+                );
+            }
+            let assertion = match req.client_assertion.as_deref() {
+                Some(value) if !value.is_empty() => value,
+                _ => {
+                    return json_error(
+                        StatusCode::UNAUTHORIZED,
+                        "invalid_client",
+                        "client assertion required",
+                    )
+                }
+            };
+            let pem = match client.client_public_key_pem.as_ref() {
+                Some(pem) if !pem.is_empty() => pem,
+                _ => {
+                    error!(
+                        "client {} configured for private_key_jwt without public key",
+                        client.client_id
+                    );
+                    return json_error(
+                        StatusCode::UNAUTHORIZED,
+                        "invalid_client",
+                        "client public key missing",
+                    );
+                }
+            };
+            let decoding = match DecodingKey::from_rsa_pem(pem.as_bytes()) {
+                Ok(key) => key,
+                Err(err) => {
+                    error!("invalid client public key for {}: {err:?}", client.client_id);
+                    return json_error(
+                        StatusCode::UNAUTHORIZED,
+                        "invalid_client",
+                        "invalid client public key",
+                    );
+                }
+            };
+            let mut validation = Validation::new(Algorithm::RS256);
+            let expected = vec![state.token_endpoint.clone()];
+            validation.set_audience(expected.as_slice());
+            validation.validate_aud = true;
+            let claims = match jsonwebtoken::decode::<ClientAssertionClaims>(
+                assertion,
+                &decoding,
+                &validation,
+            ) {
+                Ok(token) => token.claims,
+                Err(err) => {
+                    error!(
+                        "client assertion validation failed for {}: {err:?}",
+                        client.client_id
+                    );
+                    return json_error(
+                        StatusCode::UNAUTHORIZED,
+                        "invalid_client",
+                        "invalid client assertion",
+                    );
+                }
+            };
+            if claims.iss != client.client_id || claims.sub != client.client_id {
+                return json_error(
+                    StatusCode::UNAUTHORIZED,
+                    "invalid_client",
+                    "invalid client assertion issuer",
+                );
+            }
+            if !claims.aud.contains(&state.token_endpoint) {
+                return json_error(
+                    StatusCode::UNAUTHORIZED,
+                    "invalid_client",
+                    "invalid client assertion audience",
+                );
+            }
+        }
     }
     match req.grant_type.as_str() {
         "client_credentials" => issue_client_credentials_token(req, state, &client),
@@ -829,6 +1213,26 @@ async fn serve_https(
     Ok(())
 }
 
+#[cfg(windows)]
+async fn run_grpc_server(state: Arc<AppState>, cancel: CancellationToken) -> Result<()> {
+    let service = OidcGrpcService { state };
+    let server = Server::builder().add_service(HomeOidcServer::new(service));
+
+    let incoming = named_pipe_stream()
+        .map_err(|e| anyhow!("failed to prepare management pipe: {e}"))?;
+    info!("gRPC server listening on {}", NAMED_PIPE_NAME);
+
+    tokio::select! {
+        res = server.serve_with_incoming(incoming) => {
+            res.map_err(|e| anyhow!(e))?;
+        }
+        _ = cancel.cancelled() => {
+            info!("gRPC server cancellation requested");
+        }
+    }
+    Ok(())
+}
+
 fn run_servers(cfg: ServiceConfig, material: KeyMaterial, cancel: CancellationToken) -> Result<()> {
     let rt = Runtime::new()?;
     let clients = cfg
@@ -836,12 +1240,15 @@ fn run_servers(cfg: ServiceConfig, material: KeyMaterial, cancel: CancellationTo
         .iter()
         .map(|c| (c.client_id.clone(), c.clone()))
         .collect();
+    let issuer = cfg.issuer.trim_end_matches('/').to_string();
+    let token_endpoint = format!("{}/token", issuer);
     let state = Arc::new(AppState {
         cfg: cfg.clone(),
-        clients,
+        clients: RwLock::new(clients),
         key: material.encoding,
         kid: material.kid,
         jwks_json: material.jwks_json,
+        token_endpoint,
     });
     let http_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), cfg.http_port);
     let https_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), cfg.https_port);
@@ -851,6 +1258,16 @@ fn run_servers(cfg: ServiceConfig, material: KeyMaterial, cancel: CancellationTo
         let cancel_https = cancel.clone();
         let http = tokio::spawn(serve_http(http_addr, state.clone(), cancel_http));
         let https = tokio::spawn(serve_https(https_addr, state.clone(), cancel_https, tls));
+        #[cfg(windows)]
+        {
+            let cancel_grpc = cancel.clone();
+            let state_grpc = state.clone();
+            tokio::spawn(async move {
+                if let Err(err) = run_grpc_server(state_grpc, cancel_grpc).await {
+                    error!("gRPC server error: {err:?}");
+                }
+            });
+        }
         tokio::select! {
             res = http => {
                 if let Err(e) = res {
@@ -866,6 +1283,169 @@ fn run_servers(cfg: ServiceConfig, material: KeyMaterial, cancel: CancellationTo
         }
     });
     Ok(())
+}
+
+#[cfg(windows)]
+fn get_permissive_security_attributes() -> Result<
+    (
+        windows_sys::Win32::Security::SECURITY_ATTRIBUTES,
+        windows_sys::Win32::Security::PSECURITY_DESCRIPTOR,
+    ),
+> {
+    let sddl = "D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;AU)";
+    let mut sd: windows_sys::Win32::Security::PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    let sddl_w: Vec<u16> = sddl.encode_utf16().chain(std::iter::once(0)).collect();
+
+    let result = unsafe {
+        windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl_w.as_ptr(),
+            windows_sys::Win32::Security::Authorization::SDDL_REVISION_1,
+            &mut sd,
+            std::ptr::null_mut(),
+        )
+    };
+
+    if result == 0 {
+        let err = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+        anyhow::bail!(
+            "ConvertStringSecurityDescriptorToSecurityDescriptorW failed: {}",
+            err
+        );
+    }
+
+    let sa = windows_sys::Win32::Security::SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<windows_sys::Win32::Security::SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: sd,
+        bInheritHandle: 0,
+    };
+
+    Ok((sa, sd))
+}
+
+#[cfg(windows)]
+#[pin_project]
+struct PipeConnection {
+    #[pin]
+    inner: NamedPipeServer,
+}
+
+#[cfg(windows)]
+impl PipeConnection {
+    fn new(inner: NamedPipeServer) -> Self {
+        Self { inner }
+    }
+}
+
+#[cfg(windows)]
+unsafe impl Send for PipeConnection {}
+
+#[cfg(windows)]
+impl Connected for PipeConnection {
+    type ConnectInfo = ();
+
+    fn connect_info(&self) -> Self::ConnectInfo {}
+}
+
+#[cfg(windows)]
+impl AsyncRead for PipeConnection {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        self.project().inner.poll_read(cx, buf)
+    }
+}
+
+#[cfg(windows)]
+impl AsyncWrite for PipeConnection {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        data: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        self.project().inner.poll_write(cx, data)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        self.project().inner.poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        self.project().inner.poll_shutdown(cx)
+    }
+}
+
+#[cfg(windows)]
+fn named_pipe_stream() -> io::Result<UnboundedReceiverStream<Result<PipeConnection, io::Error>>> {
+    let (mut sa, sd_ptr) = get_permissive_security_attributes().map_err(|e| {
+        error!(
+            "FATAL: Failed to create security attributes for named pipe: {}",
+            e
+        );
+        io::Error::new(io::ErrorKind::Other, "Security attributes creation failed")
+    })?;
+
+    let mut server = unsafe {
+        ServerOptions::new()
+            .first_pipe_instance(true)
+            .create_with_security_attributes_raw(NAMED_PIPE_NAME, &mut sa as *mut _ as *mut _)
+    }?;
+
+    let (tx, rx) = mpsc::unbounded_channel();
+    let sd_addr = sd_ptr as usize;
+
+    tokio::spawn(async move {
+        struct SecurityDescriptorGuard(usize);
+        impl Drop for SecurityDescriptorGuard {
+            fn drop(&mut self) {
+                if self.0 != 0 {
+                    unsafe {
+                        windows_sys::Win32::Foundation::LocalFree(self.0 as *mut c_void);
+                    }
+                }
+            }
+        }
+        let _guard = SecurityDescriptorGuard(sd_addr);
+        loop {
+            match server.connect().await {
+                Ok(()) => {
+                    let sd_ptr =
+                        sd_addr as windows_sys::Win32::Security::PSECURITY_DESCRIPTOR;
+                    let mut sa_loop = windows_sys::Win32::Security::SECURITY_ATTRIBUTES {
+                        nLength: std::mem::size_of::<
+                            windows_sys::Win32::Security::SECURITY_ATTRIBUTES,
+                        >() as u32,
+                        lpSecurityDescriptor: sd_ptr,
+                        bInheritHandle: 0,
+                    };
+                    let new_server = match unsafe {
+                        ServerOptions::new().create_with_security_attributes_raw(
+                            NAMED_PIPE_NAME,
+                            &mut sa_loop as *mut _ as *mut _,
+                        )
+                    } {
+                        Ok(s) => s,
+                        Err(e) => {
+                            let _ = tx.send(Err(e));
+                            break;
+                        }
+                    };
+                    let old_server = std::mem::replace(&mut server, new_server);
+                    if tx.send(Ok(PipeConnection::new(old_server))).is_err() {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    if tx.send(Err(e)).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    Ok(UnboundedReceiverStream::new(rx))
 }
 
 #[cfg(windows)]
@@ -1005,6 +1585,7 @@ fn append_install_log(message: &str) {
 
 #[cfg(windows)]
 static STOP_TOKEN: Lazy<CancellationToken> = Lazy::new(CancellationToken::new);
+static CONFIG_WRITE_LOCK: Lazy<AsyncMutex<()>> = Lazy::new(|| AsyncMutex::new(()));
 
 #[cfg(windows)]
 define_windows_service!(ffi_service_main, service_main);

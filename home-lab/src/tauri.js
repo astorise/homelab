@@ -50,6 +50,37 @@ const __MOCK = {
       { host: 'grafana.home', port: 3000 },
     ],
   },
+  oidc: {
+    status: {
+      state: 'running',
+      log_level: 'INFO',
+      issuer: 'https://127.0.0.1:8443',
+      token_endpoint: 'https://127.0.0.1:8443/token',
+    },
+    clients: [
+      {
+        client_id: 'demo-client',
+        subject: 'demo-client',
+        allowed_scopes: ['demo.read'],
+        audiences: ['https://example-app'],
+        password_users: [
+          { username: 'demo-user', subject: 'demo-user', scopes: ['demo.read'] },
+        ],
+        auth_method: 'client_secret_post',
+        public_key_pem: '',
+      },
+      {
+        client_id: 'k3s-home',
+        subject: 'home-lab-k3s',
+        allowed_scopes: ['k3s.admin'],
+        audiences: [],
+        password_users: [],
+        auth_method: 'private_key_jwt',
+        public_key_pem:
+          '-----BEGIN PUBLIC KEY-----\\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAwMockKeyExample=====\\n-----END PUBLIC KEY-----',
+      },
+    ],
+  },
   wsl: {
     instances: [
       { name: 'home-lab', state: 'Running', version: '2', is_default: false },
@@ -133,6 +164,61 @@ async function mockInvoke(cmd, args = {}) {
       __MOCK.http.routes = __MOCK.http.routes.filter((r) => r.host !== key);
       const removed = before !== __MOCK.http.routes.length;
       return { ok: removed, message: removed ? 'Route removed' : 'Not found' };
+    }
+
+    // OIDC
+    case 'oidc_get_status':
+      return { ...__MOCK.oidc.status };
+    case 'oidc_list_clients':
+      return {
+        clients: __MOCK.oidc.clients.map((client) => ({
+          ...client,
+          allowed_scopes: [...client.allowed_scopes],
+          audiences: [...client.audiences],
+          password_users: client.password_users.map((user) => ({
+            ...user,
+            scopes: [...user.scopes],
+          })),
+        })),
+      };
+    case 'oidc_register_client': {
+      const payload = args || {};
+      const clientId = (payload.client_id || '').trim();
+      if (!clientId) {
+        return { ok: false, message: 'client_id requis (mock).' };
+      }
+      const subject = (payload.subject || clientId).trim();
+      const allowed_scopes = Array.isArray(payload.allowed_scopes)
+        ? [...payload.allowed_scopes]
+        : [];
+      const audiences = Array.isArray(payload.audiences) ? [...payload.audiences] : [];
+      const public_key_pem = (payload.public_key_pem || '').trim();
+      const auth_method = (payload.auth_method || 'private_key_jwt').trim();
+      const client = {
+        client_id: clientId,
+        subject,
+        allowed_scopes,
+        audiences,
+        password_users: [],
+        auth_method,
+        public_key_pem,
+      };
+      __MOCK.oidc.clients = __MOCK.oidc.clients
+        .filter((c) => c.client_id !== clientId)
+        .concat([client]);
+      return { ok: true, message: 'Client OIDC ajouté (mock).' };
+    }
+    case 'oidc_remove_client': {
+      const clientId =
+        typeof args === 'string' ? args : typeof args?.client_id === 'string' ? args.client_id : '';
+      const trimmed = clientId.trim();
+      if (!trimmed) {
+        return { ok: false, message: 'client_id requis (mock).' };
+      }
+      const before = __MOCK.oidc.clients.length;
+      __MOCK.oidc.clients = __MOCK.oidc.clients.filter((client) => client.client_id !== trimmed);
+      const removed = before !== __MOCK.oidc.clients.length;
+      return { ok: removed, message: removed ? 'Client supprimé (mock).' : 'Client introuvable.' };
     }
 
     case 'wsl_import_instance': {
@@ -306,6 +392,39 @@ export async function http_remove_route(arg1) {
   const host = typeof arg1 === 'object' && arg1 !== null ? arg1.host || arg1.id : arg1;
   if (!host) throw new Error('L\'hôte est requis pour la suppression.');
   return safeInvoke('http_remove_route', { host });
+}
+
+export async function oidc_get_status() { return safeInvoke('oidc_get_status'); }
+
+export async function oidc_list_clients() {
+  const res = await safeInvoke('oidc_list_clients');
+  return Array.isArray(res) ? res : (res?.clients ?? []);
+}
+
+export async function oidc_register_client(payload = {}) {
+  const data = typeof payload === 'object' && payload !== null ? { ...payload } : {};
+  const client_id = (data.client_id || '').trim();
+  if (!client_id) throw new Error("L'identifiant client est requis.");
+  const public_key_pem = (data.public_key_pem || '').trim();
+  if (!public_key_pem) throw new Error('La clé publique du client est requise.');
+  const subject = (data.subject || '').trim();
+  const allowed_scopes = Array.isArray(data.allowed_scopes) ? data.allowed_scopes : [];
+  const audiences = Array.isArray(data.audiences) ? data.audiences : [];
+  const auth_method = (data.auth_method || 'private_key_jwt').trim();
+  return safeInvoke('oidc_register_client', {
+    client_id,
+    subject,
+    allowed_scopes,
+    audiences,
+    public_key_pem,
+    auth_method,
+  });
+}
+
+export async function oidc_remove_client(clientId) {
+  const value = typeof clientId === 'string' ? clientId.trim() : '';
+  if (!value) throw new Error("L'identifiant client est requis pour la suppression.");
+  return safeInvoke('oidc_remove_client', { client_id: value });
 }
 
 export async function wsl_import_instance(options = {}) {

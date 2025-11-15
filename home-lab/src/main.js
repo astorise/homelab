@@ -5,4 +5,6 @@ import './components/dns-status.js';
 import './components/dns-records.js';
 import './components/http-status.js';
 import './components/http-routes.js';
+import './components/oidc-status.js';
+import './components/oidc-clients.js';
 import './components/wsl-instance.js';

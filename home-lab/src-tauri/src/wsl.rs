@@ -6,8 +6,13 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
+use crate::oidc::{register_client_config, oidc_get_status, RegisterClientIn, StatusOut};
+use rand::{rngs::OsRng, RngCore};
 use regex::Regex;
 use serde::Serialize;
+use serde_json::json;
+use rsa::pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding};
+use rsa::RsaPrivateKey;
 use tauri::{AppHandle, Manager};
 use tracing::{error, info, warn};
 
@@ -194,6 +199,87 @@ fn resolve_install_dir(app: &AppHandle) -> Result<PathBuf> {
         .context("Impossible de déterminer le dossier d'installation WSL")
 }
 
+fn cluster_config_root() -> PathBuf {
+    std::env::var_os("PROGRAMDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir())
+        .join("home-oidc")
+        .join("clusters")
+}
+
+fn persist_cluster_credentials(
+    instance: &str,
+    client_id: &str,
+    private_key: &str,
+    public_key: &str,
+    status: &StatusOut,
+    scopes: &[String],
+) -> Result<PathBuf> {
+    let dir = cluster_config_root().join(instance);
+    fs::create_dir_all(&dir).with_context(|| format!("Création de {}", dir.display()))?;
+    fs::write(dir.join("oidc-client.key"), private_key)
+        .with_context(|| "Écriture de la clé privée OIDC")?;
+    fs::write(dir.join("oidc-client.pub"), public_key)
+        .with_context(|| "Écriture de la clé publique OIDC")?;
+    let metadata = json!({
+        "client_id": client_id,
+        "issuer": status.issuer,
+        "token_endpoint": status.token_endpoint,
+        "allowed_scopes": scopes,
+    });
+    fs::write(
+        dir.join("oidc-client.json"),
+        serde_json::to_vec_pretty(&metadata)?,
+    )
+    .with_context(|| "Écriture du fichier de configuration OIDC")?;
+    Ok(dir)
+}
+
+async fn configure_k3s_oidc_client(instance: &str) -> Result<String> {
+    let mut rng = OsRng;
+    let private_key =
+        RsaPrivateKey::new(&mut rng, 4096).context("Génération de la clé privée OIDC")?;
+    let private_pem = private_key
+        .to_pkcs8_pem(LineEnding::LF)
+        .context("Sérialisation de la clé privée")?
+        .to_string();
+    let public_key = private_key
+        .to_public_key()
+        .to_public_key_pem(LineEnding::LF)
+        .context("Sérialisation de la clé publique")?;
+    let suffix = rng.next_u32();
+    let normalized = instance.to_lowercase();
+    let client_id = format!("k3s-{normalized}-{suffix:08x}");
+    let scopes = vec!["k3s.admin".to_string()];
+    let ack = register_client_config(RegisterClientIn {
+        client_id: client_id.clone(),
+        subject: Some(instance.to_string()),
+        allowed_scopes: scopes.clone(),
+        audiences: Vec::new(),
+        public_key_pem: public_key.clone(),
+        auth_method: Some("private_key_jwt".into()),
+    })
+    .await?;
+    if !ack.ok {
+        anyhow::bail!(ack.message);
+    }
+    let status = oidc_get_status()
+        .await
+        .map_err(|e| anyhow!(e))?;
+    let dir = persist_cluster_credentials(
+        instance,
+        &client_id,
+        &private_pem,
+        &public_key,
+        &status,
+        &scopes,
+    )?;
+    Ok(format!(
+        "OIDC client '{client_id}' enregistré. Clés stockées dans {}.",
+        dir.display()
+    ))
+}
+
 #[tauri::command]
 pub async fn wsl_import_instance(
     app: AppHandle,
@@ -222,26 +308,60 @@ pub async fn wsl_import_instance(
         "Demande d'import WSL reçue"
     );
 
-    tauri::async_runtime::spawn_blocking(move || run_wsl_setup(&handle, force_import, &instance_name))
-        .await
-        .map_err(|e| {
-            error!(target: "wsl", "Erreur JoinHandle: {e}");
-            log_wsl_event(format!(
-                "Erreur JoinHandle pendant l'import WSL (instance={}): {e}",
-                sanitized_debug
-            ));
-            format!("Erreur interne: {e}")
-        })
-        .and_then(|result| {
-            result.map_err(|e| {
-                error!(target: "wsl", "Échec import WSL: {e}");
+    let setup_result = tauri::async_runtime::spawn_blocking(move || {
+        run_wsl_setup(&handle, force_import, &instance_name)
+    })
+    .await
+    .map_err(|e| {
+        error!(target: "wsl", "Erreur JoinHandle: {e}");
+        log_wsl_event(format!(
+            "Erreur JoinHandle pendant l'import WSL (instance={}): {e}",
+            sanitized_debug
+        ));
+        format!("Erreur interne: {e}")
+    })?;
+
+    let mut provision = setup_result.map_err(|e| {
+        error!(target: "wsl", "Échec import WSL: {e}");
+        log_wsl_event(format!(
+            "Échec import WSL pour l'instance {}: {e}",
+            sanitized_debug
+        ));
+        e.to_string()
+    })?;
+
+    if provision.ok {
+        match configure_k3s_oidc_client(&sanitized_name).await {
+            Ok(extra) => {
+                if !extra.is_empty() {
+                    if !provision.message.trim().is_empty() {
+                        provision.message.push('\n');
+                    }
+                    provision.message.push_str(&extra);
+                }
                 log_wsl_event(format!(
-                    "Échec import WSL pour l'instance {}: {e}",
-                    sanitized_debug
+                    "Client OIDC k3s créé pour {}: {}",
+                    sanitized_debug,
+                    escape_for_log(&extra)
                 ));
-                e.to_string()
-            })
-        })
+            }
+            Err(err) => {
+                warn!(
+                    target: "wsl",
+                    instance = %sanitized_name,
+                    error = %err,
+                    "Configuration OIDC pour k3s impossible"
+                );
+                log_wsl_event(format!(
+                    "Configuration OIDC pour {} impossible: {}",
+                    sanitized_debug,
+                    escape_for_log(&err.to_string())
+                ));
+            }
+        }
+    }
+
+    Ok(provision)
 }
 
 fn run_wsl_setup(app: &AppHandle, force_import: bool, instance_name: &str) -> Result<ProvisionResult> {

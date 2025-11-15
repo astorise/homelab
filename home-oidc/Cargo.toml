@@ -5,6 +5,7 @@ edition = "2021"
 license = "GPL-3.0-only"
 authors = ["Homelab Maintainers <maintainers@example.com>"]
 description = "Minimal OIDC provider Windows service"
+build = "build.rs"
 
 [dependencies]
 anyhow = "1.0"
@@ -27,12 +28,25 @@ serde_json = "1.0"
 serde_with = { version = "3.8", features = ["macros"] }
 serde_urlencoded = "0.7"
 sha2 = "0.10"
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "time", "net"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "time", "net", "sync"] }
 tokio-rustls = "0.24"
 tokio-util = { version = "0.7", features = ["full"] }
+tokio-stream = "0.1.15"
+pin-project = "1.1.5"
 url = "2.5"
 windows-service = { workspace = true }
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+] }
+tonic = { version = "0.14", features = ["transport"] }
+prost = "0.14"
 
 [dev-dependencies]
 assert_cmd = "2.0"
 tempfile = "3.10"
+
+[build-dependencies]
+tonic-build = { version = "0.14", features = ["prost"] }
+protoc-bin-vendored = "3"

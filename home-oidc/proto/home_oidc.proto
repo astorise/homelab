@@ -1,0 +1,56 @@
+syntax = "proto3";
+package homeoidc.v1;
+
+message Empty {}
+
+message StatusResponse {
+  string state = 1;
+  string log_level = 2;
+  string issuer = 3;
+  string token_endpoint = 4;
+}
+
+message ListClientsResponse {
+  message PasswordUser {
+    string username = 1;
+    string subject = 2;
+    repeated string scopes = 3;
+  }
+
+  message Client {
+    string client_id = 1;
+    string subject = 2;
+    repeated string allowed_scopes = 3;
+    repeated string audiences = 4;
+    repeated PasswordUser password_users = 5;
+    string auth_method = 6;
+    string public_key_pem = 7;
+  }
+
+  repeated Client clients = 1;
+}
+
+message Acknowledge {
+  bool ok = 1;
+  string message = 2;
+}
+
+message RegisterClientRequest {
+  string client_id = 1;
+  string subject = 2;
+  repeated string allowed_scopes = 3;
+  repeated string audiences = 4;
+  string public_key_pem = 5;
+  string auth_method = 6;
+}
+
+message RemoveClientRequest {
+  string client_id = 1;
+}
+
+service HomeOidc {
+  rpc GetStatus(Empty) returns (StatusResponse);
+  rpc ListClients(Empty) returns (ListClientsResponse);
+  rpc RegisterClient(RegisterClientRequest) returns (Acknowledge);
+  rpc RemoveClient(RemoveClientRequest) returns (Acknowledge);
+}
