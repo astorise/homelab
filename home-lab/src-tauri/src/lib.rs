@@ -14,6 +14,7 @@ mod dns;
 mod http;
 mod icons;
 mod menu;
+mod oidc;
 mod ui;
 mod wsl;
 
@@ -159,6 +160,10 @@ pub fn run() {
             http::http_list_routes,
             http::http_add_route,
             http::http_remove_route,
+            oidc::oidc_get_status,
+            oidc::oidc_list_clients,
+            oidc::oidc_register_client,
+            oidc::oidc_remove_client,
             wsl::wsl_import_instance,
             wsl::wsl_list_instances,
             wsl::wsl_remove_instance,
