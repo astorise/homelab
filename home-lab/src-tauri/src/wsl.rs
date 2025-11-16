@@ -259,7 +259,8 @@ async fn configure_k3s_oidc_client(instance: &str) -> Result<String> {
         public_key_pem: public_key.clone(),
         auth_method: Some("private_key_jwt".into()),
     })
-    .await?;
+    .await
+    .map_err(|e| anyhow!(e))?;
     if !ack.ok {
         anyhow::bail!(ack.message);
     }
