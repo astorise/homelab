@@ -690,7 +690,7 @@ impl HomeOidc for OidcGrpcService {
             .map(|a| a.trim().to_string())
             .filter(|a| !a.is_empty())
             .collect::<Vec<_>>();
-        let mut client = ClientConfig {
+        let client = ClientConfig {
             client_id: raw_id.to_string(),
             client_secret: String::new(),
             allowed_scopes,
@@ -704,7 +704,7 @@ impl HomeOidc for OidcGrpcService {
                 Some(public_key.clone())
             },
         };
-        let mut cfg_guard = CONFIG_WRITE_LOCK.lock().await;
+        let cfg_guard = CONFIG_WRITE_LOCK.lock().await;
         let mut cfg = load_config_or_init().map_err(|e| Status::internal(e.to_string()))?;
         cfg.clients.retain(|c| c.client_id != client.client_id);
         cfg.clients.push(client.clone());
@@ -729,7 +729,7 @@ impl HomeOidc for OidcGrpcService {
         if raw_id.is_empty() {
             return Err(Status::invalid_argument("client_id required"));
         }
-        let mut cfg_guard = CONFIG_WRITE_LOCK.lock().await;
+        let cfg_guard = CONFIG_WRITE_LOCK.lock().await;
         let mut cfg = load_config_or_init().map_err(|e| Status::internal(e.to_string()))?;
         let before = cfg.clients.len();
         cfg.clients.retain(|c| c.client_id != raw_id);
