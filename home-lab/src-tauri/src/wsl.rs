@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
@@ -5,14 +6,16 @@ use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::dns;
+use crate::http;
+use crate::oidc::{oidc_get_status, register_client_config, RegisterClientIn, StatusOut};
 use anyhow::{anyhow, Context, Result};
-use crate::oidc::{register_client_config, oidc_get_status, RegisterClientIn, StatusOut};
 use rand::{rngs::OsRng, RngCore};
 use regex::Regex;
-use serde::Serialize;
-use serde_json::json;
 use rsa::pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding};
 use rsa::RsaPrivateKey;
+use serde::Serialize;
+use serde_json::json;
 use tauri::{AppHandle, Manager};
 use tracing::{error, info, warn};
 
@@ -34,6 +37,279 @@ pub struct WslInstance {
     state: String,
     version: Option<String>,
     is_default: bool,
+}
+
+const DEFAULT_DOMAIN_TEMPLATE: &str = "{name}.wsl";
+const ENV_DOMAIN_TEMPLATES: &str = "HOME_LAB_WSL_DOMAIN_TEMPLATES";
+const DEFAULT_DNS_TARGET: &str = "127.0.0.1";
+const ENV_DNS_TARGET: &str = "HOME_LAB_WSL_DNS_TARGET";
+const DEFAULT_DNS_TTL: u32 = 60;
+const ENV_DNS_TTL: &str = "HOME_LAB_WSL_DNS_TTL";
+const DEFAULT_HTTP_PORT_BASE: u16 = 8080;
+const DEFAULT_HTTP_PORT_STEP: u16 = 1000;
+const DEFAULT_HTTP_PORT_MAX: u16 = 60000;
+const ENV_HTTP_PORT_BASE: &str = "HOME_LAB_WSL_HTTP_PORT_BASE";
+const ENV_HTTP_PORT_STEP: &str = "HOME_LAB_WSL_HTTP_PORT_STEP";
+const ENV_HTTP_PORT_MAX: &str = "HOME_LAB_WSL_HTTP_PORT_MAX";
+
+fn env_or_default_u16(var: &str, default: u16) -> u16 {
+    match std::env::var(var) {
+        Ok(value) => value
+            .trim()
+            .parse::<u16>()
+            .map_err(|_| {
+                warn!(
+                    target: "wsl",
+                    variable = var,
+                    value = %value,
+                    "Valeur u16 invalide, utilisation de la valeur par defaut"
+                )
+            })
+            .unwrap_or(default),
+        Err(_) => default,
+    }
+}
+
+fn env_or_default_u32(var: &str, default: u32) -> u32 {
+    match std::env::var(var) {
+        Ok(value) => value
+            .trim()
+            .parse::<u32>()
+            .map_err(|_| {
+                warn!(
+                    target: "wsl",
+                    variable = var,
+                    value = %value,
+                    "Valeur u32 invalide, utilisation de la valeur par defaut"
+                )
+            })
+            .unwrap_or(default),
+        Err(_) => default,
+    }
+}
+
+fn cluster_domain_templates() -> Vec<String> {
+    if let Ok(raw) = std::env::var(ENV_DOMAIN_TEMPLATES) {
+        let templates: Vec<String> = raw
+            .split(|c| c == ',' || c == ';')
+            .map(|chunk| chunk.trim())
+            .filter(|chunk| !chunk.is_empty())
+            .map(|chunk| chunk.to_string())
+            .collect();
+        if !templates.is_empty() {
+            return templates;
+        }
+    }
+    vec![DEFAULT_DOMAIN_TEMPLATE.to_string()]
+}
+
+fn cluster_domain_slug(source: &str) -> String {
+    let mut slug = String::new();
+    let trimmed = source.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    let mut last_dash = false;
+    for ch in lower.chars() {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch);
+            last_dash = false;
+        } else if matches!(ch, '-' | '_' | '.' | ' ') {
+            if !slug.is_empty() && !last_dash {
+                slug.push('-');
+                last_dash = true;
+            }
+        }
+    }
+    let mut slug = slug.trim_matches('-').to_string();
+    if slug.is_empty() {
+        slug = "cluster".into();
+    }
+    if slug.len() > 63 {
+        slug.truncate(63);
+    }
+    slug
+}
+
+fn normalize_domain(candidate: &str) -> Option<String> {
+    let mut labels = Vec::new();
+    for raw_label in candidate.split('.') {
+        let mut label = String::new();
+        for ch in raw_label.chars() {
+            let lower = ch.to_ascii_lowercase();
+            if lower.is_ascii_alphanumeric() {
+                label.push(lower);
+            } else if matches!(lower, '-' | '_' | ' ') {
+                if !label.ends_with('-') {
+                    label.push('-');
+                }
+            }
+        }
+        let label = label.trim_matches('-').to_string();
+        if !label.is_empty() {
+            labels.push(label);
+        }
+    }
+    if labels.is_empty() {
+        None
+    } else {
+        Some(labels.join("."))
+    }
+}
+
+fn cluster_domains(instance: &str) -> Vec<String> {
+    let slug = cluster_domain_slug(instance);
+    let templates = cluster_domain_templates();
+    let mut result = Vec::new();
+    for tpl in templates {
+        let rendered = if tpl.contains("{name}") {
+            tpl.replace("{name}", &slug)
+        } else {
+            format!("{slug}{tpl}")
+        };
+        if let Some(domain) = normalize_domain(&rendered) {
+            if !result
+                .iter()
+                .any(|existing: &String| existing.eq_ignore_ascii_case(domain.as_str()))
+            {
+                result.push(domain);
+            }
+        }
+    }
+    result
+}
+
+fn dns_target_ipv4() -> String {
+    std::env::var(ENV_DNS_TARGET)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| DEFAULT_DNS_TARGET.to_string())
+}
+
+fn dns_record_ttl() -> u32 {
+    let ttl = env_or_default_u32(ENV_DNS_TTL, DEFAULT_DNS_TTL);
+    ttl.max(1)
+}
+
+fn http_port_base() -> u16 {
+    env_or_default_u16(ENV_HTTP_PORT_BASE, DEFAULT_HTTP_PORT_BASE)
+}
+
+fn http_port_step() -> u16 {
+    let step = env_or_default_u16(ENV_HTTP_PORT_STEP, DEFAULT_HTTP_PORT_STEP);
+    if step == 0 {
+        DEFAULT_HTTP_PORT_STEP
+    } else {
+        step
+    }
+}
+
+fn http_port_max() -> u16 {
+    env_or_default_u16(ENV_HTTP_PORT_MAX, DEFAULT_HTTP_PORT_MAX)
+}
+
+fn pick_http_port(used_ports: &HashSet<u16>) -> Result<u16> {
+    let base = http_port_base();
+    let step = http_port_step();
+    let max = http_port_max();
+    let mut candidate = base;
+    while candidate <= max {
+        if !used_ports.contains(&candidate) {
+            return Ok(candidate);
+        }
+        match candidate.checked_add(step) {
+            Some(next) if next > candidate => {
+                candidate = next;
+            }
+            _ => break,
+        }
+    }
+    Err(anyhow!(
+        "Aucun port HTTP disponible dans la plage configuree ({base}-{max})."
+    ))
+}
+
+async fn configure_cluster_networking(instance: &str) -> Result<String> {
+    let hosts = cluster_domains(instance);
+    if hosts.is_empty() {
+        anyhow::bail!("Aucun nom de domaine valide pour l'instance {instance}");
+    }
+
+    let routes = http::http_list_routes()
+        .await
+        .map_err(|e| anyhow!("http_list_routes: {e}"))?
+        .routes;
+
+    let mut used_ports: HashSet<u16> = HashSet::new();
+    for route in &routes {
+        if let Ok(port) = u16::try_from(route.port) {
+            used_ports.insert(port);
+        } else {
+            warn!(
+                target: "wsl",
+                host = %route.host,
+                port = route.port,
+                "Port HTTP invalide (hors plage u16) ignore pour la selection"
+            );
+        }
+    }
+
+    let mut selected_port = None;
+    for route in &routes {
+        if hosts
+            .iter()
+            .any(|host| host.eq_ignore_ascii_case(&route.host))
+        {
+            if let Ok(existing) = u16::try_from(route.port) {
+                selected_port = Some(existing);
+                break;
+            }
+        }
+    }
+
+    let http_port = match selected_port {
+        Some(port) => port,
+        None => pick_http_port(&used_ports)?,
+    };
+
+    let mut applied_hosts = Vec::new();
+    for host in &hosts {
+        http::http_add_route(host.clone(), http_port as u32)
+            .await
+            .map_err(|e| anyhow!("http_add_route({host}): {e}"))?;
+        applied_hosts.push(host.clone());
+    }
+
+    let dns_ip = dns_target_ipv4();
+    let ttl = dns_record_ttl();
+    for host in &hosts {
+        dns::dns_add_record(host.clone(), "A".into(), dns_ip.clone(), ttl)
+            .await
+            .map_err(|e| anyhow!("dns_add_record({host}): {e}"))?;
+    }
+
+    info!(
+        target: "wsl",
+        instance = %instance,
+        hosts = %applied_hosts.join(","),
+        http_port,
+        dns_ip = %dns_ip,
+        ttl,
+        "Configuration DNS/HTTP appliquee pour l'instance WSL"
+    );
+    log_wsl_event(format!(
+        "Configuration DNS/HTTP pour {}: hosts={} port={} ip={} ttl={}",
+        escape_for_log(instance),
+        escape_for_log(&applied_hosts.join(",")),
+        http_port,
+        escape_for_log(&dns_ip),
+        ttl
+    ));
+
+    Ok(format!(
+        "DNS/HTTP configures pour {} (port {}).",
+        applied_hosts.join(", "),
+        http_port
+    ))
 }
 
 fn decode_cli_output(data: &[u8]) -> String {
@@ -264,9 +540,7 @@ async fn configure_k3s_oidc_client(instance: &str) -> Result<String> {
     if !ack.ok {
         anyhow::bail!(ack.message);
     }
-    let status = oidc_get_status()
-        .await
-        .map_err(|e| anyhow!(e))?;
+    let status = oidc_get_status().await.map_err(|e| anyhow!(e))?;
     let dir = persist_cluster_credentials(
         instance,
         &client_id,
@@ -360,12 +634,45 @@ pub async fn wsl_import_instance(
                 ));
             }
         }
+
+        match configure_cluster_networking(&sanitized_name).await {
+            Ok(extra) => {
+                if !extra.is_empty() {
+                    if !provision.message.trim().is_empty() {
+                        provision.message.push('\n');
+                    }
+                    provision.message.push_str(&extra);
+                }
+                log_wsl_event(format!(
+                    "Reseau WSL configure pour {}: {}",
+                    sanitized_debug,
+                    escape_for_log(&extra)
+                ));
+            }
+            Err(err) => {
+                warn!(
+                    target: "wsl",
+                    instance = %sanitized_name,
+                    error = %err,
+                    "Configuration DNS/HTTP pour WSL impossible"
+                );
+                log_wsl_event(format!(
+                    "Configuration DNS/HTTP pour {} impossible: {}",
+                    sanitized_debug,
+                    escape_for_log(&err.to_string())
+                ));
+            }
+        }
     }
 
     Ok(provision)
 }
 
-fn run_wsl_setup(app: &AppHandle, force_import: bool, instance_name: &str) -> Result<ProvisionResult> {
+fn run_wsl_setup(
+    app: &AppHandle,
+    force_import: bool,
+    instance_name: &str,
+) -> Result<ProvisionResult> {
     let resource_dir = app
         .path()
         .resource_dir()
@@ -827,8 +1134,7 @@ pub async fn wsl_remove_instance(name: String) -> Result<WslOperationResult, Str
         return Err("Le nom de l'instance est requis.".into());
     }
 
-    let sanitized = sanitize_wsl_instance_name(raw_trimmed)
-        .map_err(|e| e.to_string())?;
+    let sanitized = sanitize_wsl_instance_name(raw_trimmed).map_err(|e| e.to_string())?;
 
     if sanitized != raw_trimmed {
         info!(

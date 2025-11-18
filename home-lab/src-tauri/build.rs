@@ -61,10 +61,7 @@ fn main() {
                 if status.success() {
                     for (_, exe) in services.iter() {
                         let _ = std::fs::copy(
-                            workspace_root
-                                .join("target")
-                                .join("release")
-                                .join(exe),
+                            workspace_root.join("target").join("release").join(exe),
                             dst_bin.join(exe),
                         );
                     }

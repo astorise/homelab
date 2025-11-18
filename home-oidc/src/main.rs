@@ -35,9 +35,9 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::net::TcpListener;
 #[cfg(windows)]
 use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
+use tokio::net::TcpListener;
 use tokio::runtime::Runtime;
 use tokio::sync::{Mutex as AsyncMutex, RwLock};
 use tokio_util::sync::CancellationToken;
@@ -48,23 +48,23 @@ use url::Url;
 
 #[cfg(windows)]
 use pin_project::pin_project;
-use tokio_rustls::TlsAcceptor;
-#[cfg(windows)]
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-#[cfg(windows)]
-use tokio::sync::mpsc;
-#[cfg(windows)]
-use tokio_stream::wrappers::UnboundedReceiverStream;
 #[cfg(windows)]
 use std::pin::Pin;
 #[cfg(windows)]
 use std::task::{Context as TaskContext, Poll};
+#[cfg(windows)]
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+#[cfg(windows)]
+use tokio::sync::mpsc;
+use tokio_rustls::TlsAcceptor;
+#[cfg(windows)]
+use tokio_stream::wrappers::UnboundedReceiverStream;
 
 #[cfg(windows)]
 use log::warn;
 use once_cell::sync::Lazy;
 #[cfg(windows)]
-use std::ffi::{OsString, c_void};
+use std::ffi::{c_void, OsString};
 
 #[cfg(windows)]
 use windows_service::service::{
@@ -82,8 +82,7 @@ use windows_service::{
 const SERVICE_NAME: &str = "HomeOidcService";
 const SERVICE_DISPLAY_NAME: &str = "Home OIDC Service";
 const SERVICE_DESCRIPTION: &str = "Minimal HTTPS OIDC provider with HTTP mirror";
-const CLIENT_ASSERTION_JWT: &str =
-    "urn:ietf:params:oauth:client-assertion-type:jwt-bearer";
+const CLIENT_ASSERTION_JWT: &str = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer";
 
 #[cfg(all(debug_assertions, windows))]
 const NAMED_PIPE_NAME: &str = r"\\.\pipe\home-oidc-dev";
@@ -635,10 +634,7 @@ impl HomeOidc for OidcGrpcService {
                     audiences: client.audiences.clone(),
                     password_users,
                     auth_method: client.auth_method.as_str().to_string(),
-                    public_key_pem: client
-                        .client_public_key_pem
-                        .clone()
-                        .unwrap_or_default(),
+                    public_key_pem: client.client_public_key_pem.clone().unwrap_or_default(),
                 }
             })
             .collect();
@@ -656,8 +652,9 @@ impl HomeOidc for OidcGrpcService {
         }
         let auth_method = match req.auth_method.trim() {
             "" | "private_key_jwt" => ClientAuthMethod::PrivateKeyJwt,
-            other if other.eq_ignore_ascii_case("client_secret")
-                || other.eq_ignore_ascii_case("client_secret_post") =>
+            other
+                if other.eq_ignore_ascii_case("client_secret")
+                    || other.eq_ignore_ascii_case("client_secret_post") =>
             {
                 return Err(Status::invalid_argument(
                     "client_secret clients must be managed via configuration file",
@@ -939,7 +936,10 @@ async fn process_token_request(
             let decoding = match DecodingKey::from_rsa_pem(pem.as_bytes()) {
                 Ok(key) => key,
                 Err(err) => {
-                    error!("invalid client public key for {}: {err:?}", client.client_id);
+                    error!(
+                        "invalid client public key for {}: {err:?}",
+                        client.client_id
+                    );
                     return json_error(
                         StatusCode::UNAUTHORIZED,
                         "invalid_client",
@@ -1218,8 +1218,8 @@ async fn run_grpc_server(state: Arc<AppState>, cancel: CancellationToken) -> Res
     let service = OidcGrpcService { state };
     let server = Server::builder().add_service(HomeOidcServer::new(service));
 
-    let incoming = named_pipe_stream()
-        .map_err(|e| anyhow!("failed to prepare management pipe: {e}"))?;
+    let incoming =
+        named_pipe_stream().map_err(|e| anyhow!("failed to prepare management pipe: {e}"))?;
     info!("gRPC server listening on {}", NAMED_PIPE_NAME);
 
     tokio::select! {
@@ -1286,12 +1286,10 @@ fn run_servers(cfg: ServiceConfig, material: KeyMaterial, cancel: CancellationTo
 }
 
 #[cfg(windows)]
-fn get_permissive_security_attributes() -> Result<
-    (
-        windows_sys::Win32::Security::SECURITY_ATTRIBUTES,
-        windows_sys::Win32::Security::PSECURITY_DESCRIPTOR,
-    ),
-> {
+fn get_permissive_security_attributes() -> Result<(
+    windows_sys::Win32::Security::SECURITY_ATTRIBUTES,
+    windows_sys::Win32::Security::PSECURITY_DESCRIPTOR,
+)> {
     let sddl = "D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;AU)";
     let mut sd: windows_sys::Win32::Security::PSECURITY_DESCRIPTOR = std::ptr::null_mut();
     let sddl_w: Vec<u16> = sddl.encode_utf16().chain(std::iter::once(0)).collect();
@@ -1410,8 +1408,7 @@ fn named_pipe_stream() -> io::Result<UnboundedReceiverStream<Result<PipeConnecti
         loop {
             match server.connect().await {
                 Ok(()) => {
-                    let sd_ptr =
-                        sd_addr as windows_sys::Win32::Security::PSECURITY_DESCRIPTOR;
+                    let sd_ptr = sd_addr as windows_sys::Win32::Security::PSECURITY_DESCRIPTOR;
                     let mut sa_loop = windows_sys::Win32::Security::SECURITY_ATTRIBUTES {
                         nLength: std::mem::size_of::<
                             windows_sys::Win32::Security::SECURITY_ATTRIBUTES,
@@ -1460,7 +1457,10 @@ fn install_service() -> Result<()> {
         .context("import certificate to Windows trust store")?;
     append_install_log("Certificate imported (best effort)");
     ensure_firewall_rule(cfg.https_port).context("ensure firewall rule")?;
-    append_install_log(&format!("Firewall rule verified for port {}", cfg.https_port));
+    append_install_log(&format!(
+        "Firewall rule verified for port {}",
+        cfg.https_port
+    ));
     let exe_path = std::env::current_exe().context("determine current executable path")?;
     let manager = ServiceManager::local_computer(
         None::<&str>,
@@ -1654,21 +1654,19 @@ fn main() -> Result<()> {
                 error!("service dispatcher error: {e:?}");
             }
         }
-        "install" => {
-            match install_service() {
-                Ok(_) => {
-                    append_install_log("Install completed successfully");
-                    println!(
-                        "Service installed. Update {} then start the service.",
-                        config_path().display()
-                    );
-                }
-                Err(e) => {
-                    append_install_log(&format!("ERROR: {e:?}"));
-                    return Err(e);
-                }
+        "install" => match install_service() {
+            Ok(_) => {
+                append_install_log("Install completed successfully");
+                println!(
+                    "Service installed. Update {} then start the service.",
+                    config_path().display()
+                );
             }
-        }
+            Err(e) => {
+                append_install_log(&format!("ERROR: {e:?}"));
+                return Err(e);
+            }
+        },
         "uninstall" => {
             uninstall_service()?;
             println!("Service uninstalled.");
