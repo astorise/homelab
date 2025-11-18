@@ -61,6 +61,92 @@ class WslInstanceManager extends HTMLElement {
     }
   }
 
+  renderClusterDetails(cluster) {
+    if (!cluster || typeof cluster !== 'object') {
+      return '<p class="mt-2 text-xs text-gray-400">Détails du cluster indisponibles.</p>';
+    }
+
+    const wrapList = (items) => `<ul class="ml-3 mt-1 space-y-0.5">${items}</ul>`;
+    const domains = Array.isArray(cluster.domains) && cluster.domains.length
+      ? cluster.domains.map((domain) => `<code>${escapeHtml(domain)}</code>`).join(', ')
+      : '<span class="text-gray-400">Non défini</span>';
+
+    const proxy = cluster.proxy || {};
+    const inboundHttp = Number.isFinite(proxy.inbound_http) ? proxy.inbound_http : '—';
+    const inboundHttps = Number.isFinite(proxy.inbound_https) ? proxy.inbound_https : '—';
+    const routes =
+      Array.isArray(proxy.routes) && proxy.routes.length
+        ? proxy.routes
+            .map(
+              (route) => `
+                <li class="text-[11px] text-gray-600 flex flex-wrap items-center gap-1">
+                  <span class="font-medium">${escapeHtml(route.host)}</span>
+                  <span class="text-gray-400">→</span>
+                  <span class="font-mono">port ${escapeHtml(String(route.port))}</span>
+                </li>`
+            )
+            .join('')
+        : '<li class="text-[11px] text-gray-400">Aucune route HTTP configurée.</li>';
+
+    const dnsRecords =
+      Array.isArray(cluster.dns_records) && cluster.dns_records.length
+        ? cluster.dns_records
+            .map((record) => {
+              const ttl =
+                typeof record.ttl === 'number' && Number.isFinite(record.ttl)
+                  ? `${record.ttl}s`
+                  : '—';
+              const addresses =
+                Array.isArray(record.a) && record.a.length
+                  ? record.a.map((value) => `<code>${escapeHtml(value)}</code>`).join(', ')
+                  : '<span class="text-gray-400">Aucune IP</span>';
+              return `
+                <li class="text-[11px] text-gray-600">
+                  <span class="font-medium">${escapeHtml(record.name)}</span>
+                  <span class="text-gray-400">→</span>
+                  ${addresses}
+                  <span class="text-gray-400">(TTL ${ttl})</span>
+                </li>`;
+            })
+            .join('')
+        : '<li class="text-[11px] text-gray-400">Aucun enregistrement DNS détecté.</li>';
+
+    const oidc = cluster.oidc || {};
+    const scopeList =
+      Array.isArray(oidc.scopes) && oidc.scopes.length
+        ? oidc.scopes.map((scope) => `<code>${escapeHtml(scope)}</code>`).join(', ')
+        : '<span class="text-gray-400">Aucun scope</span>';
+    const oidcText = oidc.present
+      ? `<span class="text-green-600 font-semibold">Présent</span> · Client <code>${escapeHtml(
+          oidc.client_id || 'inconnu'
+        )}</code> · Scopes ${scopeList}`
+      : '<span class="text-red-500 font-semibold">Absent</span>';
+
+    const apiPort =
+      typeof cluster.api_port === 'number' && Number.isFinite(cluster.api_port)
+        ? cluster.api_port
+        : '—';
+
+    return `
+      <div class="mt-2 space-y-1 text-xs text-gray-600">
+        <p><span class="font-semibold text-gray-700">Domaines :</span> ${domains}</p>
+        <div class="text-[11px]">
+          <p class="font-semibold text-gray-700">Entrées HTTP/HTTPS</p>
+          <p>HTTP → port ${escapeHtml(String(inboundHttp))}</p>
+          <p>HTTPS → port ${escapeHtml(String(inboundHttps))}</p>
+          ${wrapList(routes)}
+        </div>
+        <p class="text-[11px]"><span class="font-semibold text-gray-700">API k3s :</span> port ${escapeHtml(
+          String(apiPort)
+        )}</p>
+        <div class="text-[11px]">
+          <p class="font-semibold text-gray-700">DNS</p>
+          ${wrapList(dnsRecords)}
+        </div>
+        <p class="text-[11px]"><span class="font-semibold text-gray-700">Home OIDC :</span> ${oidcText}</p>
+      </div>`;
+  }
+
   render() {
     const busyAction = this._busyAction;
     const loading = this._loadingInstances;
@@ -104,11 +190,13 @@ class WslInstanceManager extends HTMLElement {
                 const stateLine = rawVersion
                   ? `État : ${state} · Version ${version}`
                   : `État : ${state}`;
+                const clusterDetails = this.renderClusterDetails(inst?.cluster);
                 return `
-                  <li class="flex flex-wrap items-center justify-between gap-3 px-4 py-3 text-sm text-gray-800">
-                    <div>
+                  <li class="flex flex-wrap items-start justify-between gap-3 px-4 py-3 text-sm text-gray-800">
+                    <div class="flex-1 min-w-0">
                       <p class="font-semibold text-gray-900">${name}${badge}</p>
                       <p class="text-xs text-gray-500">${stateLine}</p>
+                      ${clusterDetails}
                     </div>
                     <button
                       type="button"

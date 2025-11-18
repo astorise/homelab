@@ -128,27 +128,27 @@ async fn connect_client() -> Result<DnsClient, String> {
 // Data structures for Tauri commands (serializable)
 #[derive(Serialize)]
 pub struct AckOut {
-    ok: bool,
-    message: String,
+    pub ok: bool,
+    pub message: String,
 }
 
 #[derive(Serialize)]
 pub struct StatusOut {
-    state: String,
-    log_level: String,
+    pub state: String,
+    pub log_level: String,
 }
 
 #[derive(Serialize)]
 pub struct RecordOut {
-    name: String,
-    a: Vec<String>,
-    aaaa: Vec<String>,
-    ttl: u32,
+    pub name: String,
+    pub a: Vec<String>,
+    pub aaaa: Vec<String>,
+    pub ttl: u32,
 }
 
 #[derive(Serialize)]
 pub struct ListRecordsOut {
-    records: Vec<RecordOut>,
+    pub records: Vec<RecordOut>,
 }
 
 // Tauri command implementations
