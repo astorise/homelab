@@ -8,7 +8,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::dns;
 use crate::http;
-use crate::oidc::{oidc_get_status, register_client_config, RegisterClientIn, StatusOut};
+use crate::oidc::{
+    oidc_get_status, oidc_list_clients, register_client_config, ClientOut, RegisterClientIn,
+    StatusOut,
+};
 use anyhow::{anyhow, Context, Result};
 use rand::{rngs::OsRng, RngCore};
 use regex::Regex;
@@ -37,6 +40,43 @@ pub struct WslInstance {
     state: String,
     version: Option<String>,
     is_default: bool,
+    cluster: Option<WslClusterStatus>,
+}
+
+#[derive(Serialize, Clone, Debug, Default)]
+pub struct ClusterOidcInfo {
+    present: bool,
+    client_id: Option<String>,
+    scopes: Vec<String>,
+}
+
+#[derive(Serialize, Clone, Debug)]
+pub struct ClusterRouteBinding {
+    host: String,
+    port: u16,
+}
+
+#[derive(Serialize, Clone, Debug)]
+pub struct ClusterProxyInfo {
+    inbound_http: u16,
+    inbound_https: u16,
+    routes: Vec<ClusterRouteBinding>,
+}
+
+#[derive(Serialize, Clone, Debug)]
+pub struct ClusterDnsEntry {
+    name: String,
+    a: Vec<String>,
+    ttl: Option<u32>,
+}
+
+#[derive(Serialize, Clone, Debug)]
+pub struct WslClusterStatus {
+    domains: Vec<String>,
+    proxy: ClusterProxyInfo,
+    api_port: u16,
+    dns_records: Vec<ClusterDnsEntry>,
+    oidc: ClusterOidcInfo,
 }
 
 const DEFAULT_DOMAIN_TEMPLATE: &str = "{name}.wsl";
@@ -51,6 +91,12 @@ const DEFAULT_HTTP_PORT_MAX: u16 = 60000;
 const ENV_HTTP_PORT_BASE: &str = "HOME_LAB_WSL_HTTP_PORT_BASE";
 const ENV_HTTP_PORT_STEP: &str = "HOME_LAB_WSL_HTTP_PORT_STEP";
 const ENV_HTTP_PORT_MAX: &str = "HOME_LAB_WSL_HTTP_PORT_MAX";
+const DEFAULT_HTTP_INBOUND: u16 = 80;
+const DEFAULT_HTTPS_INBOUND: u16 = 443;
+const ENV_HTTP_INBOUND: &str = "HOME_LAB_WSL_HTTP_INBOUND";
+const ENV_HTTPS_INBOUND: &str = "HOME_LAB_WSL_HTTPS_INBOUND";
+const DEFAULT_API_PORT: u16 = 6443;
+const ENV_API_PORT: &str = "HOME_LAB_WSL_K3S_API_PORT";
 
 fn env_or_default_u16(var: &str, default: u16) -> u16 {
     match std::env::var(var) {
@@ -207,6 +253,18 @@ fn http_port_max() -> u16 {
     env_or_default_u16(ENV_HTTP_PORT_MAX, DEFAULT_HTTP_PORT_MAX)
 }
 
+fn inbound_http_port() -> u16 {
+    env_or_default_u16(ENV_HTTP_INBOUND, DEFAULT_HTTP_INBOUND)
+}
+
+fn inbound_https_port() -> u16 {
+    env_or_default_u16(ENV_HTTPS_INBOUND, DEFAULT_HTTPS_INBOUND)
+}
+
+fn k3s_api_port() -> u16 {
+    env_or_default_u16(ENV_API_PORT, DEFAULT_API_PORT)
+}
+
 fn pick_http_port(used_ports: &HashSet<u16>) -> Result<u16> {
     let base = http_port_base();
     let step = http_port_step();
@@ -310,6 +368,133 @@ async fn configure_cluster_networking(instance: &str) -> Result<String> {
         applied_hosts.join(", "),
         http_port
     ))
+}
+
+async fn attach_cluster_details(instances: &mut [WslInstance]) {
+    if instances.is_empty() {
+        return;
+    }
+
+    let inbound_http = inbound_http_port();
+    let inbound_https = inbound_https_port();
+    let api_port = k3s_api_port();
+
+    let http_routes = match http::http_list_routes().await {
+        Ok(list) => Some(list.routes),
+        Err(err) => {
+            warn!(
+                target: "wsl",
+                error = %err,
+                "Impossible de recuperer la liste des routes HTTP"
+            );
+            None
+        }
+    };
+
+    let dns_records = match dns::dns_list_records().await {
+        Ok(list) => Some(list.records),
+        Err(err) => {
+            warn!(
+                target: "wsl",
+                error = %err,
+                "Impossible de recuperer les enregistrements DNS"
+            );
+            None
+        }
+    };
+
+    let oidc_clients: Option<Vec<ClientOut>> = match oidc_list_clients().await {
+        Ok(list) => Some(list.clients),
+        Err(err) => {
+            warn!(
+                target: "wsl",
+                error = %err,
+                "Impossible de recuperer les clients OIDC"
+            );
+            None
+        }
+    };
+
+    for instance in instances.iter_mut() {
+        let domains = cluster_domains(&instance.name);
+        if domains.is_empty() {
+            instance.cluster = None;
+            continue;
+        }
+
+        let mut routes = Vec::new();
+        if let Some(all_routes) = http_routes.as_ref() {
+            for route in all_routes {
+                if domains
+                    .iter()
+                    .any(|domain| domain.eq_ignore_ascii_case(&route.host))
+                {
+                    if let Ok(port) = u16::try_from(route.port) {
+                        if !routes.iter().any(|binding: &ClusterRouteBinding| {
+                            binding.host.eq_ignore_ascii_case(&route.host)
+                        }) {
+                            routes.push(ClusterRouteBinding {
+                                host: route.host.clone(),
+                                port,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        let dns_entries = if let Some(all_records) = dns_records.as_ref() {
+            let mut entries = Vec::new();
+            for record in all_records {
+                if domains
+                    .iter()
+                    .any(|domain| domain.eq_ignore_ascii_case(&record.name))
+                {
+                    entries.push(ClusterDnsEntry {
+                        name: record.name.clone(),
+                        a: record.a.clone(),
+                        ttl: if record.ttl == 0 {
+                            None
+                        } else {
+                            Some(record.ttl)
+                        },
+                    });
+                }
+            }
+            entries
+        } else {
+            Vec::new()
+        };
+
+        let oidc_info = if let Some(clients) = oidc_clients.as_ref() {
+            if let Some(client) = clients
+                .iter()
+                .find(|client| client.subject.eq_ignore_ascii_case(&instance.name))
+            {
+                ClusterOidcInfo {
+                    present: true,
+                    client_id: Some(client.client_id.clone()),
+                    scopes: client.allowed_scopes.clone(),
+                }
+            } else {
+                ClusterOidcInfo::default()
+            }
+        } else {
+            ClusterOidcInfo::default()
+        };
+
+        instance.cluster = Some(WslClusterStatus {
+            domains,
+            proxy: ClusterProxyInfo {
+                inbound_http,
+                inbound_https,
+                routes,
+            },
+            api_port,
+            dns_records: dns_entries,
+            oidc: oidc_info,
+        });
+    }
 }
 
 fn decode_cli_output(data: &[u8]) -> String {
@@ -901,6 +1086,7 @@ fn parse_wsl_list_output(output: &str) -> Result<Vec<WslInstance>> {
             state,
             version,
             is_default,
+            cluster: None,
         });
     }
 
@@ -1117,14 +1303,18 @@ fn run_wsl_unregister(name: &str) -> Result<WslOperationResult> {
 pub async fn wsl_list_instances() -> Result<Vec<WslInstance>, String> {
     info!(target: "wsl", "Listing des instances WSL");
     log_wsl_event("Listing des instances WSL");
-    tauri::async_runtime::spawn_blocking(collect_wsl_instances)
+    let mut instances = tauri::async_runtime::spawn_blocking(collect_wsl_instances)
         .await
         .map_err(|e| {
             error!(target: "wsl", "Erreur JoinHandle (list): {e}");
             log_wsl_event(format!("Erreur JoinHandle lors du listing WSL: {e}"));
             format!("Erreur interne: {e}")
-        })
-        .and_then(|result| result.map_err(|e| e.to_string()))
+        })?
+        .map_err(|e| e.to_string())?;
+
+    attach_cluster_details(&mut instances).await;
+
+    Ok(instances)
 }
 
 #[tauri::command]
