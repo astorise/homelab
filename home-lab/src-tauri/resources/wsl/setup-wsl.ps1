@@ -144,7 +144,11 @@ function Convert-ToWslPath {
 
     $full = Convert-Path -LiteralPath $WindowsPath
 
-    $linux = & wsl.exe -d $Distro -- wslpath -a $full 2>&1
+    # When invoking wslpath via wsl.exe we must double the backslashes,
+    # otherwise sequences like \U are eaten during Windows->Linux parsing.
+    $escapedFull = $full -replace '\\', '\\\\'
+
+    $linux = & wsl.exe -d $Distro -- wslpath -a $escapedFull 2>&1
     if ($LASTEXITCODE -eq 0 -and $linux) {
         return $linux.Trim()
     }
