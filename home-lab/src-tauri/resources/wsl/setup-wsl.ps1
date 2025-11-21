@@ -196,6 +196,25 @@ function Install-K3sBinary {
     }
 }
 
+function Clear-K3sLocks {
+    param(
+        [string]$Distro
+    )
+
+    $cmd = @'
+set -euo pipefail
+LOCK_FILE="/var/lib/rancher/k3s/data/.lock"
+if [ -f "$LOCK_FILE" ]; then
+    rm -f "$LOCK_FILE"
+fi
+if pidof k3s >/dev/null 2>&1; then
+    pkill k3s || true
+fi
+'@
+    Write-Info "Nettoyage des verrous k3s (si presents)"
+    & wsl.exe -d $Distro -- sh -c $cmd 2>$null | Out-Null
+}
+
 function Invoke-K3sBootstrap {
     param(
         [string]$Distro,
@@ -273,6 +292,7 @@ try {
     try {
         Install-K3sBinary -Distro $DistroName -WindowsBinaryPath $binary
         if ($shouldBootstrap) {
+            Clear-K3sLocks -Distro $DistroName
             Invoke-K3sBootstrap -Distro $DistroName
         }
     } finally {
