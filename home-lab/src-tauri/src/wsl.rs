@@ -598,6 +598,16 @@ fn log_wsl_event(message: impl AsRef<str>) {
     }
 }
 
+fn append_provision_message(target: &mut String, extra: &str) {
+    if extra.trim().is_empty() {
+        return;
+    }
+    if !target.trim().is_empty() {
+        target.push('\n');
+    }
+    target.push_str(extra);
+}
+
 fn sanitize_cli_field(value: &str) -> String {
     fn is_disallowed(c: char) -> bool {
         matches!(
@@ -765,7 +775,7 @@ pub async fn wsl_import_instance(
         force = force_import,
         instance = %sanitized_name,
         instance_debug = %sanitized_debug,
-        "Demande d'import WSL reçue"
+        "Demande d'import WSL recue"
     );
 
     let setup_result = tauri::async_runtime::spawn_blocking(move || {
@@ -781,26 +791,64 @@ pub async fn wsl_import_instance(
         format!("Erreur interne: {e}")
     })?;
 
-    let mut provision = setup_result.map_err(|e| {
-        error!(target: "wsl", "Échec import WSL: {e}");
-        log_wsl_event(format!(
-            "Échec import WSL pour l'instance {}: {e}",
-            sanitized_debug
-        ));
-        e.to_string()
-    })?;
+    let mut provision = match setup_result {
+        Ok(prov) => prov,
+        Err(err) => {
+            error!(target: "wsl", "Echec import WSL: {err}");
+            log_wsl_event(format!(
+                "Echec import WSL pour l'instance {}: {err}",
+                sanitized_debug
+            ));
+            ProvisionResult {
+                ok: false,
+                message: err.to_string(),
+            }
+        }
+    };
 
-    if provision.ok {
+    let mut allow_post_config = provision.ok;
+    if !allow_post_config {
+        match is_wsl_instance_present(&sanitized_name).await {
+            Ok(true) => {
+                allow_post_config = true;
+                info!(
+                    target: "wsl",
+                    instance = %sanitized_name,
+                    "Instance presente malgre une erreur setup, tentative de configuration reseau/OIDC"
+                );
+                log_wsl_event(format!(
+                    "Instance {} presente malgre erreur setup, configuration reseau/OIDC en cours",
+                    sanitized_debug
+                ));
+            }
+            Ok(false) => {
+                info!(
+                    target: "wsl",
+                    instance = %sanitized_name,
+                    "Instance absente apres echec setup, configuration reseau/OIDC ignoree"
+                );
+            }
+            Err(err) => {
+                warn!(
+                    target: "wsl",
+                    instance = %sanitized_name,
+                    error = %err,
+                    "Impossible de verifier la presence de l'instance WSL apres echec setup"
+                );
+                append_provision_message(
+                    &mut provision.message,
+                    &format!("Verification de l'instance WSL impossible: {err}"),
+                );
+            }
+        }
+    }
+
+    if allow_post_config {
         match configure_k3s_oidc_client(&sanitized_name).await {
             Ok(extra) => {
-                if !extra.is_empty() {
-                    if !provision.message.trim().is_empty() {
-                        provision.message.push('\n');
-                    }
-                    provision.message.push_str(&extra);
-                }
+                append_provision_message(&mut provision.message, &extra);
                 log_wsl_event(format!(
-                    "Client OIDC k3s créé pour {}: {}",
+                    "Client OIDC k3s cree pour {}: {}",
                     sanitized_debug,
                     escape_for_log(&extra)
                 ));
@@ -812,6 +860,10 @@ pub async fn wsl_import_instance(
                     error = %err,
                     "Configuration OIDC pour k3s impossible"
                 );
+                append_provision_message(
+                    &mut provision.message,
+                    &format!("Configuration OIDC impossible: {err}"),
+                );
                 log_wsl_event(format!(
                     "Configuration OIDC pour {} impossible: {}",
                     sanitized_debug,
@@ -822,12 +874,7 @@ pub async fn wsl_import_instance(
 
         match configure_cluster_networking(&sanitized_name).await {
             Ok(extra) => {
-                if !extra.is_empty() {
-                    if !provision.message.trim().is_empty() {
-                        provision.message.push('\n');
-                    }
-                    provision.message.push_str(&extra);
-                }
+                append_provision_message(&mut provision.message, &extra);
                 log_wsl_event(format!(
                     "Reseau WSL configure pour {}: {}",
                     sanitized_debug,
@@ -840,6 +887,10 @@ pub async fn wsl_import_instance(
                     instance = %sanitized_name,
                     error = %err,
                     "Configuration DNS/HTTP pour WSL impossible"
+                );
+                append_provision_message(
+                    &mut provision.message,
+                    &format!("Configuration DNS/HTTP impossible: {err}"),
                 );
                 log_wsl_event(format!(
                     "Configuration DNS/HTTP pour {} impossible: {}",
@@ -1172,6 +1223,19 @@ fn collect_wsl_instances() -> Result<Vec<WslInstance>> {
     }
 
     Ok(instances)
+}
+
+async fn is_wsl_instance_present(name: &str) -> Result<bool> {
+    let target = name.to_ascii_lowercase();
+    tauri::async_runtime::spawn_blocking(move || {
+        collect_wsl_instances().map(|instances| {
+            instances
+                .iter()
+                .any(|instance| instance.name.to_ascii_lowercase() == target)
+        })
+    })
+    .await
+    .map_err(|e| anyhow!("Erreur JoinHandle pour verifier l'instance WSL: {e}"))?
 }
 
 fn run_wsl_unregister(name: &str) -> Result<WslOperationResult> {
