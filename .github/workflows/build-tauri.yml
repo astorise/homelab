@@ -9,7 +9,7 @@ jobs:
   build-docker-image:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       - run: docker build -t env-dev-image -f docker-image/Dockerfile .
       - run: |
           cid=$(docker create env-dev-image)
@@ -22,7 +22,7 @@ jobs:
   build-services:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -58,7 +58,7 @@ jobs:
     runs-on: windows-latest
     needs: [build-services, build-docker-image]
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
 
       - name: Clear bundled services directory
         shell: pwsh
