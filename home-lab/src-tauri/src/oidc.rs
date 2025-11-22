@@ -8,6 +8,7 @@ use std::{
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient};
+use tokio::time::{sleep, Duration};
 use tonic::transport::{Endpoint, Uri};
 use tower::service_fn;
 use tracing::{debug, error, info, instrument, warn};
@@ -28,6 +29,9 @@ use proto::homeoidc::v1::{
 
 const PIPE_RELEASE: &str = r"\\.\pipe\home-oidc";
 const PIPE_DEV: &str = r"\\.\pipe\home-oidc-dev";
+
+const CONNECT_RETRIES: usize = 5;
+const CONNECT_RETRY_DELAY_MS: u64 = 500;
 
 type OidcClient = HomeOidcClient<tonic::transport::Channel>;
 
@@ -86,30 +90,57 @@ impl AsyncWrite for SendablePipeClient {
 
 async fn connect_client() -> Result<OidcClient, String> {
     let mut last_error = None;
-    for pipe in pipe_candidates() {
-        info!("Attempting OIDC gRPC connection via {}", pipe);
-        let pipe_path = pipe.to_string();
-        match Endpoint::try_from("http://[::]:50053")
-            .unwrap()
-            .connect_with_connector(service_fn(move |_uri: Uri| {
-                let path = pipe_path.clone();
-                async move {
-                    ClientOptions::new()
-                        .open(&path)
-                        .map(SendablePipeClient::new)
-                        .map(TokioIo::new)
+    for attempt in 1..=CONNECT_RETRIES {
+        for pipe in pipe_candidates() {
+            info!(
+                attempt,
+                pipe = %pipe,
+                "Attempting OIDC gRPC connection via {}",
+                pipe
+            );
+            let pipe_path = pipe.to_string();
+            match Endpoint::try_from("http://[::]:50053")
+                .unwrap()
+                .connect_with_connector(service_fn(move |_uri: Uri| {
+                    let path = pipe_path.clone();
+                    async move {
+                        ClientOptions::new()
+                            .open(&path)
+                            .map(SendablePipeClient::new)
+                            .map(TokioIo::new)
+                    }
+                }))
+                .await
+            {
+                Ok(channel) => {
+                    info!(
+                        attempt,
+                        pipe = %pipe,
+                        "Connected to OIDC gRPC service via {}",
+                        pipe
+                    );
+                    return Ok(HomeOidcClient::new(channel));
                 }
-            }))
-            .await
-        {
-            Ok(channel) => {
-                info!("Connected to OIDC gRPC service via {}", pipe);
-                return Ok(HomeOidcClient::new(channel));
+                Err(err) => {
+                    warn!(
+                        attempt,
+                        pipe = %pipe,
+                        error = ?err,
+                        "OIDC pipe {} connection failed",
+                        pipe
+                    );
+                    last_error = Some(err);
+                }
             }
-            Err(err) => {
-                warn!(error = ?err, "OIDC pipe {} connection failed", pipe);
-                last_error = Some(err);
-            }
+        }
+        if attempt < CONNECT_RETRIES {
+            let delay = CONNECT_RETRY_DELAY_MS * attempt as u64;
+            info!(
+                attempt,
+                delay_ms = delay,
+                "OIDC gRPC connection failed, retrying after delay"
+            );
+            sleep(Duration::from_millis(delay)).await;
         }
     }
 
@@ -117,8 +148,8 @@ async fn connect_client() -> Result<OidcClient, String> {
         .map(|e| e.to_string())
         .unwrap_or_else(|| "no pipe candidates available".to_string());
     let msg = format!(
-        "Failed to connect to OIDC service: {}. Is the service running?",
-        err
+        "Failed to connect to OIDC service after {} attempt(s): {}. Is the service running?",
+        CONNECT_RETRIES, err
     );
     error!("{}", msg);
     Err(msg)
