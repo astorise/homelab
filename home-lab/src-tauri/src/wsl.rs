@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::time::{sleep, Duration};
 
 use crate::dns;
 use crate::http;
@@ -97,6 +98,10 @@ const ENV_HTTP_INBOUND: &str = "HOME_LAB_WSL_HTTP_INBOUND";
 const ENV_HTTPS_INBOUND: &str = "HOME_LAB_WSL_HTTPS_INBOUND";
 const DEFAULT_API_PORT: u16 = 6443;
 const ENV_API_PORT: &str = "HOME_LAB_WSL_K3S_API_PORT";
+const SERVICE_RPC_RETRIES: usize = 8;
+const SERVICE_RPC_BASE_DELAY_MS: u64 = 750;
+const HTTP_SERVICE_NAME: &str = "HomeHttpService";
+const DNS_SERVICE_NAME: &str = "HomeDnsService";
 
 fn env_or_default_u16(var: &str, default: u16) -> u16 {
     match std::env::var(var) {
@@ -292,9 +297,8 @@ async fn configure_cluster_networking(instance: &str) -> Result<String> {
         anyhow::bail!("Aucun nom de domaine valide pour l'instance {instance}");
     }
 
-    let routes = http::http_list_routes()
-        .await
-        .map_err(|e| anyhow!("http_list_routes: {e}"))?
+    let routes = retry_http_rpc("list_routes", || http::http_list_routes())
+        .await?
         .routes;
 
     let mut used_ports: HashSet<u16> = HashSet::new();
@@ -331,18 +335,22 @@ async fn configure_cluster_networking(instance: &str) -> Result<String> {
 
     let mut applied_hosts = Vec::new();
     for host in &hosts {
-        http::http_add_route(host.clone(), http_port as u32)
-            .await
-            .map_err(|e| anyhow!("http_add_route({host}): {e}"))?;
+        retry_http_rpc("add_route", || {
+            http::http_add_route(host.clone(), http_port as u32)
+        })
+        .await
+        .map_err(|e| anyhow!("http_add_route({host}): {e}"))?;
         applied_hosts.push(host.clone());
     }
 
     let dns_ip = dns_target_ipv4();
     let ttl = dns_record_ttl();
     for host in &hosts {
-        dns::dns_add_record(host.clone(), "A".into(), dns_ip.clone(), ttl)
-            .await
-            .map_err(|e| anyhow!("dns_add_record({host}): {e}"))?;
+        retry_dns_rpc("add_record", || {
+            dns::dns_add_record(host.clone(), "A".into(), dns_ip.clone(), ttl)
+        })
+        .await
+        .map_err(|e| anyhow!("dns_add_record({host}): {e}"))?;
     }
 
     info!(
@@ -367,6 +375,153 @@ async fn configure_cluster_networking(instance: &str) -> Result<String> {
         "DNS/HTTP configures pour {} (port {}).",
         applied_hosts.join(", "),
         http_port
+    ))
+}
+
+async fn start_service_if_needed(service_name: &str) {
+    let name = service_name.to_string();
+    let name_log = escape_for_log(&name);
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        Command::new("powershell.exe")
+            .arg("-NoProfile")
+            .arg("-Command")
+            .arg(format!(
+                "Try {{ $svc = Get-Service -Name '{name}' -ErrorAction Stop; if ($svc.Status -ne 'Running') {{ Start-Service -Name '{name}' -ErrorAction Stop; Write-Output 'started' }} else {{ Write-Output 'already-running' }} }} Catch {{ Write-Output ('error: ' + $_.Exception.Message) }}",
+            ))
+            .output()
+    })
+    .await;
+
+    match result {
+        Ok(Ok(output)) => {
+            let stdout = decode_cli_output(&output.stdout);
+            let stderr = decode_cli_output(&output.stderr);
+            let stdout_trim = stdout.trim();
+            let stderr_trim = stderr.trim();
+            if !output.status.success() || stdout_trim.starts_with("error:") {
+                warn!(
+                    target: "wsl",
+                    service = %name_log,
+                    status = %output.status,
+                    stdout = %escape_for_log(stdout_trim),
+                    stderr = %escape_for_log(stderr_trim),
+                    "Start-Service attempt failed"
+                );
+                log_wsl_event(format!(
+                    "Start-Service {name_log} failed: status={} stdout={} stderr={}",
+                    output.status,
+                    escape_for_log(stdout_trim),
+                    escape_for_log(stderr_trim)
+                ));
+            } else {
+                info!(
+                    target: "wsl",
+                    service = %name_log,
+                    status = %output.status,
+                    stdout = %escape_for_log(stdout_trim),
+                    "Start-Service invoked"
+                );
+                log_wsl_event(format!(
+                    "Start-Service {name_log}: status={} stdout={}",
+                    output.status,
+                    escape_for_log(stdout_trim)
+                ));
+            }
+        }
+        Ok(Err(err)) => {
+            warn!(
+                target: "wsl",
+                service = %name_log,
+                error = %err,
+                "Start-Service command failed to run"
+            );
+            log_wsl_event(format!(
+                "Start-Service {name_log} failed to run: {}",
+                escape_for_log(&err.to_string())
+            ));
+        }
+        Err(err) => {
+            warn!(
+                target: "wsl",
+                service = %name_log,
+                error = %err,
+                "Start-Service JoinHandle failed"
+            );
+            log_wsl_event(format!(
+                "Start-Service {name_log} JoinHandle failed: {}",
+                escape_for_log(&err.to_string())
+            ));
+        }
+    }
+}
+
+async fn retry_http_rpc<T, Fut>(op_name: &str, mut op: impl FnMut() -> Fut) -> Result<T>
+where
+    Fut: std::future::Future<Output = Result<T, String>>,
+{
+    let mut last_error = String::new();
+    for attempt in 1..=SERVICE_RPC_RETRIES {
+        match op().await {
+            Ok(value) => return Ok(value),
+            Err(err) => {
+                last_error = err.clone();
+                warn!(
+                    target: "wsl",
+                    attempt,
+                    op = op_name,
+                    error = %err,
+                    "HTTP RPC attempt failed"
+                );
+                if attempt == 1 {
+                    start_service_if_needed(HTTP_SERVICE_NAME).await;
+                }
+                if attempt < SERVICE_RPC_RETRIES {
+                    let delay = SERVICE_RPC_BASE_DELAY_MS * attempt as u64;
+                    sleep(Duration::from_millis(delay)).await;
+                }
+            }
+        }
+    }
+    Err(anyhow!(
+        "HTTP service unreachable after {} attempts (op={}): {}",
+        SERVICE_RPC_RETRIES,
+        op_name,
+        last_error
+    ))
+}
+
+async fn retry_dns_rpc<T, Fut>(op_name: &str, mut op: impl FnMut() -> Fut) -> Result<T>
+where
+    Fut: std::future::Future<Output = Result<T, String>>,
+{
+    let mut last_error = String::new();
+    for attempt in 1..=SERVICE_RPC_RETRIES {
+        match op().await {
+            Ok(value) => return Ok(value),
+            Err(err) => {
+                last_error = err.clone();
+                warn!(
+                    target: "wsl",
+                    attempt,
+                    op = op_name,
+                    error = %err,
+                    "DNS RPC attempt failed"
+                );
+                if attempt == 1 {
+                    start_service_if_needed(DNS_SERVICE_NAME).await;
+                }
+                if attempt < SERVICE_RPC_RETRIES {
+                    let delay = SERVICE_RPC_BASE_DELAY_MS * attempt as u64;
+                    sleep(Duration::from_millis(delay)).await;
+                }
+            }
+        }
+    }
+    Err(anyhow!(
+        "DNS service unreachable after {} attempts (op={}): {}",
+        SERVICE_RPC_RETRIES,
+        op_name,
+        last_error
     ))
 }
 
