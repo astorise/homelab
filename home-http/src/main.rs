@@ -915,20 +915,22 @@ fn named_pipe_stream() -> io::Result<UnboundedReceiverStream<Result<PipeConnecti
         }
         let _guard = SecurityDescriptorGuard(sd_addr);
 
-        let mut sa = windows_sys::Win32::Security::SECURITY_ATTRIBUTES {
-            nLength: std::mem::size_of::<windows_sys::Win32::Security::SECURITY_ATTRIBUTES>() as u32,
-            lpSecurityDescriptor: sd_addr as windows_sys::Win32::Security::PSECURITY_DESCRIPTOR,
-            bInheritHandle: 0,
-        };
-
-        let first_server = match ServerOptions::new()
-            .first_pipe_instance(true)
-            .create_with_security_attributes_raw(NAMED_PIPE_NAME, &mut sa as *mut _ as *mut _)
-        {
-            Ok(s) => s,
-            Err(e) => {
-                let _ = tx.send(Err(e));
-                return;
+        let first_server = {
+            let mut sa = windows_sys::Win32::Security::SECURITY_ATTRIBUTES {
+                nLength: std::mem::size_of::<windows_sys::Win32::Security::SECURITY_ATTRIBUTES>() as u32,
+                lpSecurityDescriptor: sd_addr as windows_sys::Win32::Security::PSECURITY_DESCRIPTOR,
+                bInheritHandle: 0,
+            };
+            match unsafe {
+                ServerOptions::new()
+                    .first_pipe_instance(true)
+                    .create_with_security_attributes_raw(NAMED_PIPE_NAME, &mut sa as *mut _ as *mut _)
+            } {
+                Ok(s) => s,
+                Err(e) => {
+                    let _ = tx.send(Err(e));
+                    return;
+                }
             }
         };
 
@@ -938,12 +940,19 @@ fn named_pipe_stream() -> io::Result<UnboundedReceiverStream<Result<PipeConnecti
             if let Some(s) = server.take() {
                 match s.connect().await {
                     Ok(()) => {
-                        let new_server = match ServerOptions::new()
-                            .first_pipe_instance(false)
-                            .create_with_security_attributes_raw(
-                                NAMED_PIPE_NAME,
-                                &mut sa as *mut _ as *mut _,
-                            ) {
+                        let mut sa = windows_sys::Win32::Security::SECURITY_ATTRIBUTES {
+                            nLength: std::mem::size_of::<windows_sys::Win32::Security::SECURITY_ATTRIBUTES>() as u32,
+                            lpSecurityDescriptor: sd_addr as windows_sys::Win32::Security::PSECURITY_DESCRIPTOR,
+                            bInheritHandle: 0,
+                        };
+                        let new_server = match unsafe {
+                            ServerOptions::new()
+                                .first_pipe_instance(false)
+                                .create_with_security_attributes_raw(
+                                    NAMED_PIPE_NAME,
+                                    &mut sa as *mut _ as *mut _,
+                                )
+                        } {
                             Ok(s) => s,
                             Err(e) => {
                                 let _ = tx.send(Err(e));
