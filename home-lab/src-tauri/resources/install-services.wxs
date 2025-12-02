@@ -66,6 +66,8 @@
         <RegistryKey Root="HKLM" Key="Software\astori\home-lab">
           <RegistryValue Name="ServicesAnchor" Type="integer" Value="1" KeyPath="yes"/>
         </RegistryKey>
+        <!-- Ajout au démarrage de Windows -->
+        <RegistryValue Id="Startup" Root="HKLM" Key="Software\Microsoft\Windows\CurrentVersion\Run" Name="Home Lab" Value='"[INSTALLDIR]home-lab.exe"' Type="string" />
         <!-- Make sure uninstall always stops and deletes services, even if CAs did not run -->
         <ServiceControl Id="SvcCtl_StopDelete_HomeDns" Name="HomeDnsService" Stop="both" Remove="uninstall" Wait="yes" />
         <ServiceControl Id="SvcCtl_StopDelete_HomeHttp" Name="HomeHttpService" Stop="both" Remove="uninstall" Wait="yes" />
