@@ -999,6 +999,34 @@ pub async fn wsl_import_instance(
     }
 
     if allow_post_config {
+        match download_and_install_k3s(&app, &sanitized_name).await {
+            Ok(extra) => {
+                append_provision_message(&mut provision.message, &extra);
+                log_wsl_event(format!(
+                    "Installation de K3S reussie pour {}: {}",
+                    sanitized_debug,
+                    escape_for_log(&extra)
+                ));
+            }
+            Err(err) => {
+                warn!(
+                    target: "wsl",
+                    instance = %sanitized_name,
+                    error = %err,
+                    "Installation de K3S impossible"
+                );
+                append_provision_message(
+                    &mut provision.message,
+                    &format!("Installation de K3S impossible: {err}"),
+                );
+                log_wsl_event(format!(
+                    "Installation de K3S impossible pour {}: {}",
+                    sanitized_debug,
+                    escape_for_log(&err.to_string())
+                ));
+            }
+        }
+
         match configure_k3s_oidc_client(&sanitized_name).await {
             Ok(extra) => {
                 append_provision_message(&mut provision.message, &extra);
@@ -1592,4 +1620,153 @@ pub async fn wsl_remove_instance(name: String) -> Result<WslOperationResult, Str
             e.to_string()
         })
     })
+}
+
+#[derive(serde::Deserialize, Debug)]
+struct GitHubReleaseAsset {
+    name: String,
+    browser_download_url: String,
+}
+
+#[derive(serde::Deserialize, Debug)]
+struct GitHubRelease {
+    tag_name: String,
+    assets: Vec<GitHubReleaseAsset>,
+}
+
+async fn download_and_install_k3s(
+    app: &AppHandle,
+    instance_name: &str,
+) -> Result<String> {
+    let client = reqwest::Client::new();
+    let release_url = "https://api.github.com/repos/k3s-io/k3s/releases/latest";
+    let sanitized_instance = escape_for_log(instance_name);
+
+    info!(target: "wsl", "Recuperation de la derniere version de K3S");
+    log_wsl_event(format!(
+        "Recuperation de la derniere version de K3S pour {}",
+        sanitized_instance
+    ));
+
+    let release: GitHubRelease = client
+        .get(release_url)
+        .header("User-Agent", "home-lab-tauri-app")
+        .send()
+        .await
+        .context("Impossible d'interroger l'API GitHub pour les versions de K3S")?
+        .json()
+        .await
+        .context("Impossible de désérialiser la réponse des versions de K3S")?;
+
+    let asset_name = "k3s"; // x86_64
+    let asset = release
+        .assets
+        .iter()
+        .find(|a| a.name == asset_name)
+        .context(format!(
+            "Impossible de trouver l'asset K3S '{}' dans la version {}",
+            asset_name, release.tag_name
+        ))?;
+
+    let cache_dir = app
+        .path()
+        .app_cache_dir()
+        .context("Impossible de trouver le dossier de cache de l'application")?;
+    let k3s_cache_dir = cache_dir.join("k3s");
+    fs::create_dir_all(&k3s_cache_dir)
+        .context("Impossible de créer le dossier de cache pour K3S")?;
+
+    let cached_file_path = k3s_cache_dir.join(format!("{}-{}", release.tag_name, asset_name));
+
+    if !cached_file_path.exists() {
+        info!(
+            target: "wsl",
+            url = %asset.browser_download_url,
+            path = %cached_file_path.display(),
+            "Telechargement de K3S"
+        );
+        log_wsl_event(format!(
+            "Telechargement de K3S {} vers {}",
+            asset.browser_download_url,
+            cached_file_path.display()
+        ));
+
+        let mut response = client
+            .get(&asset.browser_download_url)
+            .send()
+            .await
+            .context(format!(
+                "Impossible de télécharger l'asset K3S depuis {}",
+                asset.browser_download_url
+            ))?;
+
+        let mut file = fs::File::create(&cached_file_path).context(format!(
+            "Impossible de créer le fichier de cache K3S sur {}",
+            cached_file_path.display()
+        ))?;
+        
+        while let Some(chunk) = response.chunk().await.context("Erreur lors du telechargement de K3s")? {
+            file.write_all(&chunk).context("Erreur ecriture dans le fichier de cache K3s")?;
+        }
+
+    } else {
+        info!(
+            target: "wsl",
+            path = %cached_file_path.display(),
+            "K3S est deja en cache"
+        );
+        log_wsl_event(format!(
+            "K3S est deja en cache sur {}",
+            cached_file_path.display()
+        ));
+    }
+
+    let wsl_path = format!("\\\\wsl$\\{}\\usr\\local\\bin\\k3s", instance_name);
+    let wsl_path_buf = PathBuf::from(&wsl_path);
+
+    info!(
+        target: "wsl",
+        source = %cached_file_path.display(),
+        dest = %wsl_path,
+        "Copie de K3S dans l'instance WSL"
+    );
+    log_wsl_event(format!(
+        "Copie de K3S de {} vers {}",
+        cached_file_path.display(),
+        wsl_path
+    ));
+
+    fs::copy(&cached_file_path, &wsl_path_buf).context(format!(
+        "Impossible de copier K3S dans WSL sur {}",
+        wsl_path_buf.display()
+    ))?;
+
+    let command_line = format_cli_command("wsl.exe", &["-d", instance_name, "chmod", "+x", "/usr/local/bin/k3s"]);
+    info!(
+        target: "wsl",
+        command = %command_line,
+        "Execution de la commande pour rendre K3S executable"
+    );
+    log_wsl_event(format!(
+        "Execution de la commande pour rendre K3S executable : {}",
+        command_line
+    ));
+
+    let output = Command::new("wsl.exe")
+        .args(["-d", instance_name, "chmod", "+x", "/usr/local/bin/k3s"])
+        .output()
+        .context("Impossible de rendre K3S executable dans WSL")?;
+
+    if !output.status.success() {
+        let stderr = decode_cli_output(&output.stderr);
+        anyhow::bail!(
+            "Impossible de rendre K3S executable dans WSL: {}",
+            stderr
+        );
+    }
+
+    Ok(format!(
+        "K3S {} installe avec succes.",
+        release.tag_name
+    ))
 }

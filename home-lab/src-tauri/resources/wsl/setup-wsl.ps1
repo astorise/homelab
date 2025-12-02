@@ -104,98 +104,6 @@ function Remove-Distro {
     }
 }
 
-function Get-LatestK3sReleaseTag {
-    $uri = 'https://api.github.com/repos/k3s-io/k3s/releases/latest'
-    $headers = @{ 'User-Agent' = 'home-lab-installer' }
-    try {
-        $resp = Invoke-RestMethod -Uri $uri -Headers $headers
-        if (-not $resp.tag_name) {
-            throw 'Reponse GitHub inattendue (tag_name absent).'
-        }
-        return [string]$resp.tag_name
-    } catch {
-        throw "Impossible de recuperer la version k3s: $($_.Exception.Message)"
-    }
-}
-
-function Download-K3sBinary {
-    param(
-        [string]$Tag
-    )
-
-    $downloadUri = "https://github.com/k3s-io/k3s/releases/download/$Tag/k3s"
-    $tempFile = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), "k3s-$Tag")
-
-    Write-Info "Telechargement de k3s ($Tag) ..."
-    try {
-        Invoke-WebRequest -Uri $downloadUri -OutFile $tempFile -UseBasicParsing | Out-Null
-    } catch {
-        throw "Telechargement de k3s echoue: $($_.Exception.Message)"
-    }
-
-    return $tempFile
-}
-
-function Convert-ToWslPath {
-    param(
-        [string]$Distro,
-        [string]$WindowsPath
-    )
-
-    $full = Convert-Path -LiteralPath $WindowsPath
-
-    # When invoking wslpath via wsl.exe we must double the backslashes,
-    # otherwise sequences like \U are eaten during Windows->Linux parsing.
-    $escapedFull = $full -replace '\\', '\\\\'
-
-    $linux = & wsl.exe -d $Distro -- wslpath -a $escapedFull 2>&1
-    if ($LASTEXITCODE -eq 0 -and $linux) {
-        return $linux.Trim()
-    }
-
-    if ($LASTEXITCODE -ne 0 -and $linux) {
-        $errorDetails = ($linux | Where-Object { $_ -and $_.Trim().Length -gt 0 }) -join "`n"
-    }
-
-    $normalized = $full
-    if ($normalized.StartsWith('\\?\')) {
-        $normalized = $normalized.Substring(4)
-    }
-
-    if ($normalized -match '^(?<drive>[A-Za-z]):(?<tail>\\.*)$') {
-        $drive = $Matches['drive'].ToLowerInvariant()
-        $tail = $Matches['tail'] -replace '\\', '/'
-        return "/mnt/$drive$tail"
-    }
-
-    if ($errorDetails) {
-        throw "Conversion en chemin WSL echouee pour $full :`n$errorDetails"
-    }
-
-    throw "Conversion en chemin WSL echouee pour $full"
-}
-
-function Escape-ShellSingleQuotes {
-    param([string]$Value)
-    return $Value -replace "'", "'""'""'"
-}
-
-function Install-K3sBinary {
-    param(
-        [string]$Distro,
-        [string]$WindowsBinaryPath
-    )
-
-    $linuxPath = Convert-ToWslPath -Distro $Distro -WindowsPath $WindowsBinaryPath
-    $escaped = Escape-ShellSingleQuotes -Value $linuxPath
-    $cmd = "set -euo pipefail; install -m 0755 '$escaped' /usr/local/bin/k3s"
-    Write-Info "Installation de k3s dans la distribution $Distro"
-    $p = Start-Process -FilePath 'wsl.exe' -ArgumentList @('-d', $Distro, '--', 'sh', '-c', $cmd) -Wait -PassThru -NoNewWindow
-    if ($p.ExitCode -ne 0) {
-        throw "Installation de k3s echouee (code $($p.ExitCode))"
-    }
-}
-
 function Clear-K3sLocks {
     param(
         [string]$Distro
@@ -272,34 +180,8 @@ try {
         Write-Info "Distribution $DistroName deja presente, import ignore."
     }
 
-    $tag = Get-LatestK3sReleaseTag
-    $binary = Download-K3sBinary -Tag $tag
-
-    $shouldBootstrap = $needsImport
-    if ($shouldBootstrap) {
-        Write-Info "Instance nouvellement importee : bootstrap k3s requis."
-    } else {
-        Write-Info "Verification de la presence du kubeconfig k3s dans $DistroName"
-        & wsl.exe -d $DistroName -- test -s /etc/rancher/k3s/k3s.yaml 2>$null
-        if ($LASTEXITCODE -ne 0) {
-            $shouldBootstrap = $true
-            Write-Info "kubeconfig k3s manquant : bootstrap sera lance."
-        } else {
-            Write-Info "kubeconfig k3s deja present : bootstrap ignore."
-        }
-    }
-
-    try {
-        Install-K3sBinary -Distro $DistroName -WindowsBinaryPath $binary
-        if ($shouldBootstrap) {
-            Clear-K3sLocks -Distro $DistroName
-            Invoke-K3sBootstrap -Distro $DistroName
-        }
-    } finally {
-        if (Test-Path -LiteralPath $binary) {
-            Remove-Item -LiteralPath $binary -Force -ErrorAction SilentlyContinue
-        }
-    }
+    Clear-K3sLocks -Distro $DistroName
+    Invoke-K3sBootstrap -Distro $DistroName
 
     Write-Info "Configuration WSL terminee."
     exit 0

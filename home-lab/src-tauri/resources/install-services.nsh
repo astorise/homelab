@@ -124,6 +124,11 @@ FunctionEnd
   ; Forcer l’élévation (si pas déjà perMachine)
   ; et lancer WSL sans distribution
   nsExec::ExecToLog 'powershell -ExecutionPolicy Bypass -Command "wsl --install --no-distribution"'
+
+  ; Ajout au démarrage de Windows
+  DetailPrint "Adding home-lab to startup..."
+  WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Run" "Home Lab" '"$INSTDIR\home-lab.exe"'
+
   ; Close log file if opened
   StrCmp $LOG_HANDLE "" +2
   FileClose $LOG_HANDLE
@@ -138,6 +143,10 @@ FunctionEnd
 
 ; Ensure services are stopped and deleted BEFORE files are removed
 !macro NSIS_HOOK_PREUNINSTALL
+  ; Suppression du démarrage de Windows
+  DetailPrint "Removing home-lab from startup..."
+  DeleteRegValue HKLM "Software\Microsoft\Windows\CurrentVersion\Run" "Home Lab"
+
   SetDetailsPrint both
   StrCpy $LOG_FILE "$INSTDIR\installer.log"
   ClearErrors
