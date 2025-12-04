@@ -612,11 +612,9 @@ impl HomeOidc for OidcGrpcService {
         &self,
         _request: GrpcRequest<Empty>,
     ) -> Result<GrpcResponse<ListClientsResponse>, Status> {
-        let clients = self
-            .state
-            .cfg
-            .clients
-            .iter()
+        let clients_guard = self.state.clients.read().await;
+        let clients = clients_guard
+            .values()
             .map(|client| {
                 let password_users = client
                     .password_users

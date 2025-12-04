@@ -1254,7 +1254,7 @@ fn run_wsl_setup(
 }
 
 fn parse_wsl_list_output(output: &str) -> Result<Vec<WslInstance>> {
-    let entry_re = Regex::new(r"^(?P<name>.+?)\s{2,}(?P<state>\S.*?)(?:\s{2,}(?P<version>\S+))?$")?;
+    let entry_re = Regex::new(r"^(?P<name>.+?)\s{2,}(?P<state>.+?)(?:\s{2,}(?P<version>\S+))?$")?;
     let mut instances = Vec::new();
     let mut header_skipped = false;
 
