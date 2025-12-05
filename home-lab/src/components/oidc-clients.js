@@ -72,7 +72,7 @@ class OidcClients extends HTMLElement {
               <button
                 type="button"
                 class="oidc-remove text-xs text-red-600 hover:text-red-800"
-                data-client="${client.client_id}"
+                data-client-id="${client.client_id}"
               >Supprimer</button>
             </div>
             ${client.subject ? `<div class="text-xs text-gray-500">sub: ${client.subject}</div>` : ''}
