@@ -1284,6 +1284,60 @@ fn run_servers(cfg: ServiceConfig, material: KeyMaterial, cancel: CancellationTo
 }
 
 #[cfg(windows)]
+#[pin_project]
+struct PipeConnection {
+    #[pin]
+    inner: NamedPipeServer,
+}
+
+#[cfg(windows)]
+impl PipeConnection {
+    fn new(inner: NamedPipeServer) -> Self {
+        Self { inner }
+    }
+}
+
+#[cfg(windows)]
+unsafe impl Send for PipeConnection {}
+
+#[cfg(windows)]
+impl Connected for PipeConnection {
+    type ConnectInfo = ();
+
+    fn connect_info(&self) -> Self::ConnectInfo {}
+}
+
+#[cfg(windows)]
+impl AsyncRead for PipeConnection {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        self.project().inner.poll_read(cx, buf)
+    }
+}
+
+#[cfg(windows)]
+impl AsyncWrite for PipeConnection {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        data: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        self.project().inner.poll_write(cx, data)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        self.project().inner.poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        self.project().inner.poll_shutdown(cx)
+    }
+}
+
+#[cfg(windows)]
 fn named_pipe_stream() -> io::Result<UnboundedReceiverStream<Result<PipeConnection, io::Error>>> {
     let sddl = "D:(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;AU)(A;;FA;;;IU)"; // Allow System, Built-in Admins, Authenticated Users, Interactive Users
     let mut sd: windows_sys::Win32::Security::PSECURITY_DESCRIPTOR = std::ptr::null_mut();
