@@ -69,11 +69,15 @@ class OidcClients extends HTMLElement {
                 <span class="font-semibold">${client.client_id}</span>
                 <span class="text-xs text-gray-500 ml-2">${client.auth_method || 'inconnu'}</span>
               </div>
-              <button
+              ${
+                client.auth_method === 'private_key_jwt'
+                  ? `<button
                 type="button"
                 class="oidc-remove text-xs text-red-600 hover:text-red-800"
                 data-client-id="${client.client_id}"
-              >Supprimer</button>
+              >Supprimer</button>`
+                  : ''
+              }
             </div>
             ${client.subject ? `<div class="text-xs text-gray-500">sub: ${client.subject}</div>` : ''}
             <div class="text-sm text-gray-700">
