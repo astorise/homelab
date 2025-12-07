@@ -912,8 +912,9 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn named_pipe_stream() -> io::Result<UnboundedReceiverStream<Result<PipeConnection, io::Error>>> {
-    let sddl = "D:(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;AU)(A;;FA;;;IU)"; // Allow System, Built-in Admins, Authenticated Users, Interactive Users
+fn named_pipe_stream(
+) -> anyhow::Result<UnboundedReceiverStream<Result<PipeConnection, std::io::Error>>> {
+    let sddl = "D:(A;;GA;;;WD)(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;AU)(A;;FA;;;IU)"; // Allow Everyone, System, Admins, Authenticated, Interactive
     let mut sd: windows_sys::Win32::Security::PSECURITY_DESCRIPTOR = std::ptr::null_mut();
     let sddl_w: Vec<u16> = sddl.encode_utf16().chain(std::iter::once(0)).collect();
 
@@ -925,11 +926,11 @@ fn named_pipe_stream() -> io::Result<UnboundedReceiverStream<Result<PipeConnecti
             std::ptr::null_mut(),
         )
     };
-
     if result == 0 {
-        let err = unsafe { windows_sys::Win32::Foundation::GetLastError() };
-        error!("FATAL: ConvertStringSecurityDescriptorToSecurityDescriptorW failed: {}", err);
-        return Err(io::Error::new(io::ErrorKind::Other, "Security attributes creation failed"));
+        return Err(anyhow::anyhow!(
+            "Failed to create security descriptor: {}",
+            io::Error::last_os_error()
+        ));
     }
 
     let sd_addr = sd as usize;
@@ -948,18 +949,23 @@ fn named_pipe_stream() -> io::Result<UnboundedReceiverStream<Result<PipeConnecti
         }
         let _guard = SecurityDescriptorGuard(sd_addr);
 
-        let server = {
+        let mut server = {
             let mut sa_first = windows_sys::Win32::Security::SECURITY_ATTRIBUTES {
-                nLength: std::mem::size_of::<windows_sys::Win32::Security::SECURITY_ATTRIBUTES>() as u32,
-                lpSecurityDescriptor: sd_addr as windows_sys::Win32::Security::PSECURITY_DESCRIPTOR,
+                nLength: std::mem::size_of::<windows_sys::Win32::Security::SECURITY_ATTRIBUTES>()
+                    as u32,
+                lpSecurityDescriptor: sd_addr
+                    as windows_sys::Win32::Security::PSECURITY_DESCRIPTOR,
                 bInheritHandle: 0,
             };
             match unsafe {
                 ServerOptions::new()
                     .first_pipe_instance(true)
-                    .create_with_security_attributes_raw(NAMED_PIPE_NAME, &mut sa_first as *mut _ as *mut _)
+                    .create_with_security_attributes_raw(
+                        NAMED_PIPE_NAME,
+                        &mut sa_first as *mut _ as *mut _,
+                    )
             } {
-                Ok(s) => s,
+                Ok(s) => Some(s),
                 Err(e) => {
                     let _ = tx.send(Err(e));
                     return;
@@ -967,27 +973,29 @@ fn named_pipe_stream() -> io::Result<UnboundedReceiverStream<Result<PipeConnecti
             }
         };
 
-        let mut server = Some(server);
-
         loop {
             if let Some(s) = server.take() {
                 match s.connect().await {
                     Ok(()) => {
-                        let mut sa_loop = windows_sys::Win32::Security::SECURITY_ATTRIBUTES {
-                            nLength: std::mem::size_of::<windows_sys::Win32::Security::SECURITY_ATTRIBUTES>() as u32,
-                            lpSecurityDescriptor: sd_addr as windows_sys::Win32::Security::PSECURITY_DESCRIPTOR,
-                            bInheritHandle: 0,
-                        };
-                        let new_server = match unsafe {
-                            ServerOptions::new().create_with_security_attributes_raw(
-                                NAMED_PIPE_NAME,
-                                &mut sa_loop as *mut _ as *mut _,
-                            )
-                        } {
-                            Ok(s) => s,
-                            Err(e) => {
-                                let _ = tx.send(Err(e));
-                                break;
+                        let new_server = {
+                            let mut sa_loop = windows_sys::Win32::Security::SECURITY_ATTRIBUTES {
+                                nLength: std::mem::size_of::<windows_sys::Win32::Security::SECURITY_ATTRIBUTES>()
+                                    as u32,
+                                lpSecurityDescriptor: sd_addr
+                                    as windows_sys::Win32::Security::PSECURITY_DESCRIPTOR,
+                                bInheritHandle: 0,
+                            };
+                            match unsafe {
+                                ServerOptions::new().create_with_security_attributes_raw(
+                                    NAMED_PIPE_NAME,
+                                    &mut sa_loop as *mut _ as *mut _,
+                                )
+                            } {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    let _ = tx.send(Err(e));
+                                    break;
+                                }
                             }
                         };
                         if tx.send(Ok(PipeConnection::new(s))).is_err() {
