@@ -14,7 +14,7 @@ license = "GPL-3.0-only"
 repository = "https://github.com/example/homelab"
 
 [workspace.dependencies]
-sysinfo = "0.37.0"
+sysinfo = "0.38.0"
 tokio = "1.47.1"
 tokio-tungstenite = "0.28.0"
 windows-service = "0.8.0"
