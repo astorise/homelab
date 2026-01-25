@@ -45,7 +45,7 @@ tokio-stream = "0.1.15"
 futures-util = "0.3.30"
 pin-project = "1.1.5"
 hyper-util = { version = "0.1", features = ["tokio"] }
-rand = "0.8"
+rand = "0.9"
 rsa = { version = "0.9", features = ["pem"] }
 reqwest = { version = "0.12", features = ["json", "stream"] }
 
