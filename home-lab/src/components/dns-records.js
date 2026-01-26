@@ -1,4 +1,4 @@
-import { dns_list_records } from '../tauri.js';
+import { dns_add_record, dns_list_records, dns_remove_record } from '../tauri.js';
 
 class DnsRecords extends HTMLElement {
   constructor() {
@@ -43,17 +43,104 @@ class DnsRecords extends HTMLElement {
       </div>`;
   }
 
+  renderRecordsList(records) {
+    if (!records.length) {
+      return '<li class="text-sm text-gray-600">Aucun enregistrement.</li>';
+    }
+    return records
+      .map((record) => {
+        const ttl = record.ttl ?? '—';
+        const renderValues = (type, values) => {
+          if (!Array.isArray(values) || values.length === 0) return '';
+          return `
+            <ul class="ml-4 mt-2 space-y-1">
+              ${values
+                .map(
+                  (value) => `
+                    <li class="flex items-center justify-between gap-2 text-sm">
+                      <span class="font-mono">${type} → ${value}</span>
+                      <button
+                        type="button"
+                        class="dns-remove-record text-xs text-red-600 hover:text-red-800"
+                        data-name="${record.name}"
+                        data-rrtype="${type}"
+                        data-value="${value}"
+                      >Supprimer</button>
+                    </li>`
+                )
+                .join('')}
+            </ul>`;
+        };
+        return `
+          <li class="border-b border-gray-200 pb-3 mb-3 last:pb-0 last:mb-0 last:border-none">
+            <div class="flex items-center justify-between">
+              <span class="font-semibold">${record.name}</span>
+              <span class="text-xs text-gray-500">TTL: ${ttl}</span>
+            </div>
+            ${renderValues('A', record.a)}
+            ${renderValues('AAAA', record.aaaa)}
+          </li>`;
+      })
+      .join('');
+  }
+
+  attachEventHandlers() {
+    const form = this.querySelector('#dns-add-form');
+    if (form) {
+      form.addEventListener('submit', (event) => this.handleAdd(event));
+    }
+    this.querySelectorAll('.dns-remove-record').forEach((btn) => {
+      btn.addEventListener('click', (event) => this.handleRemove(event));
+    });
+  }
+
   renderSuccess(records) {
-    const items = records.length
-      ? records.map((r) => `<li>${JSON.stringify(r)}</li>`).join('')
-      : '<li>Aucun enregistrement.</li>';
+    this._records = Array.isArray(records) ? records : [];
     this.innerHTML = `
       <div class="p-4 bg-gray-100 rounded">
         <h2 class="font-bold mb-2">DNS Records</h2>
-        <ul class="list-disc pl-5">
-          ${items}
+        <ul class="list-disc pl-5 space-y-2">
+          ${this.renderRecordsList(this._records)}
         </ul>
+        <form id="dns-add-form" class="mt-4 grid gap-2 sm:grid-cols-5" autocomplete="off">
+          <input
+            name="name"
+            type="text"
+            required
+            placeholder="Nom"
+            class="sm:col-span-2 rounded border border-gray-300 px-2 py-1"
+          />
+          <select
+            name="rrtype"
+            class="rounded border border-gray-300 px-2 py-1"
+            required
+          >
+            <option value="A">A</option>
+            <option value="AAAA">AAAA</option>
+          </select>
+          <input
+            name="value"
+            type="text"
+            required
+            placeholder="Adresse IP"
+            class="rounded border border-gray-300 px-2 py-1"
+          />
+          <input
+            name="ttl"
+            type="number"
+            min="1"
+            step="1"
+            value="300"
+            placeholder="TTL"
+            class="rounded border border-gray-300 px-2 py-1"
+          />
+          <button
+            type="submit"
+            class="sm:col-span-5 justify-self-start bg-blue-600 text-white px-3 py-1 rounded hover:bg-blue-700"
+          >Ajouter</button>
+        </form>
       </div>`;
+    this.attachEventHandlers();
   }
 
   renderError(err) {
@@ -85,6 +172,67 @@ class DnsRecords extends HTMLElement {
         this.renderLoading();
       }
       this.scheduleRetry();
+    }
+  }
+
+  async handleAdd(event) {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const submitBtn = form.querySelector('button[type="submit"]');
+    const data = new FormData(form);
+    const name = (data.get('name') || '').trim();
+    const rrtype = (data.get('rrtype') || '').toString().toUpperCase();
+    const value = (data.get('value') || '').trim();
+    const ttlValue = data.get('ttl');
+    const ttl = ttlValue === '' || ttlValue === null ? undefined : Number.parseInt(ttlValue, 10);
+    if (!name || !rrtype || !value) {
+      showError('Veuillez remplir tous les champs pour ajouter un enregistrement.');
+      return;
+    }
+    if (submitBtn) {
+      submitBtn.disabled = true;
+      submitBtn.textContent = 'Ajout...';
+    }
+    try {
+      const res = await dns_add_record({ name, rrtype, value, ttl });
+      if (!res?.ok) {
+        throw new Error(res?.message || 'Échec de l\'ajout de l\'enregistrement.');
+      }
+      form.reset();
+      if (form.querySelector('input[name="ttl"]')) {
+        form.querySelector('input[name="ttl"]').value = '300';
+      }
+      await this.load();
+    } catch (err) {
+      showError(err.message || String(err));
+    } finally {
+      if (submitBtn) {
+        submitBtn.disabled = false;
+        submitBtn.textContent = 'Ajouter';
+      }
+    }
+  }
+
+  async handleRemove(event) {
+    event.preventDefault();
+    const btn = event.currentTarget;
+    const { name, rrtype, value } = btn.dataset;
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = 'Suppression...';
+    }
+    try {
+      const res = await dns_remove_record({ name, rrtype, value });
+      if (!res?.ok) {
+        throw new Error(res?.message || 'Échec de la suppression de l\'enregistrement.');
+      }
+      await this.load();
+    } catch (err) {
+      if (btn) {
+        btn.disabled = false;
+        btn.textContent = 'Supprimer';
+      }
+      showError(err.message || String(err));
     }
   }
 }

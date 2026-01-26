@@ -31,10 +31,11 @@ tauri-plugin-log = "2"
 log = "0.4"
 dirs = "6"
 tracing = "0.1"
+regex = "1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 tracing-appender = "0.2"
-resvg = "0.45"
-usvg = "0.45"
+resvg = "0.46"
+usvg = "0.46"
 tiny-skia = "0.11"
 png = "0.18"
 tonic = { version = "0.14", features = ["transport"] }
@@ -44,6 +45,12 @@ tokio-stream = "0.1.15"
 futures-util = "0.3.30"
 pin-project = "1.1.5"
 hyper-util = { version = "0.1", features = ["tokio"] }
+rand = "0.8"
+rsa = { version = "0.9", features = ["pem"] }
+reqwest = { version = "0.13", features = ["json", "stream"] }
+
+[dev-dependencies]
+tempfile = "3"
 
 
 [[bin]]

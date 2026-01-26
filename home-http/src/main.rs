@@ -46,6 +46,54 @@ use windows_service::service::*;
 use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
 use windows_service::{define_windows_service, service_manager::*};
 
+#[pin_project]
+struct PipeConnection {
+    #[pin]
+    inner: NamedPipeServer,
+}
+
+impl PipeConnection {
+    fn new(inner: NamedPipeServer) -> Self {
+        Self { inner }
+    }
+}
+
+unsafe impl Send for PipeConnection {}
+
+impl Connected for PipeConnection {
+    type ConnectInfo = ();
+
+    fn connect_info(&self) -> Self::ConnectInfo {}
+}
+
+impl AsyncRead for PipeConnection {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        self.project().inner.poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for PipeConnection {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        data: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        self.project().inner.poll_write(cx, data)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        self.project().inner.poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        self.project().inner.poll_shutdown(cx)
+    }
+}
+
 // Build metadata (set in build.rs)
 const BUILD_GIT_SHA: &str = env!("BUILD_GIT_SHA");
 const BUILD_GIT_TAG: &str = env!("BUILD_GIT_TAG");
@@ -831,16 +879,8 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// Creates a security descriptor that allows access for Authenticated Users.
-/// This is required for the Tauri app (as a normal user) to connect to the service's named pipe.
-fn get_permissive_security_attributes() -> Result<
-    (
-        windows_sys::Win32::Security::SECURITY_ATTRIBUTES,
-        windows_sys::Win32::Security::PSECURITY_DESCRIPTOR,
-    ),
-    anyhow::Error,
-> {
-    let sddl = "D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;AU)"; // Allow System, Built-in Admins, Authenticated Users
+fn named_pipe_stream() -> io::Result<UnboundedReceiverStream<Result<PipeConnection, io::Error>>> {
+    let sddl = "D:(A;;GA;;;AC)(A;;GA;;;WD)(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;AU)(A;;FA;;;IU)"; // Allow AppContainer, Everyone, System, Admins, Authenticated, Interactive
     let mut sd: windows_sys::Win32::Security::PSECURITY_DESCRIPTOR = std::ptr::null_mut();
     let sddl_w: Vec<u16> = sddl.encode_utf16().chain(std::iter::once(0)).collect();
 
@@ -855,93 +895,12 @@ fn get_permissive_security_attributes() -> Result<
 
     if result == 0 {
         let err = unsafe { windows_sys::Win32::Foundation::GetLastError() };
-        anyhow::bail!(
-            "ConvertStringSecurityDescriptorToSecurityDescriptorW failed: {}",
-            err
-        );
+        error!("FATAL: ConvertStringSecurityDescriptorToSecurityDescriptorW failed: {}", err);
+        return Err(io::Error::new(io::ErrorKind::Other, "Security attributes creation failed"));
     }
 
-    let sa = windows_sys::Win32::Security::SECURITY_ATTRIBUTES {
-        nLength: std::mem::size_of::<windows_sys::Win32::Security::SECURITY_ATTRIBUTES>() as u32,
-        lpSecurityDescriptor: sd,
-        bInheritHandle: 0, // FALSE
-    };
-
-    Ok((sa, sd))
-}
-
-#[pin_project]
-struct PipeConnection {
-    #[pin]
-    inner: NamedPipeServer,
-}
-
-impl PipeConnection {
-    fn new(inner: NamedPipeServer) -> Self {
-        Self { inner }
-    }
-}
-
-unsafe impl Send for PipeConnection {}
-
-impl Connected for PipeConnection {
-    type ConnectInfo = ();
-
-    fn connect_info(&self) -> Self::ConnectInfo {}
-}
-
-impl AsyncRead for PipeConnection {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut TaskContext<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        self.project().inner.poll_read(cx, buf)
-    }
-}
-
-impl AsyncWrite for PipeConnection {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut TaskContext<'_>,
-        data: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        self.project().inner.poll_write(cx, data)
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
-        self.project().inner.poll_flush(cx)
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
-        self.project().inner.poll_shutdown(cx)
-    }
-}
-
-fn named_pipe_stream() -> io::Result<UnboundedReceiverStream<Result<PipeConnection, io::Error>>> {
-    // Create security attributes that allow Authenticated Users to connect.
-    let (mut sa, sd_ptr) = get_permissive_security_attributes().map_err(|e| {
-        error!(
-            "FATAL: Failed to create security attributes for named pipe: {}",
-            e
-        );
-        io::Error::new(io::ErrorKind::Other, "Security attributes creation failed")
-    })?;
-
-    // The first server is created here, outside the async block.
-    let mut server = unsafe {
-        ServerOptions::new()
-            .first_pipe_instance(true)
-            .create_with_security_attributes_raw(NAMED_PIPE_NAME, &mut sa as *mut _ as *mut _)?
-    };
-
+    let sd_addr = sd as usize;
     let (tx, rx) = mpsc::unbounded_channel();
-
-    // The SECURITY_ATTRIBUTES struct contains a raw pointer, making it non-Send.
-    // To use it in a tokio::spawn task, we pass the raw pointer address as a usize,
-    // which is Send. The async block then takes ownership of the pointer and is
-    // responsible for freeing it.
-    let sd_addr = sd_ptr as usize;
 
     tokio::spawn(async move {
         struct SecurityDescriptorGuard(usize);
@@ -954,44 +913,65 @@ fn named_pipe_stream() -> io::Result<UnboundedReceiverStream<Result<PipeConnecti
                 }
             }
         }
-        // This guard ensures the security descriptor is freed when the task finishes.
         let _guard = SecurityDescriptorGuard(sd_addr);
 
-        loop {
-            match server.connect().await {
-                Ok(()) => {
-                    let sd_ptr = sd_addr as windows_sys::Win32::Security::PSECURITY_DESCRIPTOR;
-                    // Reconstruct the security attributes for each new server instance.
-                    let mut sa_loop = windows_sys::Win32::Security::SECURITY_ATTRIBUTES {
-                        nLength: std::mem::size_of::<
-                            windows_sys::Win32::Security::SECURITY_ATTRIBUTES,
-                        >() as u32,
-                        lpSecurityDescriptor: sd_ptr,
-                        bInheritHandle: 0,
-                    };
+        let first_server = {
+            let mut sa = windows_sys::Win32::Security::SECURITY_ATTRIBUTES {
+                nLength: std::mem::size_of::<windows_sys::Win32::Security::SECURITY_ATTRIBUTES>() as u32,
+                lpSecurityDescriptor: sd_addr as windows_sys::Win32::Security::PSECURITY_DESCRIPTOR,
+                bInheritHandle: 0,
+            };
+            match unsafe {
+                ServerOptions::new()
+                    .first_pipe_instance(true)
+                    .create_with_security_attributes_raw(NAMED_PIPE_NAME, &mut sa as *mut _ as *mut _)
+            } {
+                Ok(s) => s,
+                Err(e) => {
+                    let _ = tx.send(Err(e));
+                    return;
+                }
+            }
+        };
 
-                    let new_server = match unsafe {
-                        ServerOptions::new().create_with_security_attributes_raw(
-                            NAMED_PIPE_NAME,
-                            &mut sa_loop as *mut _ as *mut _,
-                        )
-                    } {
-                        Ok(s) => s,
-                        Err(e) => {
-                            let _ = tx.send(Err(e));
+        let mut server = Some(first_server);
+
+        loop {
+            if let Some(s) = server.take() {
+                match s.connect().await {
+                    Ok(()) => {
+                        let mut sa = windows_sys::Win32::Security::SECURITY_ATTRIBUTES {
+                            nLength: std::mem::size_of::<windows_sys::Win32::Security::SECURITY_ATTRIBUTES>() as u32,
+                            lpSecurityDescriptor: sd_addr as windows_sys::Win32::Security::PSECURITY_DESCRIPTOR,
+                            bInheritHandle: 0,
+                        };
+                        let new_server = match unsafe {
+                            ServerOptions::new()
+                                .first_pipe_instance(false)
+                                .create_with_security_attributes_raw(
+                                    NAMED_PIPE_NAME,
+                                    &mut sa as *mut _ as *mut _,
+                                )
+                        } {
+                            Ok(s) => s,
+                            Err(e) => {
+                                let _ = tx.send(Err(e));
+                                break;
+                            }
+                        };
+                        if tx.send(Ok(PipeConnection::new(s))).is_err() {
                             break;
                         }
-                    };
-                    let old_server = std::mem::replace(&mut server, new_server);
-                    if tx.send(Ok(PipeConnection::new(old_server))).is_err() {
-                        break;
+                        server = Some(new_server);
+                    }
+                    Err(e) => {
+                        if tx.send(Err(e)).is_err() {
+                            break;
+                        }
                     }
                 }
-                Err(e) => {
-                    if tx.send(Err(e)).is_err() {
-                        break;
-                    }
-                }
+            } else {
+                break;
             }
         }
     });

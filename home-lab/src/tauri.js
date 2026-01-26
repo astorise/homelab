@@ -50,6 +50,43 @@ const __MOCK = {
       { host: 'grafana.home', port: 3000 },
     ],
   },
+  oidc: {
+    status: {
+      state: 'running',
+      log_level: 'INFO',
+      issuer: 'https://127.0.0.1:8443',
+      token_endpoint: 'https://127.0.0.1:8443/token',
+    },
+    clients: [
+      {
+        client_id: 'demo-client',
+        subject: 'demo-client',
+        allowed_scopes: ['demo.read'],
+        audiences: ['https://example-app'],
+        password_users: [
+          { username: 'demo-user', subject: 'demo-user', scopes: ['demo.read'] },
+        ],
+        auth_method: 'client_secret_post',
+        public_key_pem: '',
+      },
+      {
+        client_id: 'k3s-home',
+        subject: 'home-lab-k3s',
+        allowed_scopes: ['k3s.admin'],
+        audiences: [],
+        password_users: [],
+        auth_method: 'private_key_jwt',
+        public_key_pem:
+          '-----BEGIN PUBLIC KEY-----\\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAwMockKeyExample=====\\n-----END PUBLIC KEY-----',
+      },
+    ],
+  },
+  wsl: {
+    instances: [
+      { name: 'home-lab', state: 'Running', version: '2', is_default: false },
+      { name: 'Ubuntu-22.04', state: 'Stopped', version: '2', is_default: false },
+    ],
+  },
 };
 
 async function mockInvoke(cmd, args = {}) {
@@ -129,6 +166,113 @@ async function mockInvoke(cmd, args = {}) {
       return { ok: removed, message: removed ? 'Route removed' : 'Not found' };
     }
 
+    // OIDC
+    case 'oidc_get_status':
+      return { ...__MOCK.oidc.status };
+    case 'oidc_list_clients':
+      return {
+        clients: __MOCK.oidc.clients.map((client) => ({
+          ...client,
+          allowed_scopes: [...client.allowed_scopes],
+          audiences: [...client.audiences],
+          password_users: client.password_users.map((user) => ({
+            ...user,
+            scopes: [...user.scopes],
+          })),
+        })),
+      };
+    case 'oidc_register_client': {
+      const payload = args || {};
+      const clientId = (payload.client_id || '').trim();
+      if (!clientId) {
+        return { ok: false, message: 'client_id requis (mock).' };
+      }
+      const subject = (payload.subject || clientId).trim();
+      const allowed_scopes = Array.isArray(payload.allowed_scopes)
+        ? [...payload.allowed_scopes]
+        : [];
+      const audiences = Array.isArray(payload.audiences) ? [...payload.audiences] : [];
+      const public_key_pem = (payload.public_key_pem || '').trim();
+      const auth_method = (payload.auth_method || 'private_key_jwt').trim();
+      const client = {
+        client_id: clientId,
+        subject,
+        allowed_scopes,
+        audiences,
+        password_users: [],
+        auth_method,
+        public_key_pem,
+      };
+      __MOCK.oidc.clients = __MOCK.oidc.clients
+        .filter((c) => c.client_id !== clientId)
+        .concat([client]);
+      return { ok: true, message: 'Client OIDC ajouté (mock).' };
+    }
+    case 'oidc_remove_client': {
+      const clientId =
+        typeof args === 'string' ? args : typeof args?.client_id === 'string' ? args.client_id : '';
+      const trimmed = clientId.trim();
+      if (!trimmed) {
+        return { ok: false, message: 'client_id requis (mock).' };
+      }
+      const before = __MOCK.oidc.clients.length;
+      __MOCK.oidc.clients = __MOCK.oidc.clients.filter((client) => client.client_id !== trimmed);
+      const removed = before !== __MOCK.oidc.clients.length;
+      return { ok: removed, message: removed ? 'Client supprimé (mock).' : 'Client introuvable.' };
+    }
+
+    case 'wsl_import_instance': {
+      const rawName = typeof args?.name === 'string' ? args.name.trim() : 'home-lab-k3s';
+      if (!rawName) {
+        return { ok: false, message: "Nom d'instance invalide (mock)." };
+      }
+      const normalized = rawName.toLowerCase();
+      const existsIndex = __MOCK.wsl.instances.findIndex(
+        (inst) => (inst?.name || '').toLowerCase() === normalized,
+      );
+
+      if (existsIndex !== -1 && !args?.force) {
+        return { ok: false, message: `Instance ${rawName} existe déjà (mock).` };
+      }
+
+      const instance = {
+        name: rawName,
+        state: 'Stopped',
+        version: '2',
+        is_default: false,
+      };
+
+      if (existsIndex === -1) {
+        __MOCK.wsl.instances.push(instance);
+      } else {
+        __MOCK.wsl.instances.splice(existsIndex, 1, instance);
+      }
+
+      return {
+        ok: true,
+        message: args?.force
+          ? `Instance ${rawName} réimportée (mock).`
+          : `Instance ${rawName} importée (mock).`,
+      };
+    }
+
+    case 'wsl_list_instances': {
+      return __MOCK.wsl.instances.map((inst) => ({ ...inst }));
+    }
+
+    case 'wsl_remove_instance': {
+      const name = (args?.name || args?.id || '').trim();
+      if (!name) {
+        return { ok: false, message: "Nom d'instance invalide." };
+      }
+      const before = __MOCK.wsl.instances.length;
+      __MOCK.wsl.instances = __MOCK.wsl.instances.filter((inst) => inst.name !== name);
+      const removed = __MOCK.wsl.instances.length !== before;
+      return removed
+        ? { ok: true, message: `Instance ${name} supprimée (mock).` }
+        : { ok: false, message: `Instance ${name} introuvable (mock).` };
+    }
+
     default:
       return { ok: false, message: `Unknown mock command: ${cmd}` };
   }
@@ -175,9 +319,49 @@ export async function dns_list_records() {
   return Array.isArray(res) ? res : (res?.records ?? []);
 }
 
-export async function dns_add_record(record) { return safeInvoke('dns_add_record', { record }); }
+function normalizeDnsAddArgs(arg1, arg2, arg3, arg4) {
+  if (arg1 && typeof arg1 === 'object') {
+    const { name, rrtype, value, ttl } = arg1;
+    return { name, rrtype, value, ttl };
+  }
+  return { name: arg1, rrtype: arg2, value: arg3, ttl: arg4 };
+}
 
-export async function dns_remove_record(id) { return safeInvoke('dns_remove_record', { id }); }
+function normalizeDnsRemoveArgs(arg1, arg2, arg3) {
+  if (arg1 && typeof arg1 === 'object') {
+    const { name, rrtype, value } = arg1;
+    return { name, rrtype, value };
+  }
+  if (arg2 && typeof arg2 === 'object') {
+    const { rrtype, value } = arg2;
+    return { name: arg1, rrtype, value };
+  }
+  return { name: arg1, rrtype: arg2, value: arg3 };
+}
+
+export async function dns_add_record(arg1, arg2, arg3, arg4) {
+  const payload = normalizeDnsAddArgs(arg1, arg2, arg3, arg4);
+  const name = (payload?.name || '').trim();
+  const rrtype = (payload?.rrtype || '').toUpperCase();
+  const value = (payload?.value || '').trim();
+  const ttl = Number.isFinite(payload?.ttl) ? payload.ttl : Number.parseInt(payload?.ttl, 10);
+  const safeTtl = Number.isFinite(ttl) && ttl > 0 ? ttl : 300;
+  if (!name) throw new Error('Le nom de l\'enregistrement est requis.');
+  if (!rrtype) throw new Error('Le type d\'enregistrement est requis.');
+  if (!value) throw new Error('La valeur de l\'enregistrement est requise.');
+  return safeInvoke('dns_add_record', { name, rrtype, value, ttl: safeTtl });
+}
+
+export async function dns_remove_record(arg1, arg2, arg3) {
+  const payload = normalizeDnsRemoveArgs(arg1, arg2, arg3);
+  const name = (payload?.name || '').trim();
+  const rrtype = (payload?.rrtype || '').toUpperCase();
+  const value = (payload?.value || '').trim();
+  if (!name) throw new Error('Le nom de l\'enregistrement est requis pour la suppression.');
+  if (!rrtype) throw new Error('Le type d\'enregistrement est requis pour la suppression.');
+  if (!value) throw new Error('La valeur de l\'enregistrement est requise pour la suppression.');
+  return safeInvoke('dns_remove_record', { name, rrtype, value });
+}
 
 export async function http_get_status() { return safeInvoke('http_get_status'); }
 
@@ -192,6 +376,82 @@ export async function http_list_routes() {
   return Array.isArray(res) ? res : (res?.routes ?? []);
 }
 
-export async function http_add_route(route) { return safeInvoke('http_add_route', { route }); }
+export async function http_add_route(arg1, arg2) {
+  const payload = typeof arg1 === 'object' && arg1 !== null ? arg1 : { host: arg1, port: arg2 };
+  const host = (payload?.host || '').trim();
+  const portNum = Number.isFinite(payload?.port)
+    ? payload.port
+    : Number.parseInt(payload?.port, 10);
+  if (!host) throw new Error('L\'hôte est requis.');
+  if (!Number.isFinite(portNum) || portNum < 0) throw new Error('Le port fourni est invalide.');
+  return safeInvoke('http_add_route', { host, port: portNum });
+}
 
-export async function http_remove_route(id) { return safeInvoke('http_remove_route', { id }); }
+
+export async function http_remove_route(arg1) {
+  const host = typeof arg1 === 'object' && arg1 !== null ? arg1.host || arg1.id : arg1;
+  if (!host) throw new Error('L\'hôte est requis pour la suppression.');
+  return safeInvoke('http_remove_route', { host });
+}
+
+export async function oidc_get_status() { return safeInvoke('oidc_get_status'); }
+
+export async function oidc_list_clients() {
+  const res = await safeInvoke('oidc_list_clients');
+  return Array.isArray(res) ? res : (res?.clients ?? []);
+}
+
+export async function oidc_register_client(payload = {}) {
+  const data = typeof payload === 'object' && payload !== null ? { ...payload } : {};
+  const client_id = (data.client_id || '').trim();
+  if (!client_id) throw new Error("L'identifiant client est requis.");
+  const public_key_pem = (data.public_key_pem || '').trim();
+  if (!public_key_pem) throw new Error('La clé publique du client est requise.');
+  const subject = (data.subject || '').trim();
+  const allowed_scopes = Array.isArray(data.allowed_scopes) ? data.allowed_scopes : [];
+  const audiences = Array.isArray(data.audiences) ? data.audiences : [];
+  const auth_method = (data.auth_method || 'private_key_jwt').trim();
+  return safeInvoke('oidc_register_client', {
+    client_id,
+    subject,
+    allowed_scopes,
+    audiences,
+    public_key_pem,
+    auth_method,
+  });
+}
+
+export async function oidc_remove_client(clientId) {
+  const value = typeof clientId === 'string' ? clientId.trim() : '';
+  if (!value) throw new Error("L'identifiant client est requis pour la suppression.");
+  return safeInvoke('oidc_remove_client', { client_id: value });
+}
+
+export async function wsl_import_instance(options = {}) {
+  const payload = { ...options };
+  if (payload.name !== undefined) {
+    payload.name = String(payload.name ?? '').trim();
+    if (!payload.name) {
+      throw new Error("Le nom de l'instance WSL est requis.");
+    }
+  }
+  // eslint-disable-next-line no-console
+  console.info('[tauri.js] wsl_import_instance invoked', payload);
+  const result = await safeInvoke('wsl_import_instance', payload);
+  // eslint-disable-next-line no-console
+  console.info('[tauri.js] wsl_import_instance result', result);
+  return result;
+}
+
+export async function wsl_list_instances() {
+  const res = await safeInvoke('wsl_list_instances');
+  return Array.isArray(res) ? res : res?.instances ?? [];
+}
+
+export async function wsl_remove_instance(name) {
+  const value = typeof name === 'string' ? name.trim() : '';
+  if (!value) {
+    throw new Error("Le nom de l'instance WSL est requis.");
+  }
+  return safeInvoke('wsl_remove_instance', { name: value });
+}

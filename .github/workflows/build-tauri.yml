@@ -9,50 +9,47 @@ jobs:
   build-docker-image:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       - run: docker build -t env-dev-image -f docker-image/Dockerfile .
       - run: |
           cid=$(docker create env-dev-image)
           docker export "$cid" -o env-dev-image.tar
           docker rm "$cid"
-      - uses: actions/upload-artifact@v5
+
+      - uses: actions/upload-artifact@v6
         with:
           name: env-dev-image.tar
           path: env-dev-image.tar
   build-services:
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v5
-
-      - name: Install mingw for Windows cross-compile
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y mingw-w64
+      - uses: actions/checkout@v6
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: x86_64-pc-windows-gnu
+          targets: x86_64-pc-windows-msvc
 
       - name: Cache Rust (workspace)
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: services-x86_64-pc-windows-gnu
+          shared-key: services-x86_64-pc-windows-msvc
           cache-on-failure: true
 
-      - name: Build services (Windows gnu)
-        env:
-          RUSTFLAGS: "-C target-feature=+crt-static"
+      - name: Build services (Windows MSVC)
+        shell: pwsh
         run: |
-          cargo build -p home-dns   --release --target x86_64-pc-windows-gnu
-          cargo build -p home-http --release --target x86_64-pc-windows-gnu
-          ls -lah target/x86_64-pc-windows-gnu/release
-          mkdir -p services-win
-          cp target/x86_64-pc-windows-gnu/release/home-dns.exe   services-win/
-          cp target/x86_64-pc-windows-gnu/release/home-http.exe services-win/
+          cargo build -p home-dns   --release
+          cargo build -p home-http --release
+          cargo build -p home-oidc --release
+          Get-ChildItem target/release -Filter 'home-*.exe'
+          New-Item -ItemType Directory -Path services-win -Force | Out-Null
+          Copy-Item target/release/home-dns.exe   services-win/ -Force
+          Copy-Item target/release/home-http.exe  services-win/ -Force
+          Copy-Item target/release/home-oidc.exe services-win/ -Force
 
       - name: Upload services artifacts
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: services-win
           path: services-win/*
@@ -62,7 +59,7 @@ jobs:
     runs-on: windows-latest
     needs: [build-services, build-docker-image]
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
 
       - name: Clear bundled services directory
         shell: pwsh
@@ -80,14 +77,19 @@ jobs:
           name: services-win
           path: home-lab/src-tauri/resources/bin
 
-      - name: Download Docker image into Tauri resources
-        uses: actions/download-artifact@v6
+
+      - name: Download Docker image into Tauri WSL resources
+        uses: actions/download-artifact@v7
         with:
           name: env-dev-image.tar
-          path: home-lab/src-tauri/resources
+          path: home-lab/src-tauri/resources/wsl
 
-      - name: Rename Docker image
-        run: mv home-lab/src-tauri/resources/env-dev-image.tar home-lab/src-tauri/resources/homelab-img.tar
+      - name: Rename Docker image artifact to WSL rootfs
+        shell: pwsh
+        run: |
+          Move-Item -LiteralPath 'home-lab/src-tauri/resources/wsl/env-dev-image.tar' `
+                    -Destination 'home-lab/src-tauri/resources/wsl/wsl-rootfs.tar' `
+                    -Force
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -95,7 +97,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v6
         with:
-          node-version: '22'
+          node-version: '24'
       
       - name: import windows certificate
         if: matrix.platform == 'windows-latest'
@@ -119,7 +121,7 @@ jobs:
 
       # Optionnel : cache npm
       - name: Enable npm cache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.npm
           key: ${{ runner.os }}-node-${{ hashFiles('home-lab/**/package-lock.json') }}
@@ -127,7 +129,7 @@ jobs:
             ${{ runner.os }}-node-
 
       - name: Build Tauri (Windows - NSIS + MSI)
-        uses: tauri-apps/tauri-action@v0.5.23
+        uses: tauri-apps/tauri-action@v0.6.1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_BUNDLE_DEBUG: "true"
@@ -136,14 +138,15 @@ jobs:
           projectPath: ./home-lab
 
       - name: Upload NSIS setup
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
+
         with:
           name: nsis-setup
           path: target/release/bundle/nsis/*.exe
           if-no-files-found: error
 
       - name: Upload MSI package
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: msi-package
           path: target/release/bundle/msi/*.msi
