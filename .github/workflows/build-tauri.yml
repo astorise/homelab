@@ -15,6 +15,7 @@ jobs:
           cid=$(docker create env-dev-image)
           docker export "$cid" -o env-dev-image.tar
           docker rm "$cid"
+
       - uses: actions/upload-artifact@v6
         with:
           name: env-dev-image.tar
@@ -75,6 +76,7 @@ jobs:
         with:
           name: services-win
           path: home-lab/src-tauri/resources/bin
+
 
       - name: Download Docker image into Tauri WSL resources
         uses: actions/download-artifact@v7
@@ -137,6 +139,7 @@ jobs:
 
       - name: Upload NSIS setup
         uses: actions/upload-artifact@v6
+
         with:
           name: nsis-setup
           path: target/release/bundle/nsis/*.exe
