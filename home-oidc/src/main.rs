@@ -396,7 +396,8 @@ fn load_key_material(cfg: &ServiceConfig) -> Result<KeyMaterial> {
     let mut cert_reader = BufReader::new(cert_pem.as_bytes());
     let certs = rustls_pemfile::certs(&mut cert_reader).context("read rustls certs")?;
     let mut key_reader = BufReader::new(key_pem.as_bytes());
-    let mut keys = rustls_pemfile::pkcs8_private_keys(&mut key_reader).context("read pkcs8 key")?;
+    let mut keys =
+        rustls_pemfile::pkcs8_private_keys(&mut key_reader).context("read pkcs8 key")?;
     if keys.is_empty() {
         key_reader = BufReader::new(key_pem.as_bytes());
         keys = rustls_pemfile::rsa_private_keys(&mut key_reader).context("read rsa key")?;

@@ -90,6 +90,7 @@ impl AsyncWrite for SendablePipeClient {
 }
 
 // Establishes a connection to the gRPC service over a named pipe.
+
 async fn connect_client() -> Result<HttpClient, String> {
     let mut last_error = None;
     for attempt in 1..=CONNECT_RETRIES {
