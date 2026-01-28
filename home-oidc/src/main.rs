@@ -394,21 +394,13 @@ fn load_key_material(cfg: &ServiceConfig) -> Result<KeyMaterial> {
     write_atomic(&jwks_path(), jwks_json.as_bytes())?;
 
     let mut cert_reader = BufReader::new(cert_pem.as_bytes());
-    let certs = rustls_pemfile::certs(&mut cert_reader)
-        .map(|cert| cert.map(|cert| cert.as_ref().to_vec()))
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .context("read rustls certs")?;
+    let certs = rustls_pemfile::certs(&mut cert_reader).context("read rustls certs")?;
     let mut key_reader = BufReader::new(key_pem.as_bytes());
-    let mut keys = rustls_pemfile::pkcs8_private_keys(&mut key_reader)
-        .map(|key| key.map(|key| key.as_ref().to_vec()))
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .context("read pkcs8 key")?;
+    let mut keys =
+        rustls_pemfile::pkcs8_private_keys(&mut key_reader).context("read pkcs8 key")?;
     if keys.is_empty() {
         key_reader = BufReader::new(key_pem.as_bytes());
-        keys = rustls_pemfile::rsa_private_keys(&mut key_reader)
-            .map(|key| key.map(|key| key.as_ref().to_vec()))
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .context("read rsa key")?;
+        keys = rustls_pemfile::rsa_private_keys(&mut key_reader).context("read rsa key")?;
     }
     if keys.is_empty() {
         return Err(anyhow!("no private key material"));
