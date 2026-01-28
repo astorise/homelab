@@ -5,7 +5,7 @@ edition = "2021"
 
 [build-dependencies]
 protoc-bin-vendored = "3"
-tonic-build = { version = "0.11", features = ["prost"] }
+tonic-build = { version = "0.14", features = ["prost"] }
 prost-build = "0.12"
 chrono = "0.4"
 
@@ -27,7 +27,7 @@ chrono = "0.4"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net"] }
 windows-service = { workspace = true }
 sysinfo = "0.38"
-tonic = { version = "0.11", features = ["transport"] }
+tonic = { version = "0.14", features = ["transport"] }
 tower-http = { version = "0.6.0", features = ["cors"] }
 tokio-stream = "0.1.15"
 futures-util = "0.3.30"
@@ -35,7 +35,7 @@ pin-project = "1.1.5"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
-tonic = { version = "0.11", features = ["transport"] }
+tonic = { version = "0.14", features = ["transport"] }
 anyhow = "1"
 pin-project = "1.1.5"
 tower = { version = "0.5", features = ["util"] }

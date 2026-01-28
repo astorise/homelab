@@ -18,7 +18,7 @@ flexi_logger = { version = "0.31", default-features = false, features = ["colors
 prost = "0.12"
 parking_lot = "0.12"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net"] }
-tonic = { version = "0.11", features = ["transport"] }
+tonic = { version = "0.14", features = ["transport"] }
 tower-http = { version = "0.6.0", features = ["cors"] }
 tokio-stream = "0.1.15"
 futures-util = "0.3.30"
@@ -26,7 +26,7 @@ pin-project = "1.1.5"
 hyper-util = { version = "0.1", features = ["tokio"] }
 
 [build-dependencies]
-tonic-build = { version = "0.11", features = ["prost"] }
+tonic-build = { version = "0.14", features = ["prost"] }
 prost-build = "0.12"
 protoc-bin-vendored = "3"
 chrono = "0.4"
