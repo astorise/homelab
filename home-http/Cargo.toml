@@ -5,8 +5,8 @@ edition = "2021"
 
 [build-dependencies]
 protoc-bin-vendored = "3"
-tonic-build = { version = "0.11", features = ["prost"] }
-prost-build = "0.12"
+tonic-prost-build = "0.14"
+prost-build = "0.14"
 chrono = "0.4"
 
 [dependencies]
@@ -22,12 +22,13 @@ flexi_logger = "0.31"
 parking_lot = "0.12"
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
-prost = "0.12"
+prost = "0.14"
 chrono = "0.4"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net"] }
 windows-service = { workspace = true }
 sysinfo = "0.38"
-tonic = { version = "0.11", features = ["transport"] }
+tonic = { version = "0.14", features = ["transport"] }
+tonic-prost = "0.14"
 tower-http = { version = "0.6.0", features = ["cors"] }
 tokio-stream = "0.1.15"
 futures-util = "0.3.30"
@@ -35,7 +36,7 @@ pin-project = "1.1.5"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
-tonic = { version = "0.11", features = ["transport"] }
+tonic = { version = "0.14", features = ["transport"] }
 anyhow = "1"
 pin-project = "1.1.5"
 tower = { version = "0.5", features = ["util"] }
