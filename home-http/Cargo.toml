@@ -5,7 +5,7 @@ edition = "2021"
 
 [build-dependencies]
 protoc-bin-vendored = "3"
-tonic-build = { version = "0.14", features = ["prost"] }
+tonic-build = { version = "0.14" }
 prost-build = "0.12"
 chrono = "0.4"
 
