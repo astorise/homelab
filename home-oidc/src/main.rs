@@ -22,7 +22,8 @@ use rsa::pkcs1::DecodeRsaPrivateKey;
 use rsa::pkcs8::{DecodePrivateKey, EncodePrivateKey, LineEnding};
 use rsa::traits::PublicKeyParts;
 use rsa::RsaPrivateKey;
-use rustls::{Certificate as RustlsCertificate, PrivateKey as RustlsPrivateKey, ServerConfig};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::ServerConfig;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use serde_with::skip_serializing_none;
@@ -395,37 +396,27 @@ fn load_key_material(cfg: &ServiceConfig) -> Result<KeyMaterial> {
 
     let mut cert_reader = BufReader::new(cert_pem.as_bytes());
     let certs = rustls_pemfile::certs(&mut cert_reader)
-        .collect::<Result<Vec<_>, _>>()
+        .collect::<Result<Vec<CertificateDer<'static>>, _>>()
         .context("read rustls certs")?;
     let mut key_reader = BufReader::new(key_pem.as_bytes());
-    let mut keys = rustls_pemfile::pkcs8_private_keys(&mut key_reader)
+    let pkcs8_keys = rustls_pemfile::pkcs8_private_keys(&mut key_reader)
         .collect::<Result<Vec<_>, _>>()
-        .context("read pkcs8 key")?
-        .into_iter()
-        .map(|key| key.secret_pkcs8_der().to_vec())
-        .collect::<Vec<_>>();
-    if keys.is_empty() {
+        .context("read pkcs8 key")?;
+    let key = if let Some(key) = pkcs8_keys.into_iter().next() {
+        PrivateKeyDer::from(key)
+    } else {
         key_reader = BufReader::new(key_pem.as_bytes());
-        keys = rustls_pemfile::rsa_private_keys(&mut key_reader)
+        let rsa_keys = rustls_pemfile::rsa_private_keys(&mut key_reader)
             .collect::<Result<Vec<_>, _>>()
-            .context("read rsa key")?
-            .into_iter()
-            .map(|key| key.secret_pkcs1_der().to_vec())
-            .collect::<Vec<_>>();
-    }
-    if keys.is_empty() {
-        return Err(anyhow!("no private key material"));
-    }
+            .context("read rsa key")?;
+        match rsa_keys.into_iter().next() {
+            Some(key) => PrivateKeyDer::from(key),
+            None => return Err(anyhow!("no private key material")),
+        }
+    };
     let tls_config = ServerConfig::builder()
-        .with_safe_defaults()
         .with_no_client_auth()
-        .with_single_cert(
-            certs
-                .into_iter()
-                .map(|cert| RustlsCertificate(cert.as_ref().to_vec()))
-                .collect(),
-            RustlsPrivateKey(keys[0].clone()),
-        )?;
+        .with_single_cert(certs, key)?;
 
     Ok(KeyMaterial {
         encoding,
