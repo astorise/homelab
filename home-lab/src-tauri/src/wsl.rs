@@ -14,9 +14,9 @@ use crate::oidc::{
     StatusOut,
 };
 use anyhow::{anyhow, Context, Result};
-use rand::{rngs::OsRng, RngCore};
 use regex::Regex;
 use rsa::pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding};
+use rsa::rand_core::{OsRng, RngCore};
 use rsa::RsaPrivateKey;
 use serde::Serialize;
 use serde_json::json;
