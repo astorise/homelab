@@ -16,8 +16,9 @@ use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use log::{error, info};
-use rand::{rngs::OsRng, RngCore};
+use rand::{rng, RngCore};
 use rcgen::{CertificateParams, DnType, IsCa, KeyPair, SanType};
+use rsa::rand_core::OsRng;
 use rsa::pkcs1::DecodeRsaPrivateKey;
 use rsa::pkcs8::{DecodePrivateKey, EncodePrivateKey, LineEnding};
 use rsa::traits::PublicKeyParts;
@@ -218,7 +219,7 @@ struct ServiceConfig {
 impl Default for ServiceConfig {
     fn default() -> Self {
         let mut secret = [0u8; 24];
-        rand::thread_rng().fill_bytes(&mut secret);
+        rng().fill_bytes(&mut secret);
         let default_secret = URL_SAFE_NO_PAD.encode(secret);
         ServiceConfig {
             http_port: default_http_port(),
