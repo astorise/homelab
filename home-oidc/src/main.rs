@@ -16,7 +16,7 @@ use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use log::{error, info};
-use rand::{rng, RngCore};
+use rand::{rng, Rng};
 use rcgen::{CertificateParams, DnType, IsCa, KeyPair, SanType};
 use rsa::rand_core::OsRng;
 use rsa::pkcs1::DecodeRsaPrivateKey;
