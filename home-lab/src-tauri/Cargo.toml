@@ -34,7 +34,7 @@ tracing = "0.1"
 regex = "1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 tracing-appender = "0.2"
-resvg = "0.46"
+resvg = "0.47"
 usvg = "0.47"
 tiny-skia = "0.12"
 png = "0.18"
