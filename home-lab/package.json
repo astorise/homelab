@@ -7,6 +7,7 @@
     "tauri": "tauri",
     "dev": "vite --host localhost --port 5173 --strictPort",
     "prebuild": "node scripts/write-version.mjs",
+    "build:tauri": "node scripts/write-version.mjs && node scripts/prepare-services.mjs && vite build",
     "tauri:mock": "set VITE_TAURI_MOCK=1&& tauri dev",
     "tauri:no-svc": "set NO_DEV_SERVICES=1&& tauri dev",
     "tauri:verbose": "set RUST_LOG=debug&& tauri dev",

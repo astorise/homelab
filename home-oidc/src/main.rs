@@ -1465,9 +1465,9 @@ fn install_service() -> Result<()> {
         ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE,
     )?;
     if let Ok(_) = manager.open_service(SERVICE_NAME, ServiceAccess::QUERY_STATUS) {
-        info!("service already installed");
-        append_install_log("Service already installed");
-        return Ok(());
+        info!("service already installed, reinstalling to refresh binary/config");
+        append_install_log("Service already installed, reinstalling");
+        uninstall_service().context("failed to reinstall existing service")?;
     }
     let service_info = ServiceInfo {
         name: SERVICE_NAME.into(),
@@ -1507,6 +1507,16 @@ fn uninstall_service() -> Result<()> {
         std::thread::sleep(Duration::from_millis(250));
     }
     service.delete()?;
+    drop(service);
+    for _ in 0..20 {
+        match manager.open_service(SERVICE_NAME, ServiceAccess::QUERY_STATUS) {
+            Ok(s) => {
+                drop(s);
+                std::thread::sleep(Duration::from_millis(250));
+            }
+            Err(_) => break,
+        }
+    }
     Ok(())
 }
 

@@ -5,7 +5,7 @@
   "identifier": "name.astori.home-lab",
   "build": {
     "beforeDevCommand": "npm run dev",
-    "beforeBuildCommand": "npm run build",
+    "beforeBuildCommand": "npm run build:tauri",
     "frontendDist": "../dist",
     "devUrl": "http://localhost:5173"
   },

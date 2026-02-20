@@ -726,10 +726,10 @@ fn install_service() -> Result<()> {
         None::<&str>,
         ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE,
     )?;
-    // Idempotent install: if service exists, do nothing.
+    // Upgrade-safe install: if service exists, reinstall it.
     if let Ok(_svc) = manager.open_service(SERVICE_NAME, ServiceAccess::QUERY_STATUS) {
-        info!("Service already installed");
-        return Ok(());
+        info!("Service already installed, reinstalling to refresh binary/config");
+        uninstall_service().context("failed to reinstall existing service")?;
     }
     let service_info = ServiceInfo {
         name: SERVICE_NAME.into(),

@@ -794,8 +794,8 @@ fn install_service() -> Result<()> {
         ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE,
     )?;
     if let Ok(_svc) = manager.open_service(SERVICE_NAME, ServiceAccess::QUERY_STATUS) {
-        info!("Service already installed");
-        return Ok(());
+        info!("Service already installed, reinstalling to refresh binary/config");
+        uninstall_service().context("failed to reinstall existing service")?;
     }
     let exe_path = std::env::current_exe()?;
     let service_info = ServiceInfo {
