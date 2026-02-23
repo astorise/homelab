@@ -196,7 +196,9 @@ pub fn run() {
             oidc::oidc_remove_client,
             wsl::wsl_import_instance,
             wsl::wsl_list_instances,
+            wsl::wsl_sync_windows_kubeconfig,
             wsl::wsl_remove_instance,
+            wsl::wsl_kubectl_exec,
             ui::ui_log,
         ])
         .run(tauri::generate_context!())

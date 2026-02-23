@@ -8,6 +8,7 @@ const REFRESHABLE_COMPONENTS = Object.freeze([
   { selector: 'oidc-status', method: 'load' },
   { selector: 'oidc-clients', method: 'load' },
   { selector: 'wsl-instance-manager', method: 'loadInstances' },
+  { selector: 'k8s-client', method: 'loadInstances' },
 ]);
 
 let listenerInstalled = false;

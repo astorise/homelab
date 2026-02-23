@@ -1,7 +1,7 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -18,7 +18,7 @@ use regex::Regex;
 use rsa::pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding};
 use rsa::rand_core::{OsRng, RngCore};
 use rsa::RsaPrivateKey;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tauri::{AppHandle, Manager};
 use tracing::{error, info, warn};
@@ -33,6 +33,124 @@ pub struct ProvisionResult {
 pub struct WslOperationResult {
     ok: bool,
     message: String,
+}
+
+#[derive(Serialize)]
+pub struct WslKubectlExecResult {
+    ok: bool,
+    instance: String,
+    exit_code: Option<i32>,
+    command: String,
+    stdout: String,
+    stderr: String,
+}
+
+#[derive(Serialize)]
+pub struct WslKubeconfigSyncResult {
+    ok: bool,
+    path: String,
+    contexts: Vec<String>,
+    skipped: Vec<String>,
+    message: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Default)]
+struct WindowsKubeconfig {
+    #[serde(rename = "apiVersion", default)]
+    api_version: Option<String>,
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    preferences: serde_yaml::Value,
+    #[serde(default)]
+    clusters: Vec<KubeNamedCluster>,
+    #[serde(default)]
+    users: Vec<KubeNamedUser>,
+    #[serde(default)]
+    contexts: Vec<KubeNamedContext>,
+    #[serde(rename = "current-context", default)]
+    current_context: Option<String>,
+    #[serde(flatten)]
+    extra: BTreeMap<String, serde_yaml::Value>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct KubeNamedCluster {
+    name: String,
+    cluster: serde_yaml::Value,
+    #[serde(flatten)]
+    extra: BTreeMap<String, serde_yaml::Value>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct KubeNamedUser {
+    name: String,
+    user: serde_yaml::Value,
+    #[serde(flatten)]
+    extra: BTreeMap<String, serde_yaml::Value>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct KubeNamedContext {
+    name: String,
+    context: KubeContextRef,
+    #[serde(flatten)]
+    extra: BTreeMap<String, serde_yaml::Value>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Default)]
+struct KubeContextRef {
+    cluster: String,
+    user: String,
+    #[serde(default)]
+    namespace: Option<String>,
+    #[serde(flatten)]
+    extra: BTreeMap<String, serde_yaml::Value>,
+}
+
+#[derive(Deserialize)]
+struct KubectlConfigView {
+    #[serde(default)]
+    clusters: Vec<KubectlNamedCluster>,
+    #[serde(default)]
+    users: Vec<KubectlNamedUser>,
+    #[serde(default)]
+    contexts: Vec<KubectlNamedContext>,
+    #[serde(rename = "current-context", default)]
+    current_context: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct KubectlNamedCluster {
+    name: String,
+    cluster: serde_json::Value,
+}
+
+#[derive(Deserialize)]
+struct KubectlNamedUser {
+    name: String,
+    user: serde_json::Value,
+}
+
+#[derive(Deserialize)]
+struct KubectlNamedContext {
+    name: String,
+    context: KubectlContextRef,
+}
+
+#[derive(Deserialize)]
+struct KubectlContextRef {
+    cluster: String,
+    user: String,
+    #[serde(default)]
+    namespace: Option<String>,
+}
+
+struct ManagedKubeEntry {
+    context_name: String,
+    cluster: KubeNamedCluster,
+    user: KubeNamedUser,
+    context: KubeNamedContext,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -102,6 +220,7 @@ const SERVICE_RPC_RETRIES: usize = 8;
 const SERVICE_RPC_BASE_DELAY_MS: u64 = 750;
 const HTTP_SERVICE_NAME: &str = "HomeHttpService";
 const DNS_SERVICE_NAME: &str = "HomeDnsService";
+const MANAGED_KUBECONFIG_PREFIX: &str = "home-lab-wsl-";
 
 fn env_or_default_u16(var: &str, default: u16) -> u16 {
     match std::env::var(var) {
@@ -833,6 +952,287 @@ fn cluster_config_root() -> PathBuf {
         .join("clusters")
 }
 
+fn windows_kubeconfig_path() -> Result<PathBuf> {
+    let home_dir = std::env::var_os("USERPROFILE")
+        .map(PathBuf::from)
+        .or_else(dirs::home_dir)
+        .ok_or_else(|| anyhow!("Impossible de determiner le repertoire utilisateur Windows"))?;
+    Ok(home_dir.join(".kube").join("config"))
+}
+
+fn managed_kube_base_name(instance: &str) -> String {
+    let slug = cluster_domain_slug(instance);
+    let id = if slug.trim().is_empty() {
+        "cluster".to_string()
+    } else {
+        slug
+    };
+    format!("{MANAGED_KUBECONFIG_PREFIX}{id}")
+}
+
+fn is_managed_kube_name(name: &str) -> bool {
+    name.starts_with(MANAGED_KUBECONFIG_PREFIX)
+}
+
+fn load_windows_kubeconfig(path: &Path) -> Result<WindowsKubeconfig> {
+    if !path.exists() {
+        return Ok(WindowsKubeconfig::default());
+    }
+
+    let raw = fs::read_to_string(path)
+        .with_context(|| format!("Lecture du kubeconfig Windows {}", path.display()))?;
+    if raw.trim().is_empty() {
+        return Ok(WindowsKubeconfig::default());
+    }
+
+    serde_yaml::from_str(&raw)
+        .with_context(|| format!("Deserialisation du kubeconfig Windows {}", path.display()))
+}
+
+fn save_windows_kubeconfig(path: &Path, mut config: WindowsKubeconfig) -> Result<()> {
+    if config
+        .api_version
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or("")
+        .is_empty()
+    {
+        config.api_version = Some("v1".to_string());
+    }
+    if config
+        .kind
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or("")
+        .is_empty()
+    {
+        config.kind = Some("Config".to_string());
+    }
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Creation du dossier kubeconfig {}", parent.display()))?;
+    }
+
+    let rendered =
+        serde_yaml::to_string(&config).context("Serialisation du kubeconfig Windows impossible")?;
+    fs::write(path, rendered)
+        .with_context(|| format!("Ecriture du kubeconfig Windows {}", path.display()))?;
+    Ok(())
+}
+
+fn read_instance_kubectl_config_view(instance: &str) -> Result<KubectlConfigView> {
+    let command_line = format_cli_command(
+        "wsl.exe",
+        &[
+            "-d",
+            instance,
+            "--",
+            "/usr/local/bin/k3s",
+            "kubectl",
+            "config",
+            "view",
+            "--raw",
+            "-o",
+            "json",
+        ],
+    );
+
+    let output = Command::new("wsl.exe")
+        .args([
+            "-d",
+            instance,
+            "--",
+            "/usr/local/bin/k3s",
+            "kubectl",
+            "config",
+            "view",
+            "--raw",
+            "-o",
+            "json",
+        ])
+        .output()
+        .with_context(|| {
+            format!(
+                "Impossible d'executer la commande kubectl pour l'instance {}",
+                instance
+            )
+        })?;
+
+    let stdout = decode_cli_output(&output.stdout);
+    let stderr = decode_cli_output(&output.stderr);
+    let stdout_trim = stdout.trim();
+    let stderr_trim = stderr.trim();
+    let stdout_log = escape_for_log(stdout_trim);
+    let stderr_log = escape_for_log(stderr_trim);
+
+    if !output.status.success() {
+        anyhow::bail!(
+            "kubectl config view a echoue pour {} (cmd={}): {}",
+            instance,
+            command_line,
+            if !stderr_trim.is_empty() {
+                stderr_trim
+            } else if !stdout_trim.is_empty() {
+                stdout_trim
+            } else {
+                "erreur inconnue"
+            }
+        );
+    }
+
+    if stdout_trim.is_empty() {
+        anyhow::bail!("Aucune sortie kubectl pour l'instance {}", instance);
+    }
+
+    serde_json::from_str::<KubectlConfigView>(stdout_trim).with_context(|| {
+        format!(
+            "Impossible de parser la sortie kubectl (instance={}, stdout={}, stderr={})",
+            instance, stdout_log, stderr_log
+        )
+    })
+}
+
+fn build_managed_kube_entry(instance: &str) -> Result<ManagedKubeEntry> {
+    let view = read_instance_kubectl_config_view(instance)?;
+
+    let selected_context = if let Some(current) = view.current_context.as_ref() {
+        view.contexts
+            .iter()
+            .find(|ctx| ctx.name == *current)
+            .or_else(|| view.contexts.first())
+    } else {
+        view.contexts.first()
+    }
+    .ok_or_else(|| anyhow!("Aucun contexte kubectl disponible"))?;
+
+    let selected_cluster = view
+        .clusters
+        .iter()
+        .find(|cluster| cluster.name == selected_context.context.cluster)
+        .or_else(|| view.clusters.first())
+        .ok_or_else(|| anyhow!("Aucun cluster kubectl disponible"))?;
+
+    let selected_user = view
+        .users
+        .iter()
+        .find(|user| user.name == selected_context.context.user)
+        .or_else(|| view.users.first())
+        .ok_or_else(|| anyhow!("Aucun utilisateur kubectl disponible"))?;
+
+    let base_name = managed_kube_base_name(instance);
+    let cluster_name = format!("{base_name}-cluster");
+    let user_name = format!("{base_name}-user");
+    let context_name = base_name;
+
+    let cluster_value =
+        serde_yaml::to_value(&selected_cluster.cluster).context("Conversion cluster YAML")?;
+    let user_value = serde_yaml::to_value(&selected_user.user).context("Conversion user YAML")?;
+
+    Ok(ManagedKubeEntry {
+        context_name: context_name.clone(),
+        cluster: KubeNamedCluster {
+            name: cluster_name.clone(),
+            cluster: cluster_value,
+            extra: BTreeMap::new(),
+        },
+        user: KubeNamedUser {
+            name: user_name.clone(),
+            user: user_value,
+            extra: BTreeMap::new(),
+        },
+        context: KubeNamedContext {
+            name: context_name,
+            context: KubeContextRef {
+                cluster: cluster_name,
+                user: user_name,
+                namespace: selected_context.context.namespace.clone(),
+                extra: BTreeMap::new(),
+            },
+            extra: BTreeMap::new(),
+        },
+    })
+}
+
+fn sync_windows_kubeconfig_internal() -> Result<WslKubeconfigSyncResult> {
+    let path = windows_kubeconfig_path()?;
+    let mut config = load_windows_kubeconfig(&path)?;
+
+    config
+        .clusters
+        .retain(|entry| !is_managed_kube_name(entry.name.as_str()));
+    config
+        .users
+        .retain(|entry| !is_managed_kube_name(entry.name.as_str()));
+    config
+        .contexts
+        .retain(|entry| !is_managed_kube_name(entry.name.as_str()));
+
+    let mut instances = collect_wsl_instances()?;
+    instances.sort_by(|left, right| left.name.to_lowercase().cmp(&right.name.to_lowercase()));
+
+    let mut contexts = Vec::new();
+    let mut skipped = Vec::new();
+
+    for instance in instances {
+        match build_managed_kube_entry(&instance.name) {
+            Ok(entry) => {
+                contexts.push(entry.context_name.clone());
+                config.clusters.push(entry.cluster);
+                config.users.push(entry.user);
+                config.contexts.push(entry.context);
+            }
+            Err(err) => {
+                let reason = format!("{}: {}", instance.name, err);
+                warn!(target: "wsl", instance = %instance.name, error = %err, "Kubeconfig WSL ignore pour cette instance");
+                skipped.push(reason);
+            }
+        }
+    }
+
+    if let Some(current) = config.current_context.as_ref() {
+        let is_missing = !config.contexts.iter().any(|ctx| &ctx.name == current);
+        if is_managed_kube_name(current) && is_missing {
+            config.current_context = contexts.first().cloned();
+        }
+    }
+
+    save_windows_kubeconfig(&path, config)?;
+
+    let message = if contexts.is_empty() {
+        format!(
+            "Kubeconfig Windows synchronise (aucun contexte Home Lab actif) dans {}.",
+            path.display()
+        )
+    } else if skipped.is_empty() {
+        format!(
+            "Kubeconfig Windows synchronise: {} contexte(s) Home Lab ecrit(s) dans {}.",
+            contexts.len(),
+            path.display()
+        )
+    } else {
+        format!(
+            "Kubeconfig Windows synchronise: {} contexte(s) Home Lab ecrit(s), {} instance(s) ignoree(s).",
+            contexts.len(),
+            skipped.len()
+        )
+    };
+
+    Ok(WslKubeconfigSyncResult {
+        ok: true,
+        path: path.display().to_string(),
+        contexts,
+        skipped,
+        message,
+    })
+}
+
+async fn sync_windows_kubeconfig_task() -> Result<WslKubeconfigSyncResult> {
+    tauri::async_runtime::spawn_blocking(sync_windows_kubeconfig_internal)
+        .await
+        .map_err(|e| anyhow!("Erreur JoinHandle lors de la synchronisation kubeconfig: {e}"))?
+}
+
 fn persist_cluster_credentials(
     instance: &str,
     client_id: &str,
@@ -1077,6 +1477,34 @@ pub async fn wsl_import_instance(
                 );
                 log_wsl_event(format!(
                     "Configuration DNS/HTTP pour {} impossible: {}",
+                    sanitized_debug,
+                    escape_for_log(&err.to_string())
+                ));
+            }
+        }
+
+        match sync_windows_kubeconfig_task().await {
+            Ok(sync) => {
+                append_provision_message(&mut provision.message, &sync.message);
+                log_wsl_event(format!(
+                    "Kubeconfig Windows synchronise apres import {}: {}",
+                    sanitized_debug,
+                    escape_for_log(&sync.message)
+                ));
+            }
+            Err(err) => {
+                warn!(
+                    target: "wsl",
+                    instance = %sanitized_name,
+                    error = %err,
+                    "Synchronisation kubeconfig Windows impossible apres import"
+                );
+                append_provision_message(
+                    &mut provision.message,
+                    &format!("Synchronisation kubeconfig Windows impossible: {err}"),
+                );
+                log_wsl_event(format!(
+                    "Synchronisation kubeconfig Windows impossible apres import {}: {}",
                     sanitized_debug,
                     escape_for_log(&err.to_string())
                 ));
@@ -1565,6 +1993,34 @@ pub async fn wsl_list_instances() -> Result<Vec<WslInstance>, String> {
 }
 
 #[tauri::command]
+pub async fn wsl_sync_windows_kubeconfig() -> Result<WslKubeconfigSyncResult, String> {
+    info!(target: "wsl", "Synchronisation du kubeconfig Windows demandee");
+    log_wsl_event("Synchronisation du kubeconfig Windows demandee");
+
+    let result = sync_windows_kubeconfig_task().await.map_err(|e| {
+        error!(target: "wsl", "Echec synchronisation kubeconfig Windows: {e}");
+        log_wsl_event(format!("Echec synchronisation kubeconfig Windows: {e}"));
+        e.to_string()
+    })?;
+
+    info!(
+        target: "wsl",
+        path = %result.path,
+        contexts = result.contexts.len(),
+        skipped = result.skipped.len(),
+        "Synchronisation kubeconfig Windows terminee"
+    );
+    log_wsl_event(format!(
+        "Synchronisation kubeconfig Windows terminee: path={} contexts={} skipped={}",
+        escape_for_log(&result.path),
+        result.contexts.len(),
+        result.skipped.len()
+    ));
+
+    Ok(result)
+}
+
+#[tauri::command]
 pub async fn wsl_remove_instance(name: String) -> Result<WslOperationResult, String> {
     let raw_trimmed = name.trim();
     if raw_trimmed.is_empty() {
@@ -1578,7 +2034,7 @@ pub async fn wsl_remove_instance(name: String) -> Result<WslOperationResult, Str
             target: "wsl",
             instance_raw = %escape_for_log(raw_trimmed),
             instance_sanitized = %escape_for_log(&sanitized),
-            "Nom d'instance WSL nettoyé avant suppression"
+            "Nom d'instance WSL nettoye avant suppression"
         );
         log_wsl_event(format!(
             "Nom d'instance WSL nettoye avant suppression: brut={} nettoye={}",
@@ -1593,14 +2049,14 @@ pub async fn wsl_remove_instance(name: String) -> Result<WslOperationResult, Str
         target: "wsl",
         instance = %instance_name,
         instance_debug = %instance_debug,
-        "Suppression d'une instance WSL demandée"
+        "Suppression d'une instance WSL demandee"
     );
     log_wsl_event(format!(
         "Suppression d'une instance WSL demandee: {}",
         instance_debug
     ));
 
-    tauri::async_runtime::spawn_blocking({
+    let mut removal = tauri::async_runtime::spawn_blocking({
         let instance_name = instance_name.clone();
         move || run_wsl_unregister(&instance_name)
     })
@@ -1612,14 +2068,160 @@ pub async fn wsl_remove_instance(name: String) -> Result<WslOperationResult, Str
     })
     .and_then(|result| {
         result.map_err(|e| {
-            error!(target: "wsl", "Échec suppression WSL: {e}");
+            error!(target: "wsl", "Echec suppression WSL: {e}");
             log_wsl_event(format!(
-                "Échec suppression WSL pour {}: {e}",
+                "Echec suppression WSL pour {}: {e}",
                 instance_debug
             ));
             e.to_string()
         })
+    })?;
+
+    match sync_windows_kubeconfig_task().await {
+        Ok(sync) => {
+            append_provision_message(&mut removal.message, &sync.message);
+            log_wsl_event(format!(
+                "Kubeconfig Windows synchronise apres suppression {}: {}",
+                instance_debug,
+                escape_for_log(&sync.message)
+            ));
+        }
+        Err(err) => {
+            warn!(
+                target: "wsl",
+                instance = %instance_name,
+                error = %err,
+                "Synchronisation kubeconfig Windows impossible apres suppression"
+            );
+            append_provision_message(
+                &mut removal.message,
+                &format!("Synchronisation kubeconfig Windows impossible: {err}"),
+            );
+            log_wsl_event(format!(
+                "Synchronisation kubeconfig Windows impossible apres suppression {}: {}",
+                instance_debug,
+                escape_for_log(&err.to_string())
+            ));
+        }
+    }
+
+    Ok(removal)
+}
+fn run_wsl_kubectl_exec(instance: &str, args: &[String]) -> Result<WslKubectlExecResult> {
+    if args.is_empty() {
+        return Err(anyhow!("La commande kubectl est requise."));
+    }
+
+    let mut command_args = vec![
+        "-d".to_string(),
+        instance.to_string(),
+        "--".to_string(),
+        "/usr/local/bin/k3s".to_string(),
+        "kubectl".to_string(),
+    ];
+    command_args.extend(args.iter().cloned());
+    let command_refs: Vec<&str> = command_args.iter().map(|arg| arg.as_str()).collect();
+    let command_line = format_cli_command("wsl.exe", &command_refs);
+    let instance_log = escape_for_log(instance);
+
+    info!(
+        target: "wsl",
+        instance = %instance,
+        command = %command_line,
+        "Execution kubectl dans WSL"
+    );
+    log_wsl_event(format!(
+        "Execution kubectl pour {} via {}",
+        instance_log, command_line
+    ));
+
+    let output = Command::new("wsl.exe")
+        .arg("-d")
+        .arg(instance)
+        .arg("--")
+        .arg("/usr/local/bin/k3s")
+        .arg("kubectl")
+        .args(args)
+        .output()
+        .with_context(|| format!("Impossible d'executer kubectl dans l'instance WSL {instance}"))?;
+
+    let stdout = decode_cli_output(&output.stdout);
+    let stderr = decode_cli_output(&output.stderr);
+    let stdout_trim = stdout.trim();
+    let stderr_trim = stderr.trim();
+    let stdout_log = escape_for_log(stdout_trim);
+    let stderr_log = escape_for_log(stderr_trim);
+    let ok = output.status.success();
+
+    if ok {
+        info!(
+            target: "wsl",
+            instance = %instance,
+            status = %output.status,
+            stdout = %stdout_log,
+            stderr = %stderr_log,
+            "Commande kubectl terminee"
+        );
+    } else {
+        warn!(
+            target: "wsl",
+            instance = %instance,
+            status = %output.status,
+            stdout = %stdout_log,
+            stderr = %stderr_log,
+            "Commande kubectl en echec"
+        );
+    }
+
+    log_wsl_event(format!(
+        "Commande kubectl terminee pour {}: status={} stdout={} stderr={}",
+        instance_log, output.status, stdout_log, stderr_log
+    ));
+
+    Ok(WslKubectlExecResult {
+        ok,
+        instance: instance.to_string(),
+        exit_code: output.status.code(),
+        command: command_line,
+        stdout,
+        stderr,
     })
+}
+
+#[tauri::command]
+pub async fn wsl_kubectl_exec(
+    instance: String,
+    args: Vec<String>,
+) -> Result<WslKubectlExecResult, String> {
+    let raw_instance = instance.trim();
+    if raw_instance.is_empty() {
+        return Err("Le nom de l'instance WSL est requis.".into());
+    }
+
+    let sanitized_instance = sanitize_wsl_instance_name(raw_instance).map_err(|e| e.to_string())?;
+    let sanitized_args: Vec<String> = args
+        .into_iter()
+        .map(|arg| sanitize_cli_field(&arg))
+        .filter(|arg| !arg.is_empty())
+        .collect();
+    if sanitized_args.is_empty() {
+        return Err("La commande kubectl est requise.".into());
+    }
+
+    let instance_for_log = sanitized_instance.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        run_wsl_kubectl_exec(&sanitized_instance, &sanitized_args)
+    })
+    .await
+    .map_err(|e| {
+        error!(target: "wsl", "Erreur JoinHandle (kubectl): {e}");
+        log_wsl_event(format!(
+            "Erreur JoinHandle (kubectl) pour {}: {e}",
+            escape_for_log(&instance_for_log)
+        ));
+        format!("Erreur interne: {e}")
+    })?
+    .map_err(|e| e.to_string())
 }
 
 #[derive(serde::Deserialize, Debug)]
@@ -1634,10 +2236,7 @@ struct GitHubRelease {
     assets: Vec<GitHubReleaseAsset>,
 }
 
-async fn download_and_install_k3s(
-    app: &AppHandle,
-    instance_name: &str,
-) -> Result<String> {
+async fn download_and_install_k3s(app: &AppHandle, instance_name: &str) -> Result<String> {
     let client = reqwest::Client::new();
     let release_url = "https://api.github.com/repos/k3s-io/k3s/releases/latest";
     let sanitized_instance = escape_for_log(instance_name);
@@ -1704,11 +2303,15 @@ async fn download_and_install_k3s(
             "Impossible de créer le fichier de cache K3S sur {}",
             cached_file_path.display()
         ))?;
-        
-        while let Some(chunk) = response.chunk().await.context("Erreur lors du telechargement de K3s")? {
-            file.write_all(&chunk).context("Erreur ecriture dans le fichier de cache K3s")?;
-        }
 
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .context("Erreur lors du telechargement de K3s")?
+        {
+            file.write_all(&chunk)
+                .context("Erreur ecriture dans le fichier de cache K3s")?;
+        }
     } else {
         info!(
             target: "wsl",
@@ -1741,7 +2344,10 @@ async fn download_and_install_k3s(
         wsl_path_buf.display()
     ))?;
 
-    let command_line = format_cli_command("wsl.exe", &["-d", instance_name, "chmod", "+x", "/usr/local/bin/k3s"]);
+    let command_line = format_cli_command(
+        "wsl.exe",
+        &["-d", instance_name, "chmod", "+x", "/usr/local/bin/k3s"],
+    );
     info!(
         target: "wsl",
         command = %command_line,
@@ -1759,14 +2365,8 @@ async fn download_and_install_k3s(
 
     if !output.status.success() {
         let stderr = decode_cli_output(&output.stderr);
-        anyhow::bail!(
-            "Impossible de rendre K3S executable dans WSL: {}",
-            stderr
-        );
+        anyhow::bail!("Impossible de rendre K3S executable dans WSL: {}", stderr);
     }
 
-    Ok(format!(
-        "K3S {} installe avec succes.",
-        release.tag_name
-    ))
+    Ok(format!("K3S {} installe avec succes.", release.tag_name))
 }

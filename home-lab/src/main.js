@@ -9,5 +9,6 @@ import './components/http-routes.js';
 import './components/oidc-status.js';
 import './components/oidc-clients.js';
 import './components/wsl-instance.js';
+import './components/k8s-client.js';
 
 installUiRefreshListener();

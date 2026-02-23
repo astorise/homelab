@@ -89,6 +89,15 @@ const __MOCK = {
   },
 };
 
+const toManagedContextId = (name) => {
+  const normalized = String(name ?? '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+  return normalized || 'cluster';
+};
+
 async function mockInvoke(cmd, args = {}) {
   // Petite latence pour simuler un appel
   await delay(150);
@@ -273,6 +282,105 @@ async function mockInvoke(cmd, args = {}) {
         : { ok: false, message: `Instance ${name} introuvable (mock).` };
     }
 
+    case 'wsl_sync_windows_kubeconfig': {
+      const contexts = __MOCK.wsl.instances.map(
+        (inst) => `home-lab-wsl-${toManagedContextId(inst?.name || '')}`,
+      );
+      return {
+        ok: true,
+        path: 'C:\\\\Users\\\\mock\\\\.kube\\\\config',
+        contexts,
+        skipped: [],
+        message: `Kubeconfig Windows synchronise: ${contexts.length} contexte(s) Home Lab ecrit(s).`,
+      };
+    }
+
+    case 'wsl_kubectl_exec': {
+      const instance = (args?.instance || '').trim();
+      const commandArgs = Array.isArray(args?.args)
+        ? args.args
+            .map((arg) => String(arg ?? '').trim())
+            .filter((arg) => arg.length > 0)
+        : [];
+      const command = `wsl.exe -d "${instance}" -- /usr/local/bin/k3s kubectl ${commandArgs.join(' ')}`.trim();
+
+      if (!instance) {
+        return {
+          ok: false,
+          instance,
+          exit_code: 1,
+          command,
+          stdout: '',
+          stderr: "Le nom de l'instance WSL est requis (mock).",
+        };
+      }
+      if (commandArgs.length === 0) {
+        return {
+          ok: false,
+          instance,
+          exit_code: 1,
+          command,
+          stdout: '',
+          stderr: 'La commande kubectl est requise (mock).',
+        };
+      }
+
+      const target = __MOCK.wsl.instances.find(
+        (inst) => String(inst?.name || '').toLowerCase() === instance.toLowerCase(),
+      );
+      if (!target) {
+        return {
+          ok: false,
+          instance,
+          exit_code: 1,
+          command,
+          stdout: '',
+          stderr: `Instance ${instance} introuvable (mock).`,
+        };
+      }
+
+      const normalized = commandArgs.join(' ').toLowerCase();
+      let stdout = '';
+      let stderr = '';
+      let exitCode = 0;
+
+      if (normalized === 'get nodes' || normalized === 'get nodes -o wide') {
+        stdout = [
+          'NAME               STATUS   ROLES                  AGE   VERSION',
+          `${target.name}-srv    Ready    control-plane,master   5m    v1.32.1+k3s1`,
+        ].join('\n');
+      } else if (normalized === 'get namespaces') {
+        stdout = [
+          'NAME              STATUS   AGE',
+          'default           Active   5m',
+          'kube-system       Active   5m',
+          'kube-public       Active   5m',
+          'kube-node-lease   Active   5m',
+        ].join('\n');
+      } else if (normalized === 'get pods -a' || normalized === 'get pods -a -o wide') {
+        stdout = [
+          'NAMESPACE     NAME                                      READY   STATUS    RESTARTS   AGE',
+          'kube-system   coredns-6f6b679f8f-bj9zz                1/1     Running   0          5m',
+          'kube-system   local-path-provisioner-84bb864455-z4gxk 1/1     Running   0          5m',
+          'kube-system   metrics-server-ff9dbcb6c-2vzl7          1/1     Running   0          5m',
+        ].join('\n');
+      } else if (normalized.startsWith('get ')) {
+        stdout = `Commande mock executee sur ${target.name}: kubectl ${commandArgs.join(' ')}`;
+      } else {
+        exitCode = 1;
+        stderr = `Commande non supportee dans le mock: kubectl ${commandArgs.join(' ')}`;
+      }
+
+      return {
+        ok: exitCode === 0,
+        instance: target.name,
+        exit_code: exitCode,
+        command,
+        stdout,
+        stderr,
+      };
+    }
+
     default:
       return { ok: false, message: `Unknown mock command: ${cmd}` };
   }
@@ -454,4 +562,27 @@ export async function wsl_remove_instance(name) {
     throw new Error("Le nom de l'instance WSL est requis.");
   }
   return safeInvoke('wsl_remove_instance', { name: value });
+}
+
+export async function wsl_sync_windows_kubeconfig() {
+  return safeInvoke('wsl_sync_windows_kubeconfig');
+}
+
+export async function wsl_kubectl_exec(instance, args = []) {
+  const value = typeof instance === 'string' ? instance.trim() : '';
+  if (!value) {
+    throw new Error("Le nom de l'instance WSL est requis.");
+  }
+
+  const commandArgs = Array.isArray(args)
+    ? args.map((arg) => String(arg ?? '').trim()).filter((arg) => arg.length > 0)
+    : String(args ?? '')
+        .split(/\s+/)
+        .map((arg) => arg.trim())
+        .filter((arg) => arg.length > 0);
+  if (commandArgs.length === 0) {
+    throw new Error('La commande kubectl est requise.');
+  }
+
+  return safeInvoke('wsl_kubectl_exec', { instance: value, args: commandArgs });
 }

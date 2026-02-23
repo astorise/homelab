@@ -16,3 +16,4 @@ npm run tauri dev  # start Tauri desktop app
 - `<http-status>`: displays the HTTP service state and log level.
 - `<http-routes>`: shows configured HTTP routes.
 - `<toast-container>`: hosts transient error messages; use `showError(message)` to display a toast.
+- `<k8s-client>`: runs `kubectl` commands against k3s clusters in selected WSL instances and syncs the Windows kubeconfig.
