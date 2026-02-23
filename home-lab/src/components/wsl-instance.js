@@ -1,5 +1,6 @@
 import { wsl_import_instance, wsl_list_instances, wsl_remove_instance } from '../tauri.js';
 import { showError } from './toast.js';
+import { dispatchUiRefresh } from '../ui-refresh.js';
 
 const escapeHtml = (value) =>
   String(value)
@@ -276,6 +277,11 @@ class WslInstanceManager extends HTMLElement {
       if (refreshed) {
         this._messageState = 'success';
         this._message = 'Liste des instances mise à jour.';
+        dispatchUiRefresh({
+          source: 'wsl-instance-manager',
+          reason: 'wsl-refreshed',
+          skipSelectors: ['wsl-instance-manager'],
+        });
       }
     } catch (err) {
       const message = err?.message || String(err);
@@ -369,6 +375,11 @@ class WslInstanceManager extends HTMLElement {
         this._message = result.message || (force
           ? `Instance ${name} réimportée.`
           : `Instance ${name} importée.`);
+        dispatchUiRefresh({
+          source: 'wsl-instance-manager',
+          reason: force ? 'wsl-reimported' : 'wsl-imported',
+          skipSelectors: ['wsl-instance-manager'],
+        });
       }
     } catch (err) {
       // eslint-disable-next-line no-console
@@ -400,6 +411,11 @@ class WslInstanceManager extends HTMLElement {
       if (refreshed) {
         this._messageState = 'success';
         this._message = result.message || `Instance ${trimmed} supprimée.`;
+        dispatchUiRefresh({
+          source: 'wsl-instance-manager',
+          reason: 'wsl-removed',
+          skipSelectors: ['wsl-instance-manager'],
+        });
       }
     } catch (err) {
       const message = err?.message || String(err);
