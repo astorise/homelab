@@ -127,7 +127,7 @@ FunctionEnd
 
   ; Ajout au démarrage de Windows
   DetailPrint "Adding home-lab to startup..."
-  WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Run" "Home Lab" '"$INSTDIR\home-lab.exe"'
+  WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Run" "Home Lab" '"$INSTDIR\homelab-tauri.exe"'
 
   ; Close log file if opened
   StrCmp $LOG_HANDLE "" +2
