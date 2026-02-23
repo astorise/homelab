@@ -89,13 +89,31 @@ fn main() {
         }
     }
 
-    // Always prefer files from src-tauri/bin if present (developer override)
+    // Prefer local files from src-tauri/bin only when explicitly allowed.
+    // In CI we default to OFF to avoid overriding freshly downloaded artifacts.
+    let is_ci = std::env::var_os("CI").is_some();
+    let local_override = std::env::var("HOME_LAB_PREFER_LOCAL_BIN")
+        .ok()
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(!is_ci);
+    if !local_override {
+        println!(
+            "cargo:warning=Skipping src-tauri/bin override (CI-safe mode). Set HOME_LAB_PREFER_LOCAL_BIN=1 to enable."
+        );
+    }
+
+    // Local developer override (opt-in in CI, default on locally)
     let src_bin = manifest_path.join("bin");
     for name in ["home-dns.exe", "home-http.exe", "home-oidc.exe"] {
         let src = src_bin.join(name);
         let dst = dst_bin.join(name);
         println!("cargo:rerun-if-changed={}", src.display());
-        if src.exists() {
+        if src.exists() && local_override {
             let _ = std::fs::copy(&src, &dst);
         }
     }
