@@ -302,7 +302,8 @@ async function mockInvoke(cmd, args = {}) {
             .map((arg) => String(arg ?? '').trim())
             .filter((arg) => arg.length > 0)
         : [];
-      const command = `wsl.exe -d "${instance}" -- /usr/local/bin/k3s kubectl ${commandArgs.join(' ')}`.trim();
+      const context = `home-lab-wsl-${toManagedContextId(instance)}`;
+      const command = `kubectl --context "${context}" ${commandArgs.join(' ')}`.trim();
 
       if (!instance) {
         return {
@@ -357,7 +358,14 @@ async function mockInvoke(cmd, args = {}) {
           'kube-public       Active   5m',
           'kube-node-lease   Active   5m',
         ].join('\n');
-      } else if (normalized === 'get pods -a' || normalized === 'get pods -a -o wide') {
+      } else if (
+        normalized === 'get pods -a'
+        || normalized === 'get pods --all-namespaces'
+        || normalized === 'get pods -a -o wide'
+        || normalized === 'get pods --all-namespaces -o wide'
+        || normalized === 'get pods -o wide -a'
+        || normalized === 'get pods -o wide --all-namespaces'
+      ) {
         stdout = [
           'NAMESPACE     NAME                                      READY   STATUS    RESTARTS   AGE',
           'kube-system   coredns-6f6b679f8f-bj9zz                1/1     Running   0          5m',

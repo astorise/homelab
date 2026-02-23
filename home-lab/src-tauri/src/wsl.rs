@@ -14,6 +14,11 @@ use crate::oidc::{
     StatusOut,
 };
 use anyhow::{anyhow, Context, Result};
+use k8s_openapi::api::core::v1::{Namespace, Node, Pod};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
+use kube::api::{Api, ListParams};
+use kube::config::{KubeConfigOptions, Kubeconfig};
+use kube::{Client, Config as KubeClientConfig};
 use regex::Regex;
 use rsa::pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding};
 use rsa::rand_core::{OsRng, RngCore};
@@ -2107,85 +2112,713 @@ pub async fn wsl_remove_instance(name: String) -> Result<WslOperationResult, Str
 
     Ok(removal)
 }
-fn run_wsl_kubectl_exec(instance: &str, args: &[String]) -> Result<WslKubectlExecResult> {
+#[derive(Clone, Copy, Debug)]
+enum KubectlGetResource {
+    Nodes,
+    Namespaces,
+    Pods,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct KubectlGetRequest {
+    resource: KubectlGetResource,
+    all_namespaces: bool,
+    wide: bool,
+}
+
+fn build_kubectl_command_line(context_name: &str, args: &[String]) -> String {
+    let mut command_args = Vec::with_capacity(args.len() + 2);
+    command_args.push("--context".to_string());
+    command_args.push(context_name.to_string());
+    command_args.extend(args.iter().cloned());
+    let refs: Vec<&str> = command_args.iter().map(String::as_str).collect();
+    format_cli_command("kubectl", &refs)
+}
+
+fn kubectl_error_result(instance: &str, command: &str, message: String) -> WslKubectlExecResult {
+    WslKubectlExecResult {
+        ok: false,
+        instance: instance.to_string(),
+        exit_code: Some(1),
+        command: command.to_string(),
+        stdout: String::new(),
+        stderr: message,
+    }
+}
+
+fn parse_kubectl_get_request(args: &[String]) -> Result<KubectlGetRequest> {
     if args.is_empty() {
         return Err(anyhow!("La commande kubectl est requise."));
     }
 
-    let mut command_args = vec![
-        "-d".to_string(),
-        instance.to_string(),
-        "--".to_string(),
-        "/usr/local/bin/k3s".to_string(),
-        "kubectl".to_string(),
-    ];
-    command_args.extend(args.iter().cloned());
-    let command_refs: Vec<&str> = command_args.iter().map(|arg| arg.as_str()).collect();
-    let command_line = format_cli_command("wsl.exe", &command_refs);
+    let Some(verb) = args.first() else {
+        return Err(anyhow!("La commande kubectl est requise."));
+    };
+    if !verb.eq_ignore_ascii_case("get") {
+        return Err(anyhow!(
+            "Seule la commande 'kubectl get' est supportee via le client API integre."
+        ));
+    }
+
+    let Some(resource_token) = args.get(1) else {
+        return Err(anyhow!("La ressource kubectl est requise (nodes, namespaces, pods)."));
+    };
+
+    let resource = if resource_token.eq_ignore_ascii_case("nodes")
+        || resource_token.eq_ignore_ascii_case("node")
+        || resource_token.eq_ignore_ascii_case("no")
+    {
+        KubectlGetResource::Nodes
+    } else if resource_token.eq_ignore_ascii_case("namespaces")
+        || resource_token.eq_ignore_ascii_case("namespace")
+        || resource_token.eq_ignore_ascii_case("ns")
+    {
+        KubectlGetResource::Namespaces
+    } else if resource_token.eq_ignore_ascii_case("pods")
+        || resource_token.eq_ignore_ascii_case("pod")
+        || resource_token.eq_ignore_ascii_case("po")
+    {
+        KubectlGetResource::Pods
+    } else {
+        return Err(anyhow!(
+            "Ressource kubectl non supportee: '{}'. Ressources supportees: nodes, namespaces, pods.",
+            resource_token
+        ));
+    };
+
+    let mut request = KubectlGetRequest {
+        resource,
+        all_namespaces: false,
+        wide: false,
+    };
+
+    let mut i = 2;
+    while i < args.len() {
+        let token = &args[i];
+        if token.eq_ignore_ascii_case("-A") || token.eq_ignore_ascii_case("--all-namespaces") {
+            request.all_namespaces = true;
+            i += 1;
+            continue;
+        }
+
+        if token.eq_ignore_ascii_case("-o") || token.eq_ignore_ascii_case("--output") {
+            let value = args
+                .get(i + 1)
+                .ok_or_else(|| anyhow!("L'option {} attend une valeur.", token))?;
+            if value.eq_ignore_ascii_case("wide") {
+                request.wide = true;
+            } else if value.eq_ignore_ascii_case("table") {
+                request.wide = false;
+            } else {
+                return Err(anyhow!(
+                    "Format de sortie non supporte: '{}'. Seul '-o wide' est supporte.",
+                    value
+                ));
+            }
+            i += 2;
+            continue;
+        }
+
+        if let Some(value) = token.strip_prefix("-o=") {
+            if value.eq_ignore_ascii_case("wide") {
+                request.wide = true;
+            } else if !value.eq_ignore_ascii_case("table") {
+                return Err(anyhow!(
+                    "Format de sortie non supporte: '{}'. Seul '-o wide' est supporte.",
+                    value
+                ));
+            }
+            i += 1;
+            continue;
+        }
+
+        if let Some(value) = token.strip_prefix("--output=") {
+            if value.eq_ignore_ascii_case("wide") {
+                request.wide = true;
+            } else if !value.eq_ignore_ascii_case("table") {
+                return Err(anyhow!(
+                    "Format de sortie non supporte: '{}'. Seul '-o wide' est supporte.",
+                    value
+                ));
+            }
+            i += 1;
+            continue;
+        }
+
+        if token.starts_with('-') {
+            return Err(anyhow!("Option kubectl non supportee: '{}'.", token));
+        }
+
+        return Err(anyhow!(
+            "Argument kubectl non supporte: '{}'. Seules les commandes de liste sont supportees.",
+            token
+        ));
+    }
+
+    Ok(request)
+}
+
+fn format_age(timestamp: Option<&Time>) -> String {
+    let Some(created) = timestamp else {
+        return "-".to_string();
+    };
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let created_secs = created.0.as_second();
+    let delta = (now - created_secs).max(0);
+
+    if delta >= 60 * 60 * 24 * 365 {
+        format!("{}y", delta / (60 * 60 * 24 * 365))
+    } else if delta >= 60 * 60 * 24 {
+        format!("{}d", delta / (60 * 60 * 24))
+    } else if delta >= 60 * 60 {
+        format!("{}h", delta / (60 * 60))
+    } else if delta >= 60 {
+        format!("{}m", delta / 60)
+    } else {
+        format!("{delta}s")
+    }
+}
+
+fn render_table(headers: &[&str], rows: &[Vec<String>]) -> String {
+    let mut widths: Vec<usize> = headers.iter().map(|header| header.len()).collect();
+    for row in rows {
+        for (idx, value) in row.iter().enumerate() {
+            if idx < widths.len() && value.len() > widths[idx] {
+                widths[idx] = value.len();
+            }
+        }
+    }
+
+    let mut output = String::new();
+    for (idx, header) in headers.iter().enumerate() {
+        if idx > 0 {
+            output.push_str("   ");
+        }
+        output.push_str(&format!("{:<width$}", header, width = widths[idx]));
+    }
+
+    for row in rows {
+        output.push('\n');
+        for (idx, value) in row.iter().enumerate() {
+            if idx > 0 {
+                output.push_str("   ");
+            }
+            let width = widths.get(idx).copied().unwrap_or(value.len());
+            output.push_str(&format!("{:<width$}", value, width = width));
+        }
+    }
+
+    output
+}
+
+fn node_ready_status(node: &Node) -> String {
+    let Some(status) = node.status.as_ref() else {
+        return "Unknown".to_string();
+    };
+    let Some(conditions) = status.conditions.as_ref() else {
+        return "Unknown".to_string();
+    };
+
+    for condition in conditions {
+        if condition.type_ == "Ready" {
+            return match condition.status.as_str() {
+                "True" => "Ready".to_string(),
+                "False" => "NotReady".to_string(),
+                _ => "Unknown".to_string(),
+            };
+        }
+    }
+    "Unknown".to_string()
+}
+
+fn node_roles(node: &Node) -> String {
+    let Some(labels) = node.metadata.labels.as_ref() else {
+        return "<none>".to_string();
+    };
+
+    let mut roles = Vec::new();
+    for (key, value) in labels {
+        if key == "node-role.kubernetes.io/control-plane" {
+            roles.push("control-plane".to_string());
+            continue;
+        }
+        if key == "node-role.kubernetes.io/master" {
+            roles.push("master".to_string());
+            continue;
+        }
+        if key == "node-role.kubernetes.io/worker" {
+            if value.trim().is_empty() {
+                roles.push("worker".to_string());
+            } else {
+                roles.push(value.to_string());
+            }
+            continue;
+        }
+        if let Some(role) = key.strip_prefix("node-role.kubernetes.io/") {
+            if !role.trim().is_empty() {
+                roles.push(role.to_string());
+            }
+        }
+    }
+
+    if roles.is_empty() {
+        return "<none>".to_string();
+    }
+
+    roles.sort_unstable();
+    roles.dedup();
+    roles.join(",")
+}
+
+fn node_address(node: &Node, kind: &str) -> String {
+    node.status
+        .as_ref()
+        .and_then(|status| status.addresses.as_ref())
+        .and_then(|addresses| {
+            addresses
+                .iter()
+                .find(|address| address.type_.eq_ignore_ascii_case(kind))
+                .map(|address| address.address.clone())
+        })
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn pod_ready_counts(pod: &Pod) -> String {
+    let total_from_spec = pod
+        .spec
+        .as_ref()
+        .map(|spec| spec.containers.len())
+        .unwrap_or(0);
+
+    let Some(statuses) = pod
+        .status
+        .as_ref()
+        .and_then(|status| status.container_statuses.as_ref())
+    else {
+        return format!("0/{total_from_spec}");
+    };
+
+    let ready = statuses.iter().filter(|status| status.ready).count();
+    let total = statuses.len().max(total_from_spec);
+    format!("{ready}/{total}")
+}
+
+fn pod_status_label(pod: &Pod) -> String {
+    if let Some(status) = pod.status.as_ref() {
+        if let Some(container_statuses) = status.container_statuses.as_ref() {
+            if let Some(waiting) = container_statuses
+                .iter()
+                .filter_map(|item| item.state.as_ref())
+                .filter_map(|state| state.waiting.as_ref())
+                .find_map(|waiting| waiting.reason.as_ref())
+            {
+                if !waiting.trim().is_empty() {
+                    return waiting.to_string();
+                }
+            }
+            if let Some(terminated) = container_statuses
+                .iter()
+                .filter_map(|item| item.state.as_ref())
+                .filter_map(|state| state.terminated.as_ref())
+                .find_map(|terminated| terminated.reason.as_ref())
+            {
+                if !terminated.trim().is_empty() {
+                    return terminated.to_string();
+                }
+            }
+        }
+        if let Some(reason) = status.reason.as_ref() {
+            if !reason.trim().is_empty() {
+                return reason.to_string();
+            }
+        }
+        if let Some(phase) = status.phase.as_ref() {
+            if !phase.trim().is_empty() {
+                return phase.to_string();
+            }
+        }
+    }
+    "Unknown".to_string()
+}
+
+fn pod_restarts(pod: &Pod) -> String {
+    let restarts: i64 = pod
+        .status
+        .as_ref()
+        .and_then(|status| status.container_statuses.as_ref())
+        .map(|statuses| statuses.iter().map(|status| i64::from(status.restart_count)).sum())
+        .unwrap_or(0);
+    restarts.to_string()
+}
+
+fn kube_context_for_instance(instance: &str) -> String {
+    managed_kube_base_name(instance)
+}
+
+async fn build_kube_client_for_instance(
+    instance: &str,
+) -> Result<(Client, KubeClientConfig, String, PathBuf)> {
+    let context_name = kube_context_for_instance(instance);
+    let kubeconfig_path = windows_kubeconfig_path()?;
+    if !kubeconfig_path.exists() {
+        anyhow::bail!(
+            "Aucun kubeconfig Windows detecte sur {}. Lance d'abord la synchronisation kubeconfig.",
+            kubeconfig_path.display()
+        );
+    }
+
+    let kubeconfig = Kubeconfig::read_from(kubeconfig_path.clone()).with_context(|| {
+        format!(
+            "Lecture du kubeconfig Windows impossible sur {}",
+            kubeconfig_path.display()
+        )
+    })?;
+
+    if !kubeconfig.contexts.iter().any(|ctx| ctx.name == context_name) {
+        anyhow::bail!(
+            "Contexte kubeconfig '{}' introuvable. Lance la synchronisation kubeconfig Windows depuis Home Lab.",
+            context_name
+        );
+    }
+
+    let options = KubeConfigOptions {
+        context: Some(context_name.clone()),
+        ..KubeConfigOptions::default()
+    };
+    let config = KubeClientConfig::from_custom_kubeconfig(kubeconfig, &options)
+        .await
+        .with_context(|| format!("Chargement du contexte kubeconfig '{}'", context_name))?;
+    let client = Client::try_from(config.clone())
+        .with_context(|| format!("Creation du client Kubernetes pour '{}'", context_name))?;
+
+    Ok((client, config, context_name, kubeconfig_path))
+}
+
+async fn list_nodes(client: &Client, wide: bool) -> Result<String> {
+    let api: Api<Node> = Api::all(client.clone());
+    let mut items = api.list(&ListParams::default()).await?.items;
+    items.sort_by(|left, right| {
+        left.metadata
+            .name
+            .as_deref()
+            .unwrap_or("")
+            .cmp(right.metadata.name.as_deref().unwrap_or(""))
+    });
+
+    if items.is_empty() {
+        return Ok("No resources found.".to_string());
+    }
+
+    let mut rows = Vec::with_capacity(items.len());
+    for node in items {
+        let name = node
+            .metadata
+            .name
+            .clone()
+            .unwrap_or_else(|| "<unknown>".to_string());
+        let status = node_ready_status(&node);
+        let roles = node_roles(&node);
+        let age = format_age(node.metadata.creation_timestamp.as_ref());
+        let version = node
+            .status
+            .as_ref()
+            .and_then(|status| status.node_info.as_ref())
+            .map(|info| info.kubelet_version.clone())
+            .unwrap_or_else(|| "-".to_string());
+
+        let mut row = vec![name, status, roles, age, version];
+        if wide {
+            let internal_ip = node_address(&node, "InternalIP");
+            let external_ip = node_address(&node, "ExternalIP");
+            let (os_image, kernel, runtime) = node
+                .status
+                .as_ref()
+                .and_then(|status| status.node_info.as_ref())
+                .map(|info| {
+                    (
+                        info.os_image.clone(),
+                        info.kernel_version.clone(),
+                        info.container_runtime_version.clone(),
+                    )
+                })
+                .unwrap_or_else(|| ("-".to_string(), "-".to_string(), "-".to_string()));
+            row.extend([internal_ip, external_ip, os_image, kernel, runtime]);
+        }
+        rows.push(row);
+    }
+
+    let headers: Vec<&str> = if wide {
+        vec![
+            "NAME",
+            "STATUS",
+            "ROLES",
+            "AGE",
+            "VERSION",
+            "INTERNAL-IP",
+            "EXTERNAL-IP",
+            "OS-IMAGE",
+            "KERNEL-VERSION",
+            "CONTAINER-RUNTIME",
+        ]
+    } else {
+        vec!["NAME", "STATUS", "ROLES", "AGE", "VERSION"]
+    };
+
+    Ok(render_table(&headers, &rows))
+}
+
+async fn list_namespaces(client: &Client) -> Result<String> {
+    let api: Api<Namespace> = Api::all(client.clone());
+    let mut items = api.list(&ListParams::default()).await?.items;
+    items.sort_by(|left, right| {
+        left.metadata
+            .name
+            .as_deref()
+            .unwrap_or("")
+            .cmp(right.metadata.name.as_deref().unwrap_or(""))
+    });
+
+    if items.is_empty() {
+        return Ok("No resources found.".to_string());
+    }
+
+    let mut rows = Vec::with_capacity(items.len());
+    for namespace in items {
+        let name = namespace
+            .metadata
+            .name
+            .clone()
+            .unwrap_or_else(|| "<unknown>".to_string());
+        let phase = namespace
+            .status
+            .as_ref()
+            .and_then(|status| status.phase.clone())
+            .unwrap_or_else(|| "-".to_string());
+        let age = format_age(namespace.metadata.creation_timestamp.as_ref());
+        rows.push(vec![name, phase, age]);
+    }
+
+    Ok(render_table(&["NAME", "STATUS", "AGE"], &rows))
+}
+
+async fn list_pods(
+    client: &Client,
+    config: &KubeClientConfig,
+    all_namespaces: bool,
+    wide: bool,
+) -> Result<String> {
+    let mut items = if all_namespaces {
+        let api: Api<Pod> = Api::all(client.clone());
+        api.list(&ListParams::default()).await?.items
+    } else {
+        let api: Api<Pod> = Api::namespaced(client.clone(), &config.default_namespace);
+        api.list(&ListParams::default()).await?.items
+    };
+
+    items.sort_by(|left, right| {
+        let left_ns = left.metadata.namespace.as_deref().unwrap_or("");
+        let right_ns = right.metadata.namespace.as_deref().unwrap_or("");
+        match left_ns.cmp(right_ns) {
+            std::cmp::Ordering::Equal => left
+                .metadata
+                .name
+                .as_deref()
+                .unwrap_or("")
+                .cmp(right.metadata.name.as_deref().unwrap_or("")),
+            order => order,
+        }
+    });
+
+    if items.is_empty() {
+        if all_namespaces {
+            return Ok("No resources found.".to_string());
+        }
+        return Ok(format!(
+            "No resources found in {} namespace.",
+            config.default_namespace
+        ));
+    }
+
+    let mut rows = Vec::with_capacity(items.len());
+    for pod in items {
+        let namespace = pod
+            .metadata
+            .namespace
+            .clone()
+            .unwrap_or_else(|| config.default_namespace.clone());
+        let name = pod
+            .metadata
+            .name
+            .clone()
+            .unwrap_or_else(|| "<unknown>".to_string());
+        let ready = pod_ready_counts(&pod);
+        let status = pod_status_label(&pod);
+        let restarts = pod_restarts(&pod);
+        let age = format_age(pod.metadata.creation_timestamp.as_ref());
+        let ip = pod
+            .status
+            .as_ref()
+            .and_then(|status| status.pod_ip.clone())
+            .unwrap_or_else(|| "-".to_string());
+        let node = pod
+            .spec
+            .as_ref()
+            .and_then(|spec| spec.node_name.clone())
+            .unwrap_or_else(|| "-".to_string());
+
+        let mut row = Vec::new();
+        if all_namespaces {
+            row.push(namespace);
+        }
+        row.push(name);
+        row.push(ready);
+        row.push(status);
+        row.push(restarts);
+        row.push(age);
+        if wide {
+            row.push(ip);
+            row.push(node);
+        }
+        rows.push(row);
+    }
+
+    let headers: Vec<&str> = if all_namespaces {
+        if wide {
+            vec![
+                "NAMESPACE",
+                "NAME",
+                "READY",
+                "STATUS",
+                "RESTARTS",
+                "AGE",
+                "IP",
+                "NODE",
+            ]
+        } else {
+            vec!["NAMESPACE", "NAME", "READY", "STATUS", "RESTARTS", "AGE"]
+        }
+    } else if wide {
+        vec!["NAME", "READY", "STATUS", "RESTARTS", "AGE", "IP", "NODE"]
+    } else {
+        vec!["NAME", "READY", "STATUS", "RESTARTS", "AGE"]
+    };
+
+    Ok(render_table(&headers, &rows))
+}
+
+async fn execute_kubectl_get(
+    client: &Client,
+    config: &KubeClientConfig,
+    request: KubectlGetRequest,
+) -> Result<String> {
+    match request.resource {
+        KubectlGetResource::Nodes => list_nodes(client, request.wide).await,
+        KubectlGetResource::Namespaces => list_namespaces(client).await,
+        KubectlGetResource::Pods => {
+            list_pods(client, config, request.all_namespaces, request.wide).await
+        }
+    }
+}
+
+async fn run_wsl_kubectl_exec(instance: &str, args: &[String]) -> Result<WslKubectlExecResult> {
+    if args.is_empty() {
+        return Err(anyhow!("La commande kubectl est requise."));
+    }
+
+    let context_name = kube_context_for_instance(instance);
+    let command_line = build_kubectl_command_line(&context_name, args);
     let instance_log = escape_for_log(instance);
+
+    let request = match parse_kubectl_get_request(args) {
+        Ok(request) => request,
+        Err(err) => {
+            let message = err.to_string();
+            warn!(
+                target: "wsl",
+                instance = %instance,
+                command = %command_line,
+                error = %message,
+                "Commande kubectl refusee (syntaxe non supportee)"
+            );
+            log_wsl_event(format!(
+                "Commande kubectl refusee pour {} via {}: {}",
+                instance_log,
+                command_line,
+                escape_for_log(&message)
+            ));
+            return Ok(kubectl_error_result(instance, &command_line, message));
+        }
+    };
 
     info!(
         target: "wsl",
         instance = %instance,
         command = %command_line,
-        "Execution kubectl dans WSL"
+        context = %context_name,
+        "Execution kubectl via client Kubernetes Rust"
     );
     log_wsl_event(format!(
-        "Execution kubectl pour {} via {}",
+        "Execution kubectl pour {} via API Kubernetes: {}",
         instance_log, command_line
     ));
 
-    let output = Command::new("wsl.exe")
-        .arg("-d")
-        .arg(instance)
-        .arg("--")
-        .arg("/usr/local/bin/k3s")
-        .arg("kubectl")
-        .args(args)
-        .output()
-        .with_context(|| format!("Impossible d'executer kubectl dans l'instance WSL {instance}"))?;
-
-    let stdout = decode_cli_output(&output.stdout);
-    let stderr = decode_cli_output(&output.stderr);
-    let stdout_trim = stdout.trim();
-    let stderr_trim = stderr.trim();
-    let stdout_log = escape_for_log(stdout_trim);
-    let stderr_log = escape_for_log(stderr_trim);
-    let ok = output.status.success();
-
-    if ok {
-        info!(
-            target: "wsl",
-            instance = %instance,
-            status = %output.status,
-            stdout = %stdout_log,
-            stderr = %stderr_log,
-            "Commande kubectl terminee"
-        );
-    } else {
-        warn!(
-            target: "wsl",
-            instance = %instance,
-            status = %output.status,
-            stdout = %stdout_log,
-            stderr = %stderr_log,
-            "Commande kubectl en echec"
-        );
+    let outcome = async {
+        let (client, config, resolved_context, kubeconfig_path) =
+            build_kube_client_for_instance(instance).await?;
+        let stdout = execute_kubectl_get(&client, &config, request).await?;
+        Ok::<(String, String, PathBuf), anyhow::Error>((stdout, resolved_context, kubeconfig_path))
     }
+    .await;
 
-    log_wsl_event(format!(
-        "Commande kubectl terminee pour {}: status={} stdout={} stderr={}",
-        instance_log, output.status, stdout_log, stderr_log
-    ));
+    match outcome {
+        Ok((stdout, resolved_context, kubeconfig_path)) => {
+            let stdout_log = escape_for_log(stdout.trim());
+            info!(
+                target: "wsl",
+                instance = %instance,
+                context = %resolved_context,
+                kubeconfig = %kubeconfig_path.display(),
+                stdout = %stdout_log,
+                "Commande kubectl terminee via API Kubernetes"
+            );
+            log_wsl_event(format!(
+                "Commande kubectl terminee pour {}: status=0 context={} kubeconfig={} stdout={}",
+                instance_log,
+                escape_for_log(&resolved_context),
+                escape_for_log(&kubeconfig_path.display().to_string()),
+                stdout_log
+            ));
 
-    Ok(WslKubectlExecResult {
-        ok,
-        instance: instance.to_string(),
-        exit_code: output.status.code(),
-        command: command_line,
-        stdout,
-        stderr,
-    })
+            Ok(WslKubectlExecResult {
+                ok: true,
+                instance: instance.to_string(),
+                exit_code: Some(0),
+                command: command_line,
+                stdout,
+                stderr: String::new(),
+            })
+        }
+        Err(err) => {
+            let message = err.to_string();
+            warn!(
+                target: "wsl",
+                instance = %instance,
+                command = %command_line,
+                error = %message,
+                "Commande kubectl en echec via API Kubernetes"
+            );
+            log_wsl_event(format!(
+                "Commande kubectl en echec pour {}: status=1 stderr={}",
+                instance_log,
+                escape_for_log(&message)
+            ));
+            Ok(kubectl_error_result(instance, &command_line, message))
+        }
+    }
 }
 
 #[tauri::command]
@@ -2208,20 +2841,16 @@ pub async fn wsl_kubectl_exec(
         return Err("La commande kubectl est requise.".into());
     }
 
-    let instance_for_log = sanitized_instance.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        run_wsl_kubectl_exec(&sanitized_instance, &sanitized_args)
-    })
-    .await
-    .map_err(|e| {
-        error!(target: "wsl", "Erreur JoinHandle (kubectl): {e}");
-        log_wsl_event(format!(
-            "Erreur JoinHandle (kubectl) pour {}: {e}",
-            escape_for_log(&instance_for_log)
-        ));
-        format!("Erreur interne: {e}")
-    })?
-    .map_err(|e| e.to_string())
+    run_wsl_kubectl_exec(&sanitized_instance, &sanitized_args)
+        .await
+        .map_err(|e| {
+            error!(target: "wsl", "Erreur execution kubectl API: {e}");
+            log_wsl_event(format!(
+                "Erreur execution kubectl API pour {}: {e}",
+                escape_for_log(&sanitized_instance)
+            ));
+            e.to_string()
+        })
 }
 
 #[derive(serde::Deserialize, Debug)]

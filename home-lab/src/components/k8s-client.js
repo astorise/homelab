@@ -260,7 +260,7 @@ class K8sClient extends HTMLElement {
       <div class="p-4 bg-gray-100 rounded">
         <h2 class="font-bold mb-2">Client Kubernetes</h2>
         <p class="text-sm text-gray-600 mb-3">
-          Lance des commandes <code>kubectl</code> dans chaque instance WSL k3s via <code>k3s kubectl</code>.
+          Execute des commandes <code>kubectl</code> via l'API Kubernetes en utilisant le contexte Windows associe a l'instance WSL.
         </p>
         ${
           this._kubeconfigPath
