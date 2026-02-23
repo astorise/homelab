@@ -19,12 +19,37 @@ mod ui;
 mod wsl;
 
 static mut LOG_GUARD: Option<WorkerGuard> = None;
+const BUILD_GIT_SHA: &str = env!("BUILD_GIT_SHA");
+const BUILD_GIT_TAG: &str = env!("BUILD_GIT_TAG");
 
 fn default_log_filter() -> &'static str {
     if cfg!(debug_assertions) {
         "debug,tauri=info"
     } else {
         "info"
+    }
+}
+
+fn build_label() -> String {
+    let raw = if BUILD_GIT_TAG.trim().is_empty() || BUILD_GIT_TAG == "unknown" {
+        BUILD_GIT_SHA
+    } else {
+        BUILD_GIT_TAG
+    };
+    let sanitized: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if sanitized.trim_matches('_').is_empty() {
+        "unknown".to_string()
+    } else {
+        sanitized
     }
 }
 
@@ -56,7 +81,8 @@ fn init_file_logger() {
     let filter = EnvFilter::try_new(filter_directive.clone())
         .unwrap_or_else(|_| EnvFilter::new(default_log_filter()));
 
-    let file_appender = rolling::daily(&dir, "app.log");
+    let logfile_name = format!("app_{}.log", build_label());
+    let file_appender = rolling::daily(&dir, &logfile_name);
     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
 
     let builder = fmt()
@@ -75,7 +101,11 @@ fn init_file_logger() {
             unsafe {
                 LOG_GUARD = Some(guard);
             }
-            info!("File logger initialised in {}", dir.display());
+            info!(
+                "File logger initialised in {} (file={})",
+                dir.display(),
+                logfile_name
+            );
         }
         Err(err) => {
             drop(guard);

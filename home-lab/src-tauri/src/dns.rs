@@ -4,6 +4,7 @@ use serde::Serialize;
 use std::{
     io,
     pin::Pin,
+    process::Command,
     task::{Context, Poll},
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -29,8 +30,13 @@ use proto::homedns::v1::{AddRecordRequest, Empty, RemoveRecordRequest};
 const PIPE_RELEASE: &str = r"\\.\pipe\home-dns";
 const PIPE_DEV: &str = r"\\.\pipe\home-dns-dev";
 
+const SERVICE_NAME: &str = "HomeDnsService";
+const LOOPBACK_ENDPOINT: &str = "http://[::]:50052";
 const CONNECT_RETRIES: usize = 5;
 const CONNECT_RETRY_DELAY_MS: u64 = 500;
+const PIPE_OPEN_RETRIES: usize = 4;
+const PIPE_OPEN_RETRY_DELAY_MS: u64 = 75;
+const DIAG_MAX_FAILURES: usize = 8;
 
 type DnsClient = HomeDnsClient<tonic::transport::Channel>;
 
@@ -90,7 +96,8 @@ impl AsyncWrite for SendablePipeClient {
 
 // Establishes a connection to the gRPC service over a named pipe.
 async fn connect_client() -> Result<DnsClient, String> {
-    let mut last_error = None;
+    let mut last_error = None::<String>;
+    let mut sampled_failures: Vec<String> = Vec::new();
     for attempt in 1..=CONNECT_RETRIES {
         for pipe in pipe_candidates() {
             info!(
@@ -100,16 +107,11 @@ async fn connect_client() -> Result<DnsClient, String> {
                 pipe
             );
             let pipe_path = pipe.to_string();
-            match Endpoint::try_from("http://[::]:50052")
+            match Endpoint::try_from(LOOPBACK_ENDPOINT)
                 .unwrap()
                 .connect_with_connector(service_fn(move |_uri: Uri| {
                     let path = pipe_path.clone();
-                    async move {
-                        ClientOptions::new()
-                            .open(&path)
-                            .map(SendablePipeClient::new)
-                            .map(TokioIo::new)
-                    }
+                    async move { open_pipe_with_retry(&path).await }
                 }))
                 .await
             {
@@ -123,14 +125,20 @@ async fn connect_client() -> Result<DnsClient, String> {
                     return Ok(HomeDnsClient::new(channel));
                 }
                 Err(err) => {
+                    let err_dbg = format!("{err:?}");
                     warn!(
                         attempt,
                         pipe = %pipe,
-                        error = ?err,
+                        error = %err_dbg,
                         "DNS pipe {} connection failed",
                         pipe
                     );
-                    last_error = Some(err);
+                    if sampled_failures.len() < DIAG_MAX_FAILURES {
+                        sampled_failures.push(format!(
+                            "attempt={attempt}, pipe={pipe}, error={err_dbg}"
+                        ));
+                    }
+                    last_error = Some(err_dbg);
                 }
             }
         }
@@ -148,12 +156,84 @@ async fn connect_client() -> Result<DnsClient, String> {
     let err = last_error
         .map(|e| e.to_string())
         .unwrap_or_else(|| "no pipe candidates available".to_string());
+    let svc_state = service_state_snapshot(SERVICE_NAME);
+    let home_pipes = list_home_pipes_snapshot();
+    let sampled = if sampled_failures.is_empty() {
+        "none".to_string()
+    } else {
+        sampled_failures.join(" | ")
+    };
     let msg = format!(
-        "Failed to connect to DNS service after {} attempt(s): {}. Is the service running?",
-        CONNECT_RETRIES, err
+        "Failed to connect to DNS service after {CONNECT_RETRIES} attempt(s): {err}. \
+service={SERVICE_NAME} state=[{svc_state}] visible_pipes=[{home_pipes}] sampled_failures=[{sampled}]",
     );
     error!("{}", msg);
     Err(msg)
+}
+
+async fn open_pipe_with_retry(path: &str) -> io::Result<TokioIo<SendablePipeClient>> {
+    for open_attempt in 1..=PIPE_OPEN_RETRIES {
+        match ClientOptions::new().open(path) {
+            Ok(client) => return Ok(TokioIo::new(SendablePipeClient::new(client))),
+            Err(err) => {
+                let is_busy = matches!(err.raw_os_error(), Some(231));
+                if is_busy && open_attempt < PIPE_OPEN_RETRIES {
+                    let delay = PIPE_OPEN_RETRY_DELAY_MS * open_attempt as u64;
+                    debug!(
+                        path = %path,
+                        open_attempt,
+                        delay_ms = delay,
+                        "DNS pipe busy, retrying open"
+                    );
+                    sleep(Duration::from_millis(delay)).await;
+                    continue;
+                }
+                return Err(err);
+            }
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::Other,
+        "named pipe open retry exhausted",
+    ))
+}
+
+fn service_state_snapshot(service_name: &str) -> String {
+    match Command::new("sc").args(["query", service_name]).output() {
+        Ok(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let state = stdout
+                .lines()
+                .find(|line| line.contains("STATE"))
+                .map(str::trim)
+                .unwrap_or("STATE unavailable");
+            if output.status.success() {
+                state.to_string()
+            } else {
+                format!("{} (sc exit={:?})", state, output.status.code())
+            }
+        }
+        Err(err) => format!("sc query failed: {err}"),
+    }
+}
+
+fn list_home_pipes_snapshot() -> String {
+    match std::fs::read_dir("\\\\.\\pipe\\") {
+        Ok(entries) => {
+            let mut names: Vec<String> = entries
+                .flatten()
+                .filter_map(|entry| entry.file_name().into_string().ok())
+                .filter(|name| name.starts_with("home-"))
+                .collect();
+            names.sort();
+            if names.is_empty() {
+                "none".to_string()
+            } else {
+                names.join(",")
+            }
+        }
+        Err(err) => format!("unavailable: {err}"),
+    }
 }
 
 // Data structures for Tauri commands (serializable)

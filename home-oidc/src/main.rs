@@ -85,6 +85,8 @@ const SERVICE_NAME: &str = "HomeOidcService";
 const SERVICE_DISPLAY_NAME: &str = "Home OIDC Service";
 const SERVICE_DESCRIPTION: &str = "Minimal HTTPS OIDC provider with HTTP mirror";
 const CLIENT_ASSERTION_JWT: &str = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer";
+const BUILD_GIT_SHA: &str = env!("BUILD_GIT_SHA");
+const BUILD_GIT_TAG: &str = env!("BUILD_GIT_TAG");
 
 #[cfg(all(debug_assertions, windows))]
 const NAMED_PIPE_NAME: &str = r"\\.\pipe\home-oidc-dev";
@@ -258,15 +260,43 @@ fn level_from_cfg(cfg: &ServiceConfig) -> log::LevelFilter {
     }
 }
 
+fn build_label() -> String {
+    let raw = if BUILD_GIT_TAG.trim().is_empty() || BUILD_GIT_TAG == "unknown" {
+        BUILD_GIT_SHA
+    } else {
+        BUILD_GIT_TAG
+    };
+    let sanitized: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if sanitized.trim_matches('_').is_empty() {
+        "unknown".to_string()
+    } else {
+        sanitized
+    }
+}
+
+fn build_log_basename(prefix: &str) -> String {
+    format!("{prefix}_{}", build_label())
+}
+
 fn init_logger(level: log::LevelFilter) -> Result<()> {
     let dir = logs_dir();
+    let basename = build_log_basename("home-oidc");
     fs::create_dir_all(&dir)
         .with_context(|| format!("creating log directory {}", dir.display()))?;
     Logger::try_with_env_or_str(level.as_str())?
         .log_to_file(
             FileSpec::default()
                 .directory(dir)
-                .basename("home-oidc")
+                .basename(basename)
                 .suffix("log"),
         )
         .duplicate_to_stderr(Duplicate::Error)

@@ -141,6 +141,33 @@ fn default_level_str() -> &'static str {
     }
 }
 
+fn build_label() -> String {
+    let raw = if BUILD_GIT_TAG.trim().is_empty() || BUILD_GIT_TAG == "unknown" {
+        BUILD_GIT_SHA
+    } else {
+        BUILD_GIT_TAG
+    };
+    let sanitized: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if sanitized.trim_matches('_').is_empty() {
+        "unknown".to_string()
+    } else {
+        sanitized
+    }
+}
+
+fn build_log_basename(prefix: &str) -> String {
+    format!("{prefix}_{}", build_label())
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct HttpConfig {
     #[serde(default = "default_http_port")]
@@ -193,6 +220,7 @@ fn level_from_cfg(cfg: &HttpConfig) -> LevelFilter {
 
 fn init_logger(level: LevelFilter) -> Result<()> {
     let dir = logs_dir();
+    let basename = build_log_basename("home-http");
     std::fs::create_dir_all(&dir).map_err(|e| {
         eprintln!("cannot create log directory {}: {e}", dir.display());
         e
@@ -201,7 +229,7 @@ fn init_logger(level: LevelFilter) -> Result<()> {
         .log_to_file(
             FileSpec::default()
                 .directory(&dir)
-                .basename("home-http")
+                .basename(basename)
                 .suffix("log"),
         )
         .duplicate_to_stderr(Duplicate::Error)
@@ -881,6 +909,10 @@ fn main() -> Result<()> {
 
 fn named_pipe_stream() -> io::Result<UnboundedReceiverStream<Result<PipeConnection, io::Error>>> {
     let sddl = "D:(A;;GA;;;AC)(A;;GA;;;WD)(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;AU)(A;;FA;;;IU)"; // Allow AppContainer, Everyone, System, Admins, Authenticated, Interactive
+    info!(
+        "Preparing HTTP named pipe listener: pipe={} sddl={}",
+        NAMED_PIPE_NAME, sddl
+    );
     let mut sd: windows_sys::Win32::Security::PSECURITY_DESCRIPTOR = std::ptr::null_mut();
     let sddl_w: Vec<u16> = sddl.encode_utf16().chain(std::iter::once(0)).collect();
 
@@ -928,6 +960,12 @@ fn named_pipe_stream() -> io::Result<UnboundedReceiverStream<Result<PipeConnecti
             } {
                 Ok(s) => s,
                 Err(e) => {
+                    error!(
+                        "Failed to create first HTTP named pipe instance: kind={:?} os_code={:?} err={}",
+                        e.kind(),
+                        e.raw_os_error(),
+                        e
+                    );
                     let _ = tx.send(Err(e));
                     return;
                 }
@@ -935,11 +973,17 @@ fn named_pipe_stream() -> io::Result<UnboundedReceiverStream<Result<PipeConnecti
         };
 
         let mut server = Some(first_server);
+        let mut accepted_count: u64 = 0;
 
         loop {
             if let Some(s) = server.take() {
                 match s.connect().await {
                     Ok(()) => {
+                        accepted_count += 1;
+                        info!(
+                            "HTTP named pipe accepted client connection count={}",
+                            accepted_count
+                        );
                         let mut sa = windows_sys::Win32::Security::SECURITY_ATTRIBUTES {
                             nLength: std::mem::size_of::<windows_sys::Win32::Security::SECURITY_ATTRIBUTES>() as u32,
                             lpSecurityDescriptor: sd_addr as windows_sys::Win32::Security::PSECURITY_DESCRIPTOR,
@@ -955,6 +999,13 @@ fn named_pipe_stream() -> io::Result<UnboundedReceiverStream<Result<PipeConnecti
                         } {
                             Ok(s) => s,
                             Err(e) => {
+                                error!(
+                                    "Failed to create next HTTP named pipe instance after accept count={}: kind={:?} os_code={:?} err={}",
+                                    accepted_count,
+                                    e.kind(),
+                                    e.raw_os_error(),
+                                    e
+                                );
                                 let _ = tx.send(Err(e));
                                 break;
                             }
@@ -965,6 +1016,12 @@ fn named_pipe_stream() -> io::Result<UnboundedReceiverStream<Result<PipeConnecti
                         server = Some(new_server);
                     }
                     Err(e) => {
+                        warn!(
+                            "HTTP named pipe connect() failed: kind={:?} os_code={:?} err={}",
+                            e.kind(),
+                            e.raw_os_error(),
+                            e
+                        );
                         if tx.send(Err(e)).is_err() {
                             break;
                         }
