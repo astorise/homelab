@@ -14,11 +14,13 @@ use crate::oidc::{
     StatusOut,
 };
 use anyhow::{anyhow, Context, Result};
-use k8s_openapi::api::core::v1::{Namespace, Node, Pod};
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
-use kube::api::{Api, ListParams};
+use k8s_openapi::api::core::v1::{Event as CoreEvent, Namespace, Node, Pod};
+use k8s_openapi::api::events::v1::Event as EventsV1Event;
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::{MicroTime, Time};
+use kube::api::{Api, DynamicObject, ListParams, LogParams};
 use kube::config::{KubeConfigOptions, Kubeconfig};
-use kube::{Client, Config as KubeClientConfig};
+use kube::discovery::{self, verbs, Discovery, Scope as DiscoveryScope};
+use kube::{Client, Config as KubeClientConfig, ResourceExt};
 use regex::Regex;
 use rsa::pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding};
 use rsa::rand_core::{OsRng, RngCore};
@@ -2112,18 +2114,87 @@ pub async fn wsl_remove_instance(name: String) -> Result<WslOperationResult, Str
 
     Ok(removal)
 }
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 enum KubectlGetResource {
     Nodes,
     Namespaces,
     Pods,
+    Events,
+    Dynamic(String),
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct KubectlGetRequest {
     resource: KubectlGetResource,
+    name: Option<String>,
+    namespace: Option<String>,
     all_namespaces: bool,
     wide: bool,
+}
+
+#[derive(Clone, Debug)]
+struct KubectlDescribeRequest {
+    resource: String,
+    names: Vec<String>,
+    namespace: Option<String>,
+    all_namespaces: bool,
+}
+
+#[derive(Clone, Debug)]
+struct KubectlLogsRequest {
+    pod: String,
+    namespace: Option<String>,
+    container: Option<String>,
+    all_containers: bool,
+    previous: bool,
+    tail_lines: Option<i64>,
+    since_seconds: Option<i64>,
+    timestamps: bool,
+    limit_bytes: Option<i64>,
+}
+
+#[derive(Clone, Debug)]
+struct KubectlObjectRef {
+    kind: String,
+    name: String,
+    namespace: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct KubectlEventsRequest {
+    namespace: Option<String>,
+    all_namespaces: bool,
+    wide: bool,
+    for_object: Option<KubectlObjectRef>,
+    event_name: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+enum KubectlCommand {
+    Get(KubectlGetRequest),
+    Describe(KubectlDescribeRequest),
+    Logs(KubectlLogsRequest),
+    Events(KubectlEventsRequest),
+}
+
+#[derive(Clone, Debug)]
+struct ResolvedResource {
+    api_resource: discovery::ApiResource,
+    scope: DiscoveryScope,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct EventRow {
+    namespace: String,
+    event: String,
+    last_seen: String,
+    type_: String,
+    reason: String,
+    object: String,
+    source: String,
+    count: i32,
+    message: String,
+    sort_timestamp: i64,
 }
 
 fn build_kubectl_command_line(context_name: &str, args: &[String]) -> String {
@@ -2161,7 +2232,9 @@ fn parse_kubectl_get_request(args: &[String]) -> Result<KubectlGetRequest> {
     }
 
     let Some(resource_token) = args.get(1) else {
-        return Err(anyhow!("La ressource kubectl est requise (nodes, namespaces, pods)."));
+        return Err(anyhow!(
+            "La ressource kubectl est requise (nodes, namespaces, pods)."
+        ));
     };
 
     let resource = if resource_token.eq_ignore_ascii_case("nodes")
@@ -2179,21 +2252,28 @@ fn parse_kubectl_get_request(args: &[String]) -> Result<KubectlGetRequest> {
         || resource_token.eq_ignore_ascii_case("po")
     {
         KubectlGetResource::Pods
+    } else if resource_token.eq_ignore_ascii_case("events")
+        || resource_token.eq_ignore_ascii_case("event")
+        || resource_token.eq_ignore_ascii_case("ev")
+    {
+        KubectlGetResource::Events
     } else {
-        return Err(anyhow!(
-            "Ressource kubectl non supportee: '{}'. Ressources supportees: nodes, namespaces, pods.",
-            resource_token
-        ));
+        KubectlGetResource::Dynamic(normalize_resource_alias(resource_token))
     };
 
     let mut request = KubectlGetRequest {
         resource,
+        name: None,
+        namespace: None,
         all_namespaces: false,
         wide: false,
     };
 
     let mut i = 2;
     while i < args.len() {
+        if parse_namespace_flag(args, &mut i, &mut request.namespace)? {
+            continue;
+        }
         let token = &args[i];
         if token.eq_ignore_ascii_case("-A") || token.eq_ignore_ascii_case("--all-namespaces") {
             request.all_namespaces = true;
@@ -2249,26 +2329,452 @@ fn parse_kubectl_get_request(args: &[String]) -> Result<KubectlGetRequest> {
             return Err(anyhow!("Option kubectl non supportee: '{}'.", token));
         }
 
+        if request.name.is_none() {
+            request.name = Some(token.clone());
+            i += 1;
+            continue;
+        }
+
+        return Err(anyhow!("Arguments kubectl inattendus: '{}'.", token));
+    }
+
+    if request.all_namespaces && request.namespace.is_some() {
         return Err(anyhow!(
-            "Argument kubectl non supporte: '{}'. Seules les commandes de liste sont supportees.",
-            token
+            "Les options --all-namespaces et --namespace ne peuvent pas etre combinees."
         ));
     }
 
     Ok(request)
 }
 
-fn format_age(timestamp: Option<&Time>) -> String {
-    let Some(created) = timestamp else {
-        return "-".to_string();
+fn normalize_resource_alias(raw: &str) -> String {
+    let token = raw.trim().to_ascii_lowercase();
+    match token.as_str() {
+        "node" | "no" => "nodes".to_string(),
+        "namespace" | "ns" => "namespaces".to_string(),
+        "pod" | "po" => "pods".to_string(),
+        "deployment" | "deploy" => "deployments".to_string(),
+        "daemonset" | "ds" => "daemonsets".to_string(),
+        "statefulset" | "sts" => "statefulsets".to_string(),
+        "replicaset" | "rs" => "replicasets".to_string(),
+        "service" | "svc" => "services".to_string(),
+        "ingress" | "ing" => "ingresses".to_string(),
+        "configmap" | "cm" => "configmaps".to_string(),
+        "secret" => "secrets".to_string(),
+        "event" | "ev" => "events".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn normalize_kind_alias(raw: &str) -> String {
+    let token = raw.trim().to_ascii_lowercase();
+    match token.as_str() {
+        "pods" | "pod" | "po" => "pod".to_string(),
+        "nodes" | "node" | "no" => "node".to_string(),
+        "namespaces" | "namespace" | "ns" => "namespace".to_string(),
+        "services" | "service" | "svc" => "service".to_string(),
+        "deployments" | "deployment" | "deploy" => "deployment".to_string(),
+        "daemonsets" | "daemonset" | "ds" => "daemonset".to_string(),
+        "statefulsets" | "statefulset" | "sts" => "statefulset".to_string(),
+        "replicasets" | "replicaset" | "rs" => "replicaset".to_string(),
+        "events" | "event" | "ev" => "event".to_string(),
+        other => other.trim_end_matches('s').to_string(),
+    }
+}
+
+fn split_resource_and_inline_name(token: &str) -> (String, Option<String>) {
+    let raw = token.trim();
+    if let Some((resource, name)) = raw.split_once('/') {
+        let resource = resource.trim();
+        let name = name.trim();
+        if !resource.is_empty() && !name.is_empty() {
+            return (resource.to_string(), Some(name.to_string()));
+        }
+    }
+    (raw.to_string(), None)
+}
+
+fn parse_namespace_flag(
+    args: &[String],
+    i: &mut usize,
+    namespace: &mut Option<String>,
+) -> Result<bool> {
+    let token = &args[*i];
+    if token.eq_ignore_ascii_case("-n") || token.eq_ignore_ascii_case("--namespace") {
+        let value = args
+            .get(*i + 1)
+            .ok_or_else(|| anyhow!("L'option {} attend un namespace.", token))?;
+        let ns = value.trim();
+        if ns.is_empty() {
+            return Err(anyhow!("Le namespace ne peut pas etre vide."));
+        }
+        *namespace = Some(ns.to_string());
+        *i += 2;
+        return Ok(true);
+    }
+    if let Some(value) = token.strip_prefix("--namespace=") {
+        let ns = value.trim();
+        if ns.is_empty() {
+            return Err(anyhow!("Le namespace ne peut pas etre vide."));
+        }
+        *namespace = Some(ns.to_string());
+        *i += 1;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+fn parse_duration_seconds(raw: &str) -> Result<i64> {
+    let value = raw.trim().to_ascii_lowercase();
+    if value.is_empty() {
+        return Err(anyhow!("La duree --since ne peut pas etre vide."));
+    }
+
+    let (digits, factor) = if let Some(head) = value.strip_suffix("ms") {
+        (head, 0.001_f64)
+    } else if let Some(head) = value.strip_suffix('s') {
+        (head, 1.0_f64)
+    } else if let Some(head) = value.strip_suffix('m') {
+        (head, 60.0_f64)
+    } else if let Some(head) = value.strip_suffix('h') {
+        (head, 3600.0_f64)
+    } else if let Some(head) = value.strip_suffix('d') {
+        (head, 86400.0_f64)
+    } else {
+        (value.as_str(), 1.0_f64)
     };
 
+    let base: f64 = digits
+        .trim()
+        .parse()
+        .with_context(|| format!("Duree invalide: {}", raw))?;
+    let seconds = (base * factor).round() as i64;
+    if seconds < 0 {
+        return Err(anyhow!("La duree --since doit etre positive."));
+    }
+    Ok(seconds)
+}
+
+fn parse_kubectl_object_ref(raw: &str) -> Result<KubectlObjectRef> {
+    let trimmed = raw.trim();
+    let (kind_raw, name_raw) = trimmed
+        .split_once('/')
+        .ok_or_else(|| anyhow!("Format --for invalide. Attendu: kind/name."))?;
+    let kind = normalize_kind_alias(kind_raw);
+    let name = name_raw.trim();
+    if kind.is_empty() || name.is_empty() {
+        return Err(anyhow!("Format --for invalide. Attendu: kind/name."));
+    }
+    Ok(KubectlObjectRef {
+        kind,
+        name: name.to_string(),
+        namespace: None,
+    })
+}
+
+fn parse_kubectl_describe_request(args: &[String]) -> Result<KubectlDescribeRequest> {
+    if args.len() < 2 || !args[0].eq_ignore_ascii_case("describe") {
+        return Err(anyhow!("La commande attendue est 'kubectl describe'."));
+    }
+
+    let (resource_raw, inline_name) = split_resource_and_inline_name(&args[1]);
+    if resource_raw.trim().is_empty() {
+        return Err(anyhow!("La ressource kubectl est requise pour describe."));
+    }
+
+    let mut request = KubectlDescribeRequest {
+        resource: normalize_resource_alias(&resource_raw),
+        names: inline_name.into_iter().collect(),
+        namespace: None,
+        all_namespaces: false,
+    };
+
+    let mut i = 2;
+    while i < args.len() {
+        if parse_namespace_flag(args, &mut i, &mut request.namespace)? {
+            continue;
+        }
+        let token = &args[i];
+        if token.eq_ignore_ascii_case("-A") || token.eq_ignore_ascii_case("--all-namespaces") {
+            request.all_namespaces = true;
+            i += 1;
+            continue;
+        }
+        if token.starts_with('-') {
+            return Err(anyhow!("Option kubectl non supportee: '{}'.", token));
+        }
+        request.names.push(token.clone());
+        i += 1;
+    }
+
+    if request.all_namespaces && request.namespace.is_some() {
+        return Err(anyhow!(
+            "Les options --all-namespaces et --namespace ne peuvent pas etre combinees."
+        ));
+    }
+    Ok(request)
+}
+
+fn parse_kubectl_logs_request(args: &[String]) -> Result<KubectlLogsRequest> {
+    if args.is_empty()
+        || (!args[0].eq_ignore_ascii_case("logs") && !args[0].eq_ignore_ascii_case("log"))
+    {
+        return Err(anyhow!("La commande attendue est 'kubectl logs'."));
+    }
+
+    let mut request = KubectlLogsRequest {
+        pod: String::new(),
+        namespace: None,
+        container: None,
+        all_containers: false,
+        previous: false,
+        tail_lines: None,
+        since_seconds: None,
+        timestamps: false,
+        limit_bytes: None,
+    };
+
+    let mut i = 1;
+    while i < args.len() {
+        if parse_namespace_flag(args, &mut i, &mut request.namespace)? {
+            continue;
+        }
+        let token = &args[i];
+
+        if token.eq_ignore_ascii_case("-c") || token.eq_ignore_ascii_case("--container") {
+            let value = args
+                .get(i + 1)
+                .ok_or_else(|| anyhow!("L'option {} attend une valeur.", token))?;
+            request.container = Some(value.trim().to_string());
+            i += 2;
+            continue;
+        }
+        if let Some(value) = token.strip_prefix("--container=") {
+            request.container = Some(value.trim().to_string());
+            i += 1;
+            continue;
+        }
+        if token.eq_ignore_ascii_case("--all-containers") {
+            request.all_containers = true;
+            i += 1;
+            continue;
+        }
+        if token.eq_ignore_ascii_case("--previous") {
+            request.previous = true;
+            i += 1;
+            continue;
+        }
+        if token.eq_ignore_ascii_case("--timestamps") {
+            request.timestamps = true;
+            i += 1;
+            continue;
+        }
+        if token.eq_ignore_ascii_case("-f") || token.eq_ignore_ascii_case("--follow") {
+            return Err(anyhow!(
+                "Le mode follow n'est pas supporte dans Home Lab (commande bloquante)."
+            ));
+        }
+        if token.eq_ignore_ascii_case("--tail") {
+            let value = args
+                .get(i + 1)
+                .ok_or_else(|| anyhow!("L'option {} attend une valeur.", token))?;
+            request.tail_lines = Some(
+                value
+                    .trim()
+                    .parse()
+                    .with_context(|| format!("Valeur --tail invalide: {}", value))?,
+            );
+            i += 2;
+            continue;
+        }
+        if let Some(value) = token.strip_prefix("--tail=") {
+            request.tail_lines = Some(
+                value
+                    .trim()
+                    .parse()
+                    .with_context(|| format!("Valeur --tail invalide: {}", value))?,
+            );
+            i += 1;
+            continue;
+        }
+        if token.eq_ignore_ascii_case("--limit-bytes") {
+            let value = args
+                .get(i + 1)
+                .ok_or_else(|| anyhow!("L'option {} attend une valeur.", token))?;
+            request.limit_bytes = Some(
+                value
+                    .trim()
+                    .parse()
+                    .with_context(|| format!("Valeur --limit-bytes invalide: {}", value))?,
+            );
+            i += 2;
+            continue;
+        }
+        if let Some(value) = token.strip_prefix("--limit-bytes=") {
+            request.limit_bytes = Some(
+                value
+                    .trim()
+                    .parse()
+                    .with_context(|| format!("Valeur --limit-bytes invalide: {}", value))?,
+            );
+            i += 1;
+            continue;
+        }
+        if token.eq_ignore_ascii_case("--since") {
+            let value = args
+                .get(i + 1)
+                .ok_or_else(|| anyhow!("L'option {} attend une valeur.", token))?;
+            request.since_seconds = Some(parse_duration_seconds(value)?);
+            i += 2;
+            continue;
+        }
+        if let Some(value) = token.strip_prefix("--since=") {
+            request.since_seconds = Some(parse_duration_seconds(value)?);
+            i += 1;
+            continue;
+        }
+        if token.starts_with('-') {
+            return Err(anyhow!("Option kubectl non supportee: '{}'.", token));
+        }
+        if request.pod.is_empty() {
+            let (resource, inline_name) = split_resource_and_inline_name(token);
+            if let Some(name) = inline_name {
+                if normalize_resource_alias(&resource) != "pods" {
+                    return Err(anyhow!(
+                        "La commande logs supporte uniquement les pods (recu '{}').",
+                        resource
+                    ));
+                }
+                request.pod = name;
+            } else {
+                request.pod = token.to_string();
+            }
+            i += 1;
+            continue;
+        }
+        if request.container.is_none() {
+            request.container = Some(token.to_string());
+            i += 1;
+            continue;
+        }
+        return Err(anyhow!("Arguments logs inattendus: '{}'.", token));
+    }
+
+    if request.pod.trim().is_empty() {
+        return Err(anyhow!("Le nom du pod est requis pour la commande logs."));
+    }
+    if request.all_containers && request.container.is_some() {
+        return Err(anyhow!(
+            "Les options --all-containers et --container ne peuvent pas etre combinees."
+        ));
+    }
+    Ok(request)
+}
+
+fn parse_kubectl_events_request(args: &[String]) -> Result<KubectlEventsRequest> {
+    if args.is_empty() || !args[0].eq_ignore_ascii_case("events") {
+        return Err(anyhow!("La commande attendue est 'kubectl events'."));
+    }
+
+    let mut request = KubectlEventsRequest {
+        namespace: None,
+        all_namespaces: false,
+        wide: false,
+        for_object: None,
+        event_name: None,
+    };
+
+    let mut i = 1;
+    while i < args.len() {
+        if parse_namespace_flag(args, &mut i, &mut request.namespace)? {
+            continue;
+        }
+        let token = &args[i];
+        if token.eq_ignore_ascii_case("-A") || token.eq_ignore_ascii_case("--all-namespaces") {
+            request.all_namespaces = true;
+            i += 1;
+            continue;
+        }
+        if token.eq_ignore_ascii_case("-o") || token.eq_ignore_ascii_case("--output") {
+            let value = args
+                .get(i + 1)
+                .ok_or_else(|| anyhow!("L'option {} attend une valeur.", token))?;
+            request.wide = value.eq_ignore_ascii_case("wide");
+            i += 2;
+            continue;
+        }
+        if let Some(value) = token.strip_prefix("-o=") {
+            request.wide = value.eq_ignore_ascii_case("wide");
+            i += 1;
+            continue;
+        }
+        if let Some(value) = token.strip_prefix("--output=") {
+            request.wide = value.eq_ignore_ascii_case("wide");
+            i += 1;
+            continue;
+        }
+        if token.eq_ignore_ascii_case("--for") {
+            let value = args
+                .get(i + 1)
+                .ok_or_else(|| anyhow!("L'option {} attend une valeur.", token))?;
+            request.for_object = Some(parse_kubectl_object_ref(value)?);
+            i += 2;
+            continue;
+        }
+        if let Some(value) = token.strip_prefix("--for=") {
+            request.for_object = Some(parse_kubectl_object_ref(value)?);
+            i += 1;
+            continue;
+        }
+        if token.starts_with('-') {
+            return Err(anyhow!("Option kubectl non supportee: '{}'.", token));
+        }
+        if request.event_name.is_none() {
+            request.event_name = Some(token.clone());
+            i += 1;
+            continue;
+        }
+        return Err(anyhow!("Argument kubectl inattendu: '{}'.", token));
+    }
+
+    if request.all_namespaces && request.namespace.is_some() {
+        return Err(anyhow!(
+            "Les options --all-namespaces et --namespace ne peuvent pas etre combinees."
+        ));
+    }
+    Ok(request)
+}
+
+fn parse_kubectl_command(args: &[String]) -> Result<KubectlCommand> {
+    if args.is_empty() {
+        return Err(anyhow!("La commande kubectl est requise."));
+    }
+    if args[0].eq_ignore_ascii_case("get") {
+        return Ok(KubectlCommand::Get(parse_kubectl_get_request(args)?));
+    }
+    if args[0].eq_ignore_ascii_case("describe") {
+        return Ok(KubectlCommand::Describe(parse_kubectl_describe_request(
+            args,
+        )?));
+    }
+    if args[0].eq_ignore_ascii_case("logs") || args[0].eq_ignore_ascii_case("log") {
+        return Ok(KubectlCommand::Logs(parse_kubectl_logs_request(args)?));
+    }
+    if args[0].eq_ignore_ascii_case("events") {
+        return Ok(KubectlCommand::Events(parse_kubectl_events_request(args)?));
+    }
+    Err(anyhow!(
+        "Commande kubectl non supportee: '{}'. Commandes supportees: get, describe, logs, events.",
+        args[0]
+    ))
+}
+
+fn format_age_from_seconds(created: i64) -> String {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64;
-    let created_secs = created.0.as_second();
-    let delta = (now - created_secs).max(0);
+    let delta = (now - created).max(0);
 
     if delta >= 60 * 60 * 24 * 365 {
         format!("{}y", delta / (60 * 60 * 24 * 365))
@@ -2281,6 +2787,18 @@ fn format_age(timestamp: Option<&Time>) -> String {
     } else {
         format!("{delta}s")
     }
+}
+
+fn format_age(timestamp: Option<&Time>) -> String {
+    timestamp
+        .map(|value| format_age_from_seconds(value.0.as_second()))
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn format_age_micro(timestamp: Option<&MicroTime>) -> String {
+    timestamp
+        .map(|value| format_age_from_seconds(value.0.as_second()))
+        .unwrap_or_else(|| "-".to_string())
 }
 
 fn render_table(headers: &[&str], rows: &[Vec<String>]) -> String {
@@ -2450,7 +2968,12 @@ fn pod_restarts(pod: &Pod) -> String {
         .status
         .as_ref()
         .and_then(|status| status.container_statuses.as_ref())
-        .map(|statuses| statuses.iter().map(|status| i64::from(status.restart_count)).sum())
+        .map(|statuses| {
+            statuses
+                .iter()
+                .map(|status| i64::from(status.restart_count))
+                .sum()
+        })
         .unwrap_or(0);
     restarts.to_string()
 }
@@ -2478,7 +3001,11 @@ async fn build_kube_client_for_instance(
         )
     })?;
 
-    if !kubeconfig.contexts.iter().any(|ctx| ctx.name == context_name) {
+    if !kubeconfig
+        .contexts
+        .iter()
+        .any(|ctx| ctx.name == context_name)
+    {
         anyhow::bail!(
             "Contexte kubeconfig '{}' introuvable. Lance la synchronisation kubeconfig Windows depuis Home Lab.",
             context_name
@@ -2608,14 +3135,16 @@ async fn list_namespaces(client: &Client) -> Result<String> {
 async fn list_pods(
     client: &Client,
     config: &KubeClientConfig,
+    namespace: Option<&str>,
     all_namespaces: bool,
     wide: bool,
 ) -> Result<String> {
+    let selected_namespace = namespace.unwrap_or(config.default_namespace.as_str());
     let mut items = if all_namespaces {
         let api: Api<Pod> = Api::all(client.clone());
         api.list(&ListParams::default()).await?.items
     } else {
-        let api: Api<Pod> = Api::namespaced(client.clone(), &config.default_namespace);
+        let api: Api<Pod> = Api::namespaced(client.clone(), selected_namespace);
         api.list(&ListParams::default()).await?.items
     };
 
@@ -2639,7 +3168,7 @@ async fn list_pods(
         }
         return Ok(format!(
             "No resources found in {} namespace.",
-            config.default_namespace
+            selected_namespace
         ));
     }
 
@@ -2649,7 +3178,7 @@ async fn list_pods(
             .metadata
             .namespace
             .clone()
-            .unwrap_or_else(|| config.default_namespace.clone());
+            .unwrap_or_else(|| selected_namespace.to_string());
         let name = pod
             .metadata
             .name
@@ -2710,17 +3239,993 @@ async fn list_pods(
     Ok(render_table(&headers, &rows))
 }
 
+fn default_namespace(config: &KubeClientConfig, namespace: Option<&str>) -> String {
+    namespace
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(config.default_namespace.as_str())
+        .to_string()
+}
+
+fn singularize_plural(plural: &str) -> String {
+    if plural.ends_with("ies") && plural.len() > 3 {
+        let mut base = plural[..plural.len() - 3].to_string();
+        base.push('y');
+        return base;
+    }
+    for suffix in ["sses", "xes", "zes", "ches", "shes"] {
+        if plural.ends_with(suffix) && plural.len() > 2 {
+            return plural[..plural.len() - 2].to_string();
+        }
+    }
+    if plural.ends_with('s') && plural.len() > 1 {
+        return plural[..plural.len() - 1].to_string();
+    }
+    plural.to_string()
+}
+
+fn split_group_hint(resource: &str) -> (String, Option<String>) {
+    let token = resource.trim().to_ascii_lowercase();
+    if let Some((base, group_hint)) = token.split_once('.') {
+        let normalized_base = normalize_resource_alias(base);
+        let hint = group_hint.trim().to_string();
+        if !hint.is_empty() {
+            return (normalized_base, Some(hint));
+        }
+        return (normalized_base, None);
+    }
+    (normalize_resource_alias(&token), None)
+}
+
+fn resource_match_score(
+    resource_token: &str,
+    group_hint: Option<&str>,
+    api_resource: &discovery::ApiResource,
+) -> i32 {
+    let plural = api_resource.plural.to_ascii_lowercase();
+    let kind = api_resource.kind.to_ascii_lowercase();
+    let singular = singularize_plural(&plural);
+
+    let mut score = if resource_token == plural {
+        300
+    } else if resource_token == kind {
+        280
+    } else if resource_token == singular {
+        260
+    } else {
+        0
+    };
+    if score == 0 {
+        return 0;
+    }
+
+    let group = api_resource.group.to_ascii_lowercase();
+    if let Some(hint) = group_hint {
+        let matches = group == hint || group.ends_with(&format!(".{hint}"));
+        if !matches {
+            return 0;
+        }
+        score += 80;
+    } else if resource_token == "events" {
+        if group == "events.k8s.io" {
+            score += 40;
+        } else if group.is_empty() {
+            score += 20;
+        }
+    } else if group.is_empty() {
+        score += 20;
+    }
+
+    if api_resource.version == "v1" {
+        score += 5;
+    }
+    score
+}
+
+fn resource_tie_breaker(resolved: &ResolvedResource) -> i32 {
+    if resolved.api_resource.group == "events.k8s.io" {
+        3
+    } else if resolved.api_resource.group.is_empty() {
+        2
+    } else {
+        1
+    }
+}
+
+async fn resolve_dynamic_resource(client: &Client, resource: &str) -> Result<ResolvedResource> {
+    let (normalized, group_hint) = split_group_hint(resource);
+    let discovery = match Discovery::new(client.clone()).run_aggregated().await {
+        Ok(discovery) => discovery,
+        Err(err) => {
+            warn!(
+                target: "wsl",
+                resource = %resource,
+                error = %err,
+                "Aggregated discovery indisponible, bascule sur discovery classique"
+            );
+            Discovery::new(client.clone()).run().await?
+        }
+    };
+
+    let mut best: Option<(i32, ResolvedResource)> = None;
+    for group in discovery.groups() {
+        for (api_resource, capabilities) in group.recommended_resources() {
+            if !capabilities.supports_operation(verbs::LIST)
+                && !capabilities.supports_operation(verbs::GET)
+            {
+                continue;
+            }
+            let score = resource_match_score(&normalized, group_hint.as_deref(), &api_resource);
+            if score <= 0 {
+                continue;
+            }
+
+            let candidate = ResolvedResource {
+                api_resource: api_resource.clone(),
+                scope: capabilities.scope.clone(),
+            };
+            match &best {
+                None => best = Some((score, candidate)),
+                Some((current_score, current)) => {
+                    if score > *current_score
+                        || (score == *current_score
+                            && resource_tie_breaker(&candidate) > resource_tie_breaker(current))
+                    {
+                        best = Some((score, candidate));
+                    }
+                }
+            }
+        }
+    }
+
+    best.map(|(_, resolved)| resolved).ok_or_else(|| {
+        anyhow!(
+            "Ressource kubectl '{}' introuvable via l'API Kubernetes.",
+            resource
+        )
+    })
+}
+
+async fn list_dynamic_objects(
+    client: &Client,
+    config: &KubeClientConfig,
+    resolved: &ResolvedResource,
+    namespace: Option<&str>,
+    all_namespaces: bool,
+    field_selector: Option<&str>,
+) -> Result<Vec<DynamicObject>> {
+    let mut params = ListParams::default();
+    if let Some(selector) = field_selector {
+        params = params.fields(selector);
+    }
+
+    match resolved.scope {
+        DiscoveryScope::Cluster => {
+            let api: Api<DynamicObject> = Api::all_with(client.clone(), &resolved.api_resource);
+            Ok(api.list(&params).await?.items)
+        }
+        DiscoveryScope::Namespaced => {
+            if all_namespaces {
+                let api: Api<DynamicObject> = Api::all_with(client.clone(), &resolved.api_resource);
+                Ok(api.list(&params).await?.items)
+            } else {
+                let namespace = default_namespace(config, namespace);
+                let api: Api<DynamicObject> =
+                    Api::namespaced_with(client.clone(), &namespace, &resolved.api_resource);
+                Ok(api.list(&params).await?.items)
+            }
+        }
+    }
+}
+
+async fn get_named_dynamic_objects(
+    client: &Client,
+    config: &KubeClientConfig,
+    resolved: &ResolvedResource,
+    names: &[String],
+    namespace: Option<&str>,
+    all_namespaces: bool,
+) -> Result<Vec<DynamicObject>> {
+    let mut objects = Vec::new();
+    for name in names {
+        if name.trim().is_empty() {
+            continue;
+        }
+        match resolved.scope {
+            DiscoveryScope::Cluster => {
+                let api: Api<DynamicObject> = Api::all_with(client.clone(), &resolved.api_resource);
+                let object = api.get(name).await.with_context(|| {
+                    format!(
+                        "Ressource {} '{}' introuvable",
+                        resolved.api_resource.plural, name
+                    )
+                })?;
+                objects.push(object);
+            }
+            DiscoveryScope::Namespaced => {
+                if all_namespaces {
+                    let selector = format!("metadata.name={}", name);
+                    let mut matched =
+                        list_dynamic_objects(client, config, resolved, None, true, Some(&selector))
+                            .await?;
+                    if matched.is_empty() {
+                        anyhow::bail!(
+                            "Ressource {} '{}' introuvable dans les namespaces.",
+                            resolved.api_resource.plural,
+                            name
+                        );
+                    }
+                    objects.append(&mut matched);
+                } else {
+                    let ns = default_namespace(config, namespace);
+                    let api: Api<DynamicObject> =
+                        Api::namespaced_with(client.clone(), &ns, &resolved.api_resource);
+                    let object = api.get(name).await.with_context(|| {
+                        format!(
+                            "Ressource {} '{}' introuvable dans le namespace '{}'",
+                            resolved.api_resource.plural, name, ns
+                        )
+                    })?;
+                    objects.push(object);
+                }
+            }
+        }
+    }
+    Ok(objects)
+}
+
+fn sort_dynamic_objects(objects: &mut [DynamicObject]) {
+    objects.sort_by(|left, right| {
+        let left_ns = left.metadata.namespace.as_deref().unwrap_or("");
+        let right_ns = right.metadata.namespace.as_deref().unwrap_or("");
+        match left_ns.cmp(right_ns) {
+            std::cmp::Ordering::Equal => left.name_any().cmp(&right.name_any()),
+            order => order,
+        }
+    });
+}
+
+fn dynamic_status(object: &DynamicObject) -> String {
+    if let Some(phase) = object
+        .data
+        .get("status")
+        .and_then(|status| status.get("phase"))
+        .and_then(|phase| phase.as_str())
+        .filter(|phase| !phase.trim().is_empty())
+    {
+        return phase.to_string();
+    }
+    "-".to_string()
+}
+
+fn render_dynamic_get_table(
+    resolved: &ResolvedResource,
+    objects: &[DynamicObject],
+    all_namespaces: bool,
+    wide: bool,
+) -> String {
+    if objects.is_empty() {
+        return "No resources found.".to_string();
+    }
+    let include_namespace = all_namespaces && resolved.scope == DiscoveryScope::Namespaced;
+    let mut rows = Vec::with_capacity(objects.len());
+    for object in objects {
+        let mut row = Vec::new();
+        if include_namespace {
+            row.push(
+                object
+                    .metadata
+                    .namespace
+                    .clone()
+                    .unwrap_or_else(|| "-".to_string()),
+            );
+        }
+        row.push(object.name_any());
+        row.push(dynamic_status(object));
+        row.push(format_age(object.metadata.creation_timestamp.as_ref()));
+        if wide {
+            row.push(
+                object
+                    .types
+                    .as_ref()
+                    .map(|types| types.kind.clone())
+                    .unwrap_or_else(|| resolved.api_resource.kind.clone()),
+            );
+            row.push(
+                object
+                    .types
+                    .as_ref()
+                    .map(|types| types.api_version.clone())
+                    .unwrap_or_else(|| resolved.api_resource.api_version.clone()),
+            );
+        }
+        rows.push(row);
+    }
+
+    let headers: Vec<&str> = if include_namespace {
+        if wide {
+            vec!["NAMESPACE", "NAME", "STATUS", "AGE", "KIND", "API-VERSION"]
+        } else {
+            vec!["NAMESPACE", "NAME", "STATUS", "AGE"]
+        }
+    } else if wide {
+        vec!["NAME", "STATUS", "AGE", "KIND", "API-VERSION"]
+    } else {
+        vec!["NAME", "STATUS", "AGE"]
+    };
+
+    render_table(&headers, &rows)
+}
+
+fn yaml_block(value: &serde_json::Value) -> Result<String> {
+    let mut rendered = serde_yaml::to_string(value).context("Serialisation YAML impossible")?;
+    if rendered.starts_with("---\n") {
+        rendered = rendered.trim_start_matches("---\n").to_string();
+    }
+    Ok(rendered.trim_end().to_string())
+}
+
+fn append_map_section(output: &mut String, title: &str, map: Option<&BTreeMap<String, String>>) {
+    output.push_str(title);
+    output.push_str(":\n");
+    match map {
+        Some(values) if !values.is_empty() => {
+            for (key, value) in values {
+                output.push_str("  ");
+                output.push_str(key);
+                output.push_str(": ");
+                output.push_str(value);
+                output.push('\n');
+            }
+        }
+        _ => output.push_str("  <none>\n"),
+    }
+}
+
+fn append_json_section(output: &mut String, title: &str, value: Option<&serde_json::Value>) {
+    output.push_str(title);
+    output.push_str(":\n");
+    match value {
+        Some(value) => match yaml_block(value) {
+            Ok(rendered) if !rendered.trim().is_empty() => {
+                for line in rendered.lines() {
+                    output.push_str("  ");
+                    output.push_str(line);
+                    output.push('\n');
+                }
+            }
+            _ => output.push_str("  <none>\n"),
+        },
+        None => output.push_str("  <none>\n"),
+    }
+}
+
+fn render_dynamic_describe_object(object: &DynamicObject, resolved: &ResolvedResource) -> String {
+    let mut output = String::new();
+    let kind = object
+        .types
+        .as_ref()
+        .map(|types| types.kind.clone())
+        .unwrap_or_else(|| resolved.api_resource.kind.clone());
+    let api_version = object
+        .types
+        .as_ref()
+        .map(|types| types.api_version.clone())
+        .unwrap_or_else(|| resolved.api_resource.api_version.clone());
+
+    output.push_str("Name:         ");
+    output.push_str(&object.name_any());
+    output.push('\n');
+    if let Some(namespace) = object.metadata.namespace.as_deref() {
+        output.push_str("Namespace:    ");
+        output.push_str(namespace);
+        output.push('\n');
+    }
+    output.push_str("Kind:         ");
+    output.push_str(&kind);
+    output.push('\n');
+    output.push_str("API Version:  ");
+    output.push_str(&api_version);
+    output.push('\n');
+    output.push_str("Created:      ");
+    output.push_str(
+        &object
+            .metadata
+            .creation_timestamp
+            .as_ref()
+            .map(|value| value.0.to_string())
+            .unwrap_or_else(|| "-".to_string()),
+    );
+    output.push('\n');
+    output.push_str("Age:          ");
+    output.push_str(&format_age(object.metadata.creation_timestamp.as_ref()));
+    output.push('\n');
+
+    append_map_section(&mut output, "Labels", object.metadata.labels.as_ref());
+    append_map_section(
+        &mut output,
+        "Annotations",
+        object.metadata.annotations.as_ref(),
+    );
+    append_json_section(&mut output, "Spec", object.data.get("spec"));
+    append_json_section(&mut output, "Status", object.data.get("status"));
+
+    output.trim_end().to_string()
+}
+
+fn object_matches_filter(
+    object_kind: Option<&str>,
+    object_name: Option<&str>,
+    object_namespace: Option<&str>,
+    filter: &KubectlObjectRef,
+) -> bool {
+    let filter_kind = normalize_kind_alias(&filter.kind);
+    let kind = object_kind
+        .map(normalize_kind_alias)
+        .unwrap_or_else(|| "-".to_string());
+    if kind != filter_kind {
+        return false;
+    }
+    if object_name.unwrap_or_default() != filter.name {
+        return false;
+    }
+    if let Some(expected_ns) = filter.namespace.as_deref() {
+        return object_namespace.unwrap_or_default() == expected_ns;
+    }
+    true
+}
+
+fn event_sort_time_v1(event: &EventsV1Event) -> i64 {
+    if let Some(event_time) = event.event_time.as_ref() {
+        return event_time.0.as_second();
+    }
+    if let Some(last) = event.deprecated_last_timestamp.as_ref() {
+        return last.0.as_second();
+    }
+    if let Some(first) = event.deprecated_first_timestamp.as_ref() {
+        return first.0.as_second();
+    }
+    0
+}
+
+fn event_sort_time_core(event: &CoreEvent) -> i64 {
+    if let Some(last) = event.last_timestamp.as_ref() {
+        return last.0.as_second();
+    }
+    if let Some(first) = event.first_timestamp.as_ref() {
+        return first.0.as_second();
+    }
+    if let Some(event_time) = event.event_time.as_ref() {
+        return event_time.0.as_second();
+    }
+    0
+}
+
+fn convert_v1_event_rows(
+    events: Vec<EventsV1Event>,
+    filter: Option<&KubectlObjectRef>,
+) -> Vec<EventRow> {
+    let mut rows = Vec::new();
+    for event in events {
+        let object_kind = event
+            .regarding
+            .as_ref()
+            .and_then(|ref_obj| ref_obj.kind.as_deref());
+        let object_name = event
+            .regarding
+            .as_ref()
+            .and_then(|ref_obj| ref_obj.name.as_deref());
+        let object_ns = event
+            .regarding
+            .as_ref()
+            .and_then(|ref_obj| ref_obj.namespace.as_deref());
+        if let Some(filter) = filter {
+            if !object_matches_filter(object_kind, object_name, object_ns, filter) {
+                continue;
+            }
+        }
+
+        let object = match (object_kind, object_name) {
+            (Some(kind), Some(name)) if !kind.is_empty() && !name.is_empty() => {
+                format!("{}/{}", kind, name)
+            }
+            _ => "-".to_string(),
+        };
+        let source = event
+            .reporting_controller
+            .clone()
+            .or_else(|| {
+                event
+                    .deprecated_source
+                    .as_ref()
+                    .and_then(|source| source.component.clone())
+            })
+            .unwrap_or_else(|| "-".to_string());
+
+        rows.push(EventRow {
+            namespace: event
+                .metadata
+                .namespace
+                .clone()
+                .or_else(|| object_ns.map(str::to_string))
+                .unwrap_or_else(|| "-".to_string()),
+            event: event
+                .metadata
+                .name
+                .clone()
+                .unwrap_or_else(|| "-".to_string()),
+            last_seen: if event.event_time.is_some() {
+                format_age_micro(event.event_time.as_ref())
+            } else if event.deprecated_last_timestamp.is_some() {
+                format_age(event.deprecated_last_timestamp.as_ref())
+            } else {
+                format_age(event.deprecated_first_timestamp.as_ref())
+            },
+            type_: event.type_.clone().unwrap_or_else(|| "-".to_string()),
+            reason: event.reason.clone().unwrap_or_else(|| "-".to_string()),
+            object,
+            source,
+            count: event.deprecated_count.unwrap_or(1),
+            message: event.note.clone().unwrap_or_else(|| "-".to_string()),
+            sort_timestamp: event_sort_time_v1(&event),
+        });
+    }
+    rows
+}
+
+fn convert_core_event_rows(
+    events: Vec<CoreEvent>,
+    filter: Option<&KubectlObjectRef>,
+) -> Vec<EventRow> {
+    let mut rows = Vec::new();
+    for event in events {
+        let object_kind = event.involved_object.kind.as_deref();
+        let object_name = event.involved_object.name.as_deref();
+        let object_ns = event.involved_object.namespace.as_deref();
+
+        if let Some(filter) = filter {
+            if !object_matches_filter(object_kind, object_name, object_ns, filter) {
+                continue;
+            }
+        }
+
+        let source = event
+            .reporting_component
+            .clone()
+            .or_else(|| {
+                event
+                    .source
+                    .as_ref()
+                    .and_then(|source| source.component.clone())
+            })
+            .unwrap_or_else(|| "-".to_string());
+
+        rows.push(EventRow {
+            namespace: event
+                .metadata
+                .namespace
+                .clone()
+                .or_else(|| object_ns.map(str::to_string))
+                .unwrap_or_else(|| "-".to_string()),
+            event: event
+                .metadata
+                .name
+                .clone()
+                .unwrap_or_else(|| "-".to_string()),
+            last_seen: if event.last_timestamp.is_some() {
+                format_age(event.last_timestamp.as_ref())
+            } else if event.first_timestamp.is_some() {
+                format_age(event.first_timestamp.as_ref())
+            } else {
+                format_age_micro(event.event_time.as_ref())
+            },
+            type_: event.type_.clone().unwrap_or_else(|| "-".to_string()),
+            reason: event.reason.clone().unwrap_or_else(|| "-".to_string()),
+            object: format!(
+                "{}/{}",
+                event
+                    .involved_object
+                    .kind
+                    .clone()
+                    .unwrap_or_else(|| "-".to_string()),
+                event
+                    .involved_object
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| "-".to_string())
+            ),
+            source,
+            count: event.count.unwrap_or(1),
+            message: event.message.clone().unwrap_or_else(|| "-".to_string()),
+            sort_timestamp: event_sort_time_core(&event),
+        });
+    }
+    rows
+}
+
+fn render_events_rows(rows: &[EventRow], all_namespaces: bool, wide: bool) -> String {
+    if rows.is_empty() {
+        return "No resources found.".to_string();
+    }
+
+    let mut rows_out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let mut rendered = Vec::new();
+        if all_namespaces {
+            rendered.push(row.namespace.clone());
+        }
+        rendered.push(row.last_seen.clone());
+        rendered.push(row.type_.clone());
+        rendered.push(row.reason.clone());
+        rendered.push(row.object.clone());
+        if wide {
+            rendered.push(row.source.clone());
+            rendered.push(row.count.to_string());
+        }
+        rendered.push(row.message.clone());
+        rows_out.push(rendered);
+    }
+
+    let headers: Vec<&str> = if all_namespaces {
+        if wide {
+            vec![
+                "NAMESPACE",
+                "LAST SEEN",
+                "TYPE",
+                "REASON",
+                "OBJECT",
+                "SOURCE",
+                "COUNT",
+                "MESSAGE",
+            ]
+        } else {
+            vec![
+                "NAMESPACE",
+                "LAST SEEN",
+                "TYPE",
+                "REASON",
+                "OBJECT",
+                "MESSAGE",
+            ]
+        }
+    } else if wide {
+        vec![
+            "LAST SEEN",
+            "TYPE",
+            "REASON",
+            "OBJECT",
+            "SOURCE",
+            "COUNT",
+            "MESSAGE",
+        ]
+    } else {
+        vec!["LAST SEEN", "TYPE", "REASON", "OBJECT", "MESSAGE"]
+    };
+    render_table(&headers, &rows_out)
+}
+
+async fn execute_kubectl_events(
+    client: &Client,
+    config: &KubeClientConfig,
+    request: KubectlEventsRequest,
+) -> Result<String> {
+    let namespace = default_namespace(config, request.namespace.as_deref());
+    let mut rows = if request.all_namespaces {
+        let api: Api<EventsV1Event> = Api::all(client.clone());
+        match api.list(&ListParams::default()).await {
+            Ok(list) => convert_v1_event_rows(list.items, request.for_object.as_ref()),
+            Err(_) => {
+                let fallback_api: Api<CoreEvent> = Api::all(client.clone());
+                let fallback = fallback_api.list(&ListParams::default()).await?;
+                convert_core_event_rows(fallback.items, request.for_object.as_ref())
+            }
+        }
+    } else {
+        let api: Api<EventsV1Event> = Api::namespaced(client.clone(), &namespace);
+        match api.list(&ListParams::default()).await {
+            Ok(list) => convert_v1_event_rows(list.items, request.for_object.as_ref()),
+            Err(_) => {
+                let fallback_api: Api<CoreEvent> = Api::namespaced(client.clone(), &namespace);
+                let fallback = fallback_api.list(&ListParams::default()).await?;
+                convert_core_event_rows(fallback.items, request.for_object.as_ref())
+            }
+        }
+    };
+
+    if let Some(event_name) = request.event_name.as_deref() {
+        rows.retain(|row| row.event == event_name);
+    }
+
+    rows.sort_by(|left, right| {
+        right
+            .sort_timestamp
+            .cmp(&left.sort_timestamp)
+            .then_with(|| left.namespace.cmp(&right.namespace))
+            .then_with(|| left.object.cmp(&right.object))
+    });
+
+    Ok(render_events_rows(
+        &rows,
+        request.all_namespaces,
+        request.wide,
+    ))
+}
+
+async fn execute_kubectl_logs(
+    client: &Client,
+    config: &KubeClientConfig,
+    request: KubectlLogsRequest,
+) -> Result<String> {
+    let namespace = default_namespace(config, request.namespace.as_deref());
+    let pods: Api<Pod> = Api::namespaced(client.clone(), &namespace);
+
+    let base_log_params = LogParams {
+        container: request.container.clone(),
+        follow: false,
+        limit_bytes: request.limit_bytes,
+        pretty: false,
+        previous: request.previous,
+        since_seconds: request.since_seconds,
+        since_time: None,
+        tail_lines: request.tail_lines,
+        timestamps: request.timestamps,
+    };
+
+    if request.all_containers {
+        let pod = pods.get(&request.pod).await.with_context(|| {
+            format!(
+                "Pod '{}' introuvable dans le namespace '{}'",
+                request.pod, namespace
+            )
+        })?;
+        let mut container_names = Vec::new();
+        if let Some(spec) = pod.spec.as_ref() {
+            if let Some(init_containers) = spec.init_containers.as_ref() {
+                for container in init_containers {
+                    container_names.push(container.name.clone());
+                }
+            }
+            for container in &spec.containers {
+                container_names.push(container.name.clone());
+            }
+            if let Some(ephemeral_containers) = spec.ephemeral_containers.as_ref() {
+                for container in ephemeral_containers {
+                    container_names.push(container.name.clone());
+                }
+            }
+        }
+        container_names.sort();
+        container_names.dedup();
+        if container_names.is_empty() {
+            anyhow::bail!("Aucun conteneur detecte pour le pod '{}'.", request.pod);
+        }
+
+        let mut outputs = Vec::new();
+        for container in container_names {
+            let mut params = base_log_params.clone();
+            params.container = Some(container.clone());
+            let logs = pods.logs(&request.pod, &params).await.with_context(|| {
+                format!(
+                    "Lecture des logs impossible pour le conteneur '{}'.",
+                    container
+                )
+            })?;
+            outputs.push(format!("==> container/{container} <==\n{logs}"));
+        }
+        return Ok(outputs.join("\n\n"));
+    }
+
+    pods.logs(&request.pod, &base_log_params)
+        .await
+        .with_context(|| {
+            format!(
+                "Lecture des logs impossible pour le pod '{}' dans le namespace '{}'.",
+                request.pod, namespace
+            )
+        })
+}
+
+async fn execute_kubectl_describe(
+    client: &Client,
+    config: &KubeClientConfig,
+    request: KubectlDescribeRequest,
+) -> Result<String> {
+    let resolved = resolve_dynamic_resource(client, &request.resource).await?;
+    let mut objects = if request.names.is_empty() {
+        list_dynamic_objects(
+            client,
+            config,
+            &resolved,
+            request.namespace.as_deref(),
+            request.all_namespaces,
+            None,
+        )
+        .await?
+    } else {
+        get_named_dynamic_objects(
+            client,
+            config,
+            &resolved,
+            &request.names,
+            request.namespace.as_deref(),
+            request.all_namespaces,
+        )
+        .await?
+    };
+    sort_dynamic_objects(&mut objects);
+
+    if objects.is_empty() {
+        return Ok("No resources found.".to_string());
+    }
+
+    Ok(objects
+        .iter()
+        .map(|object| render_dynamic_describe_object(object, &resolved))
+        .collect::<Vec<String>>()
+        .join("\n\n---\n\n"))
+}
+
 async fn execute_kubectl_get(
     client: &Client,
     config: &KubeClientConfig,
     request: KubectlGetRequest,
 ) -> Result<String> {
+    if let Some(name) = request.name.clone() {
+        return match request.resource {
+            KubectlGetResource::Events => {
+                execute_kubectl_events(
+                    client,
+                    config,
+                    KubectlEventsRequest {
+                        namespace: request.namespace,
+                        all_namespaces: request.all_namespaces,
+                        wide: request.wide,
+                        for_object: None,
+                        event_name: Some(name),
+                    },
+                )
+                .await
+            }
+            KubectlGetResource::Nodes => {
+                let resolved = resolve_dynamic_resource(client, "nodes").await?;
+                let mut objects = get_named_dynamic_objects(
+                    client,
+                    config,
+                    &resolved,
+                    &[name],
+                    request.namespace.as_deref(),
+                    request.all_namespaces,
+                )
+                .await?;
+                sort_dynamic_objects(&mut objects);
+                Ok(render_dynamic_get_table(
+                    &resolved,
+                    &objects,
+                    request.all_namespaces,
+                    request.wide,
+                ))
+            }
+            KubectlGetResource::Namespaces => {
+                let resolved = resolve_dynamic_resource(client, "namespaces").await?;
+                let mut objects = get_named_dynamic_objects(
+                    client,
+                    config,
+                    &resolved,
+                    &[name],
+                    request.namespace.as_deref(),
+                    request.all_namespaces,
+                )
+                .await?;
+                sort_dynamic_objects(&mut objects);
+                Ok(render_dynamic_get_table(
+                    &resolved,
+                    &objects,
+                    request.all_namespaces,
+                    request.wide,
+                ))
+            }
+            KubectlGetResource::Pods => {
+                let resolved = resolve_dynamic_resource(client, "pods").await?;
+                let mut objects = get_named_dynamic_objects(
+                    client,
+                    config,
+                    &resolved,
+                    &[name],
+                    request.namespace.as_deref(),
+                    request.all_namespaces,
+                )
+                .await?;
+                sort_dynamic_objects(&mut objects);
+                Ok(render_dynamic_get_table(
+                    &resolved,
+                    &objects,
+                    request.all_namespaces,
+                    request.wide,
+                ))
+            }
+            KubectlGetResource::Dynamic(resource) => {
+                let resolved = resolve_dynamic_resource(client, &resource).await?;
+                let mut objects = get_named_dynamic_objects(
+                    client,
+                    config,
+                    &resolved,
+                    &[name],
+                    request.namespace.as_deref(),
+                    request.all_namespaces,
+                )
+                .await?;
+                sort_dynamic_objects(&mut objects);
+                Ok(render_dynamic_get_table(
+                    &resolved,
+                    &objects,
+                    request.all_namespaces,
+                    request.wide,
+                ))
+            }
+        };
+    }
+
     match request.resource {
         KubectlGetResource::Nodes => list_nodes(client, request.wide).await,
         KubectlGetResource::Namespaces => list_namespaces(client).await,
         KubectlGetResource::Pods => {
-            list_pods(client, config, request.all_namespaces, request.wide).await
+            list_pods(
+                client,
+                config,
+                request.namespace.as_deref(),
+                request.all_namespaces,
+                request.wide,
+            )
+            .await
         }
+        KubectlGetResource::Events => {
+            execute_kubectl_events(
+                client,
+                config,
+                KubectlEventsRequest {
+                    namespace: request.namespace,
+                    all_namespaces: request.all_namespaces,
+                    wide: request.wide,
+                    for_object: None,
+                    event_name: None,
+                },
+            )
+            .await
+        }
+        KubectlGetResource::Dynamic(resource) => {
+            let resolved = resolve_dynamic_resource(client, &resource).await?;
+            let mut objects = list_dynamic_objects(
+                client,
+                config,
+                &resolved,
+                request.namespace.as_deref(),
+                request.all_namespaces,
+                None,
+            )
+            .await?;
+            sort_dynamic_objects(&mut objects);
+            Ok(render_dynamic_get_table(
+                &resolved,
+                &objects,
+                request.all_namespaces,
+                request.wide,
+            ))
+        }
+    }
+}
+
+async fn execute_kubectl_command(
+    client: &Client,
+    config: &KubeClientConfig,
+    command: KubectlCommand,
+) -> Result<String> {
+    match command {
+        KubectlCommand::Get(request) => execute_kubectl_get(client, config, request).await,
+        KubectlCommand::Describe(request) => {
+            execute_kubectl_describe(client, config, request).await
+        }
+        KubectlCommand::Logs(request) => execute_kubectl_logs(client, config, request).await,
+        KubectlCommand::Events(request) => execute_kubectl_events(client, config, request).await,
     }
 }
 
@@ -2733,8 +4238,8 @@ async fn run_wsl_kubectl_exec(instance: &str, args: &[String]) -> Result<WslKube
     let command_line = build_kubectl_command_line(&context_name, args);
     let instance_log = escape_for_log(instance);
 
-    let request = match parse_kubectl_get_request(args) {
-        Ok(request) => request,
+    let command = match parse_kubectl_command(args) {
+        Ok(command) => command,
         Err(err) => {
             let message = err.to_string();
             warn!(
@@ -2769,7 +4274,7 @@ async fn run_wsl_kubectl_exec(instance: &str, args: &[String]) -> Result<WslKube
     let outcome = async {
         let (client, config, resolved_context, kubeconfig_path) =
             build_kube_client_for_instance(instance).await?;
-        let stdout = execute_kubectl_get(&client, &config, request).await?;
+        let stdout = execute_kubectl_command(&client, &config, command).await?;
         Ok::<(String, String, PathBuf), anyhow::Error>((stdout, resolved_context, kubeconfig_path))
     }
     .await;
