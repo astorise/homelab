@@ -228,6 +228,7 @@ const SERVICE_RPC_BASE_DELAY_MS: u64 = 750;
 const HTTP_SERVICE_NAME: &str = "HomeHttpService";
 const DNS_SERVICE_NAME: &str = "HomeDnsService";
 const MANAGED_KUBECONFIG_PREFIX: &str = "home-lab-wsl-";
+const K3S_BOOTSTRAP_TIMEOUT_SECONDS: u64 = 180;
 
 fn env_or_default_u16(var: &str, default: u16) -> u16 {
     match std::env::var(var) {
@@ -1028,7 +1029,7 @@ fn save_windows_kubeconfig(path: &Path, mut config: WindowsKubeconfig) -> Result
     Ok(())
 }
 
-fn read_instance_kubectl_config_view(instance: &str) -> Result<KubectlConfigView> {
+fn read_instance_kubectl_config_view_once(instance: &str) -> Result<KubectlConfigView> {
     let command_line = format_cli_command(
         "wsl.exe",
         &[
@@ -1098,6 +1099,96 @@ fn read_instance_kubectl_config_view(instance: &str) -> Result<KubectlConfigView
             instance, stdout_log, stderr_log
         )
     })
+}
+
+fn kubectl_view_has_required_entries(view: &KubectlConfigView) -> bool {
+    !view.contexts.is_empty() && !view.clusters.is_empty() && !view.users.is_empty()
+}
+
+fn bootstrap_k3s_for_instance_if_available(instance: &str) -> Result<()> {
+    let script = format!(
+        "set -euo pipefail; if [ ! -x /usr/local/bin/k3s-init.sh ]; then exit 0; fi; BOOTSTRAP_ONLY=1 BOOTSTRAP_TIMEOUT={} /usr/local/bin/k3s-init.sh",
+        K3S_BOOTSTRAP_TIMEOUT_SECONDS
+    );
+    let command_line = format_cli_command("wsl.exe", &["-d", instance, "--", "sh", "-lc", &script]);
+
+    let output = Command::new("wsl.exe")
+        .args(["-d", instance, "--", "sh", "-lc", &script])
+        .output()
+        .with_context(|| format!("Impossible d'executer k3s-init.sh pour {}", instance))?;
+
+    let stdout = decode_cli_output(&output.stdout);
+    let stderr = decode_cli_output(&output.stderr);
+    let stdout_trim = stdout.trim();
+    let stderr_trim = stderr.trim();
+    let stdout_log = escape_for_log(stdout_trim);
+    let stderr_log = escape_for_log(stderr_trim);
+
+    if !output.status.success() {
+        anyhow::bail!(
+            "k3s-init.sh a echoue pour {} (cmd={}): {}",
+            instance,
+            command_line,
+            if !stderr_trim.is_empty() {
+                stderr_trim
+            } else if !stdout_trim.is_empty() {
+                stdout_trim
+            } else {
+                "erreur inconnue"
+            }
+        );
+    }
+
+    info!(
+        target: "wsl",
+        instance = %instance,
+        command = %command_line,
+        stdout = %stdout_log,
+        stderr = %stderr_log,
+        "Bootstrap k3s termine"
+    );
+    log_wsl_event(format!(
+        "Bootstrap k3s pour {} termine: status={} stdout={} stderr={}",
+        escape_for_log(instance),
+        output.status,
+        stdout_log,
+        stderr_log
+    ));
+    Ok(())
+}
+
+fn read_instance_kubectl_config_view(instance: &str) -> Result<KubectlConfigView> {
+    let first = read_instance_kubectl_config_view_once(instance)?;
+    if kubectl_view_has_required_entries(&first) {
+        return Ok(first);
+    }
+
+    warn!(
+        target: "wsl",
+        instance = %instance,
+        contexts = first.contexts.len(),
+        clusters = first.clusters.len(),
+        users = first.users.len(),
+        "kubectl config view incomplet; tentative de bootstrap k3s"
+    );
+    log_wsl_event(format!(
+        "kubectl config view incomplet pour {} (contexts={}, clusters={}, users={}), tentative bootstrap k3s",
+        escape_for_log(instance),
+        first.contexts.len(),
+        first.clusters.len(),
+        first.users.len()
+    ));
+
+    bootstrap_k3s_for_instance_if_available(instance)?;
+    let second = read_instance_kubectl_config_view_once(instance)?;
+    if kubectl_view_has_required_entries(&second) {
+        return Ok(second);
+    }
+
+    anyhow::bail!(
+        "Aucun contexte kubectl disponible pour {} apres tentative de bootstrap k3s.",
+        instance
+    )
 }
 
 fn build_managed_kube_entry(instance: &str) -> Result<ManagedKubeEntry> {
@@ -2982,11 +3073,27 @@ fn kube_context_for_instance(instance: &str) -> String {
     managed_kube_base_name(instance)
 }
 
+fn kubeconfig_has_context(kubeconfig: &Kubeconfig, context_name: &str) -> bool {
+    kubeconfig
+        .contexts
+        .iter()
+        .any(|ctx| ctx.name == context_name)
+}
+
 async fn build_kube_client_for_instance(
     instance: &str,
 ) -> Result<(Client, KubeClientConfig, String, PathBuf)> {
     let context_name = kube_context_for_instance(instance);
     let kubeconfig_path = windows_kubeconfig_path()?;
+    if !kubeconfig_path.exists() {
+        info!(
+            target: "wsl",
+            context = %context_name,
+            kubeconfig = %kubeconfig_path.display(),
+            "Kubeconfig Windows absent; tentative de synchronisation automatique"
+        );
+        sync_windows_kubeconfig_task().await?;
+    }
     if !kubeconfig_path.exists() {
         anyhow::bail!(
             "Aucun kubeconfig Windows detecte sur {}. Lance d'abord la synchronisation kubeconfig.",
@@ -2994,22 +3101,42 @@ async fn build_kube_client_for_instance(
         );
     }
 
-    let kubeconfig = Kubeconfig::read_from(kubeconfig_path.clone()).with_context(|| {
+    let mut kubeconfig = Kubeconfig::read_from(kubeconfig_path.clone()).with_context(|| {
         format!(
             "Lecture du kubeconfig Windows impossible sur {}",
             kubeconfig_path.display()
         )
     })?;
 
-    if !kubeconfig
-        .contexts
-        .iter()
-        .any(|ctx| ctx.name == context_name)
-    {
-        anyhow::bail!(
-            "Contexte kubeconfig '{}' introuvable. Lance la synchronisation kubeconfig Windows depuis Home Lab.",
-            context_name
+    if !kubeconfig_has_context(&kubeconfig, &context_name) {
+        info!(
+            target: "wsl",
+            context = %context_name,
+            kubeconfig = %kubeconfig_path.display(),
+            "Contexte kubeconfig manquant; tentative de synchronisation automatique"
         );
+        let sync = sync_windows_kubeconfig_task().await?;
+        kubeconfig = Kubeconfig::read_from(kubeconfig_path.clone()).with_context(|| {
+            format!(
+                "Lecture du kubeconfig Windows impossible sur {} apres synchronisation automatique",
+                kubeconfig_path.display()
+            )
+        })?;
+        if !kubeconfig_has_context(&kubeconfig, &context_name) {
+            let hint = if sync.skipped.is_empty() {
+                "Aucune instance WSL n'a fourni de kubeconfig valide.".to_string()
+            } else {
+                format!(
+                    "Instances ignorees lors de la sync: {}",
+                    sync.skipped.join(" | ")
+                )
+            };
+            anyhow::bail!(
+                "Contexte kubeconfig '{}' introuvable apres synchronisation automatique. {}",
+                context_name,
+                hint
+            );
+        }
     }
 
     let options = KubeConfigOptions {
