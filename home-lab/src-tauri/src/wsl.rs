@@ -229,6 +229,9 @@ const HTTP_SERVICE_NAME: &str = "HomeHttpService";
 const DNS_SERVICE_NAME: &str = "HomeDnsService";
 const MANAGED_KUBECONFIG_PREFIX: &str = "home-lab-wsl-";
 const K3S_BOOTSTRAP_TIMEOUT_SECONDS: u64 = 180;
+const KUBECTL_EXEC_TIMEOUT_SECONDS: u64 = 25;
+const KUBE_CONNECT_TIMEOUT_SECONDS: u64 = 5;
+const KUBE_IO_TIMEOUT_SECONDS: u64 = 15;
 
 fn env_or_default_u16(var: &str, default: u16) -> u16 {
     match std::env::var(var) {
@@ -3143,9 +3146,13 @@ async fn build_kube_client_for_instance(
         context: Some(context_name.clone()),
         ..KubeConfigOptions::default()
     };
-    let config = KubeClientConfig::from_custom_kubeconfig(kubeconfig, &options)
+    let mut config = KubeClientConfig::from_custom_kubeconfig(kubeconfig, &options)
         .await
         .with_context(|| format!("Chargement du contexte kubeconfig '{}'", context_name))?;
+    // Guard against long hangs when the API endpoint is unreachable.
+    config.connect_timeout = Some(Duration::from_secs(KUBE_CONNECT_TIMEOUT_SECONDS));
+    config.read_timeout = Some(Duration::from_secs(KUBE_IO_TIMEOUT_SECONDS));
+    config.write_timeout = Some(Duration::from_secs(KUBE_IO_TIMEOUT_SECONDS));
     let client = Client::try_from(config.clone())
         .with_context(|| format!("Creation du client Kubernetes pour '{}'", context_name))?;
 
@@ -4398,16 +4405,16 @@ async fn run_wsl_kubectl_exec(instance: &str, args: &[String]) -> Result<WslKube
         instance_log, command_line
     ));
 
-    let outcome = async {
+    let outcome = tokio::time::timeout(Duration::from_secs(KUBECTL_EXEC_TIMEOUT_SECONDS), async {
         let (client, config, resolved_context, kubeconfig_path) =
             build_kube_client_for_instance(instance).await?;
         let stdout = execute_kubectl_command(&client, &config, command).await?;
         Ok::<(String, String, PathBuf), anyhow::Error>((stdout, resolved_context, kubeconfig_path))
-    }
+    })
     .await;
 
     match outcome {
-        Ok((stdout, resolved_context, kubeconfig_path)) => {
+        Ok(Ok((stdout, resolved_context, kubeconfig_path))) => {
             let stdout_log = escape_for_log(stdout.trim());
             info!(
                 target: "wsl",
@@ -4434,7 +4441,7 @@ async fn run_wsl_kubectl_exec(instance: &str, args: &[String]) -> Result<WslKube
                 stderr: String::new(),
             })
         }
-        Err(err) => {
+        Ok(Err(err)) => {
             let message = err.to_string();
             warn!(
                 target: "wsl",
@@ -4447,6 +4454,25 @@ async fn run_wsl_kubectl_exec(instance: &str, args: &[String]) -> Result<WslKube
                 "Commande kubectl en echec pour {}: status=1 stderr={}",
                 instance_log,
                 escape_for_log(&message)
+            ));
+            Ok(kubectl_error_result(instance, &command_line, message))
+        }
+        Err(_) => {
+            let message = format!(
+                "Timeout apres {}s lors de l'execution Kubernetes. \
+Verifie que k3s est demarre dans '{}' et que l'API est joignable depuis Windows.",
+                KUBECTL_EXEC_TIMEOUT_SECONDS, instance
+            );
+            warn!(
+                target: "wsl",
+                instance = %instance,
+                command = %command_line,
+                timeout_seconds = KUBECTL_EXEC_TIMEOUT_SECONDS,
+                "Commande kubectl en timeout via API Kubernetes"
+            );
+            log_wsl_event(format!(
+                "Commande kubectl en timeout pour {}: status=1 timeout={}s",
+                instance_log, KUBECTL_EXEC_TIMEOUT_SECONDS
             ));
             Ok(kubectl_error_result(instance, &command_line, message))
         }
