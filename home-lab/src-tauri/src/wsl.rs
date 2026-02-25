@@ -25,7 +25,7 @@ use regex::Regex;
 use rsa::pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding};
 use rsa::rand_core::{OsRng, RngCore};
 use rsa::RsaPrivateKey;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::json;
 use tauri::{AppHandle, Manager};
 use tracing::{error, info, warn};
@@ -117,11 +117,11 @@ struct KubeContextRef {
 
 #[derive(Deserialize)]
 struct KubectlConfigView {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_vec_or_null")]
     clusters: Vec<KubectlNamedCluster>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_vec_or_null")]
     users: Vec<KubectlNamedUser>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_vec_or_null")]
     contexts: Vec<KubectlNamedContext>,
     #[serde(rename = "current-context", default)]
     current_context: Option<String>,
@@ -151,6 +151,14 @@ struct KubectlContextRef {
     user: String,
     #[serde(default)]
     namespace: Option<String>,
+}
+
+fn deserialize_vec_or_null<'de, D, T>(deserializer: D) -> std::result::Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Ok(Option::<Vec<T>>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 struct ManagedKubeEntry {
@@ -1041,6 +1049,8 @@ fn read_instance_kubectl_config_view_once(instance: &str) -> Result<KubectlConfi
             "--",
             "/usr/local/bin/k3s",
             "kubectl",
+            "--kubeconfig",
+            "/etc/rancher/k3s/k3s.yaml",
             "config",
             "view",
             "--raw",
@@ -1056,6 +1066,8 @@ fn read_instance_kubectl_config_view_once(instance: &str) -> Result<KubectlConfi
             "--",
             "/usr/local/bin/k3s",
             "kubectl",
+            "--kubeconfig",
+            "/etc/rancher/k3s/k3s.yaml",
             "config",
             "view",
             "--raw",
