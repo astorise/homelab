@@ -15,6 +15,7 @@ RUN mkdir -p /usr/local/bin
 
 # Copy initialization scripts and environment
 COPY docker-image/k3s-env /etc/k3s-env
+COPY docker-image/wsl.conf /etc/wsl.conf
 COPY docker-image/fstab /etc/fstab
 COPY docker-image/mount_all.sh /usr/local/bin/mount_all.sh
 COPY docker-image/k3s-init.sh /usr/local/bin/k3s-init.sh
