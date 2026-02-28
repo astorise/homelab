@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
+use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -24,6 +25,7 @@ use kube::config::{KubeConfigOptions, Kubeconfig};
 use kube::discovery::{self, verbs, Discovery, Scope as DiscoveryScope};
 use kube::{Client, Config as KubeClientConfig, ResourceExt};
 use regex::Regex;
+use reqwest::Url;
 use rsa::pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding};
 use rsa::rand_core::{OsRng, RngCore};
 use rsa::RsaPrivateKey;
@@ -3230,9 +3232,108 @@ async fn ensure_wsl_instance_running(instance: &str, trace_id: &str) -> Result<(
     Ok(())
 }
 
-async fn wait_for_kube_api_port(instance: &str, trace_id: &str) -> Result<()> {
+async fn tcp_connect_once(
+    host: &str,
+    port: u16,
+    timeout: Duration,
+) -> std::result::Result<(), String> {
+    match tokio::time::timeout(timeout, TcpStream::connect((host, port))).await {
+        Ok(Ok(_stream)) => Ok(()),
+        Ok(Err(err)) => Err(err.to_string()),
+        Err(_) => Err("timeout TCP".to_string()),
+    }
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    let normalized = host.trim().to_ascii_lowercase();
+    if normalized == "localhost" {
+        return true;
+    }
+    normalized
+        .parse::<Ipv4Addr>()
+        .map(|addr| addr.is_loopback())
+        .unwrap_or(normalized == "::1")
+}
+
+async fn resolve_wsl_instance_ipv4(instance: &str) -> Result<String> {
+    let instance_owned = instance.to_string();
+    let output = tauri::async_runtime::spawn_blocking(move || {
+        Command::new("wsl.exe")
+            .args(["-d", &instance_owned, "--", "sh", "-lc", "ip route get 1"])
+            .output()
+    })
+    .await
+    .map_err(|e| anyhow!("Erreur JoinHandle lors de la resolution IP WSL: {e}"))?
+    .with_context(|| format!("Impossible de determiner l'IP WSL pour '{}'", instance))?;
+
+    let stdout = decode_cli_output(&output.stdout);
+    let stderr = decode_cli_output(&output.stderr);
+    if !output.status.success() {
+        let detail = if !stderr.trim().is_empty() {
+            stderr.trim().to_string()
+        } else if !stdout.trim().is_empty() {
+            stdout.trim().to_string()
+        } else {
+            format!(
+                "wsl.exe -d {} ip route get 1 a echoue ({})",
+                instance, output.status
+            )
+        };
+        anyhow::bail!("{detail}");
+    }
+
+    let re = Regex::new(r"src\s+([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)")
+        .context("Compilation regex IP WSL impossible")?;
+    let ip = re
+        .captures(stdout.trim())
+        .and_then(|captures| captures.get(1))
+        .map(|m| m.as_str().to_string())
+        .ok_or_else(|| anyhow!("IP WSL introuvable dans la sortie: {}", stdout.trim()))?;
+
+    if ip.parse::<Ipv4Addr>().is_err() {
+        anyhow::bail!("IP WSL invalide detectee: '{}'", ip);
+    }
+    Ok(ip)
+}
+
+async fn resolve_kube_api_host_for_instance(instance: &str, trace_id: &str) -> Result<String> {
     let api_port = k3s_api_port();
+    if tcp_connect_once("127.0.0.1", api_port, Duration::from_millis(700))
+        .await
+        .is_ok()
+    {
+        info!(
+            target: "wsl",
+            trace_id = %trace_id,
+            instance = %instance,
+            api_host = "127.0.0.1",
+            api_port = api_port,
+            "Endpoint API Kubernetes retenu (forward localhost)"
+        );
+        return Ok("127.0.0.1".to_string());
+    }
+
+    let wsl_ip = resolve_wsl_instance_ipv4(instance).await?;
+    info!(
+        target: "wsl",
+        trace_id = %trace_id,
+        instance = %instance,
+        api_host = %wsl_ip,
+        api_port = api_port,
+        "Endpoint API Kubernetes retenu (IP WSL)"
+    );
+    log_wsl_event(format!(
+        "[{trace_id}] Endpoint API Kubernetes pour {}: {}:{}",
+        escape_for_log(instance),
+        escape_for_log(&wsl_ip),
+        api_port
+    ));
+    Ok(wsl_ip)
+}
+
+async fn wait_for_kube_api_port(instance: &str, api_host: &str, trace_id: &str) -> Result<()> {
     let started_at = Instant::now();
+    let api_port = k3s_api_port();
     let timeout = Duration::from_secs(KUBE_API_READY_TIMEOUT_SECONDS);
     let mut attempt: u32 = 0;
     let mut last_error = String::new();
@@ -3241,41 +3342,34 @@ async fn wait_for_kube_api_port(instance: &str, trace_id: &str) -> Result<()> {
         if started_at.elapsed() >= timeout {
             let message = if last_error.trim().is_empty() {
                 format!(
-                    "API Kubernetes indisponible sur 127.0.0.1:{} apres {}s.",
-                    api_port, KUBE_API_READY_TIMEOUT_SECONDS
+                    "API Kubernetes indisponible sur {}:{} apres {}s.",
+                    api_host, api_port, KUBE_API_READY_TIMEOUT_SECONDS
                 )
             } else {
                 format!(
-                    "API Kubernetes indisponible sur 127.0.0.1:{} apres {}s (dernier essai: {}).",
-                    api_port, KUBE_API_READY_TIMEOUT_SECONDS, last_error
+                    "API Kubernetes indisponible sur {}:{} apres {}s (dernier essai: {}).",
+                    api_host, api_port, KUBE_API_READY_TIMEOUT_SECONDS, last_error
                 )
             };
             return Err(anyhow!(message));
         }
 
         attempt += 1;
-        match tokio::time::timeout(
-            Duration::from_millis(900),
-            TcpStream::connect(("127.0.0.1", api_port)),
-        )
-        .await
-        {
-            Ok(Ok(_stream)) => {
+        match tcp_connect_once(api_host, api_port, Duration::from_millis(900)).await {
+            Ok(()) => {
                 info!(
                     target: "wsl",
                     trace_id = %trace_id,
                     instance = %instance,
+                    api_host = %api_host,
                     api_port = api_port,
                     attempts = attempt,
                     "Port API Kubernetes joignable"
                 );
                 return Ok(());
             }
-            Ok(Err(err)) => {
+            Err(err) => {
                 last_error = err.to_string();
-            }
-            Err(_) => {
-                last_error = "timeout TCP".to_string();
             }
         }
 
@@ -3283,8 +3377,63 @@ async fn wait_for_kube_api_port(instance: &str, trace_id: &str) -> Result<()> {
     }
 }
 
+fn kubeconfig_cluster_for_context_mut<'a>(
+    kubeconfig: &'a mut Kubeconfig,
+    context_name: &str,
+) -> Option<&'a mut kube::config::Cluster> {
+    let cluster_name = kubeconfig
+        .contexts
+        .iter()
+        .find(|ctx| ctx.name == context_name)
+        .and_then(|named| named.context.as_ref())
+        .map(|ctx| ctx.cluster.clone())?;
+
+    kubeconfig
+        .clusters
+        .iter_mut()
+        .find(|named| named.name == cluster_name)
+        .and_then(|named| named.cluster.as_mut())
+}
+
+fn apply_kube_api_endpoint_override(
+    kubeconfig: &mut Kubeconfig,
+    context_name: &str,
+    api_host: &str,
+    api_port: u16,
+) -> Result<()> {
+    let Some(cluster) = kubeconfig_cluster_for_context_mut(kubeconfig, context_name) else {
+        anyhow::bail!(
+            "Cluster kubeconfig introuvable pour le contexte '{}'.",
+            context_name
+        );
+    };
+
+    let base_server = cluster
+        .server
+        .as_deref()
+        .and_then(|value| Url::parse(value).ok())
+        .map(|url| {
+            if url.scheme() == "http" {
+                "http".to_string()
+            } else {
+                "https".to_string()
+            }
+        })
+        .unwrap_or_else(|| "https".to_string());
+
+    cluster.server = Some(format!("{base_server}://{api_host}:{api_port}"));
+    if is_loopback_host(api_host) {
+        cluster.tls_server_name = None;
+    } else {
+        cluster.tls_server_name = Some("localhost".to_string());
+    }
+    cluster.proxy_url = None;
+    Ok(())
+}
+
 async fn build_kube_client_for_instance(
     instance: &str,
+    api_host: Option<&str>,
 ) -> Result<(Client, KubeClientConfig, String, PathBuf)> {
     let context_name = kube_context_for_instance(instance);
     let kubeconfig_path = windows_kubeconfig_path()?;
@@ -3340,6 +3489,24 @@ async fn build_kube_client_for_instance(
                 hint
             );
         }
+    }
+
+    if let Some(host) = api_host {
+        apply_kube_api_endpoint_override(&mut kubeconfig, &context_name, host, k3s_api_port())
+            .with_context(|| {
+                format!(
+                    "Application endpoint API Kubernetes impossible pour le contexte '{}'",
+                    context_name
+                )
+            })?;
+        info!(
+            target: "wsl",
+            instance = %instance,
+            context = %context_name,
+            api_host = %host,
+            api_port = k3s_api_port(),
+            "Endpoint API Kubernetes applique au kubeconfig en memoire"
+        );
     }
 
     let options = KubeConfigOptions {
@@ -4621,14 +4788,15 @@ async fn run_wsl_kubectl_exec(instance: &str, args: &[String]) -> Result<WslKube
         Duration::from_secs(KUBECTL_PREPARE_TIMEOUT_SECONDS),
         async {
             ensure_wsl_instance_running(instance, &trace_id).await?;
-            wait_for_kube_api_port(instance, &trace_id).await?;
-            Ok::<(), anyhow::Error>(())
+            let api_host = resolve_kube_api_host_for_instance(instance, &trace_id).await?;
+            wait_for_kube_api_port(instance, &api_host, &trace_id).await?;
+            Ok::<String, anyhow::Error>(api_host)
         },
     )
     .await;
 
-    match prepare_outcome {
-        Ok(Ok(())) => {}
+    let api_host = match prepare_outcome {
+        Ok(Ok(host)) => host,
         Ok(Err(err)) => {
             let message = err.to_string();
             warn!(
@@ -4655,10 +4823,8 @@ async fn run_wsl_kubectl_exec(instance: &str, args: &[String]) -> Result<WslKube
         Err(_) => {
             let message = format!(
                 "Timeout apres {}s lors de la preparation Kubernetes (demarrage instance/API). \
-Verifie que '{}' peut demarrer et exposer l'API sur 127.0.0.1:{}.",
-                KUBECTL_PREPARE_TIMEOUT_SECONDS,
-                instance,
-                k3s_api_port()
+Verifie que '{}' peut demarrer et exposer l'API Kubernetes.",
+                KUBECTL_PREPARE_TIMEOUT_SECONDS, instance
             );
             warn!(
                 target: "wsl",
@@ -4680,19 +4846,21 @@ Verifie que '{}' peut demarrer et exposer l'API sur 127.0.0.1:{}.",
                 message,
             ));
         }
-    }
+    };
 
     let trace_for_task = trace_id.clone();
     let instance_for_task = instance.to_string();
+    let api_host_for_task = api_host.clone();
     let mut operation = tauri::async_runtime::spawn(async move {
         info!(
             target: "wsl",
             trace_id = %trace_for_task,
             instance = %instance_for_task,
+            api_host = %api_host_for_task,
             "Initialisation du client Kubernetes"
         );
         let (client, config, resolved_context, kubeconfig_path) =
-            build_kube_client_for_instance(&instance_for_task).await?;
+            build_kube_client_for_instance(&instance_for_task, Some(&api_host_for_task)).await?;
         info!(
             target: "wsl",
             trace_id = %trace_for_task,
