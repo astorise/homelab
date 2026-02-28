@@ -3,8 +3,10 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use tokio::net::TcpStream;
 use tokio::time::{sleep, Duration};
 
 use crate::dns;
@@ -48,6 +50,8 @@ pub struct WslKubectlExecResult {
     instance: String,
     exit_code: Option<i32>,
     command: String,
+    trace_id: String,
+    duration_ms: u64,
     stdout: String,
     stderr: String,
 }
@@ -238,8 +242,11 @@ const DNS_SERVICE_NAME: &str = "HomeDnsService";
 const MANAGED_KUBECONFIG_PREFIX: &str = "home-lab-wsl-";
 const K3S_BOOTSTRAP_TIMEOUT_SECONDS: u64 = 180;
 const KUBECTL_EXEC_TIMEOUT_SECONDS: u64 = 25;
+const KUBECTL_PREPARE_TIMEOUT_SECONDS: u64 = 20;
 const KUBE_CONNECT_TIMEOUT_SECONDS: u64 = 5;
 const KUBE_IO_TIMEOUT_SECONDS: u64 = 15;
+const KUBE_API_READY_TIMEOUT_SECONDS: u64 = 15;
+const KUBE_API_READY_POLL_INTERVAL_MS: u64 = 350;
 
 fn env_or_default_u16(var: &str, default: u16) -> u16 {
     match std::env::var(var) {
@@ -842,6 +849,7 @@ fn format_cli_command(program: &str, args: &[&str]) -> String {
 }
 
 static WSL_LOG_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static KUBECTL_TRACE_SEQ: AtomicU64 = AtomicU64::new(1);
 
 fn wsl_log_lock() -> &'static Mutex<()> {
     WSL_LOG_LOCK.get_or_init(|| Mutex::new(()))
@@ -863,6 +871,19 @@ fn epoch_timestamp() -> String {
         }
         Err(_) => "0".to_string(),
     }
+}
+
+fn next_kubectl_trace_id() -> String {
+    let seq = KUBECTL_TRACE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0);
+    format!("k8s-{millis}-{seq}")
+}
+
+fn elapsed_ms(started_at: &Instant) -> u64 {
+    u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 fn append_wsl_log(message: &str) -> std::io::Result<()> {
@@ -2312,12 +2333,20 @@ fn build_kubectl_command_line(context_name: &str, args: &[String]) -> String {
     format_cli_command("kubectl", &refs)
 }
 
-fn kubectl_error_result(instance: &str, command: &str, message: String) -> WslKubectlExecResult {
+fn kubectl_error_result(
+    instance: &str,
+    command: &str,
+    trace_id: &str,
+    duration_ms: u64,
+    message: String,
+) -> WslKubectlExecResult {
     WslKubectlExecResult {
         ok: false,
         instance: instance.to_string(),
         exit_code: Some(1),
         command: command.to_string(),
+        trace_id: trace_id.to_string(),
+        duration_ms,
         stdout: String::new(),
         stderr: message,
     }
@@ -3095,6 +3124,165 @@ fn kubeconfig_has_context(kubeconfig: &Kubeconfig, context_name: &str) -> bool {
         .any(|ctx| ctx.name == context_name)
 }
 
+fn wsl_state_is_running(state: &str) -> bool {
+    let normalized = state.trim().to_lowercase();
+    normalized == "running"
+        || normalized.contains("running")
+        || normalized.contains("exécution")
+        || normalized.contains("execution")
+}
+
+async fn wsl_instance_state(instance: &str) -> Result<Option<String>> {
+    let target = instance.to_ascii_lowercase();
+    tauri::async_runtime::spawn_blocking(move || {
+        let instances = collect_wsl_instances()?;
+        Ok::<Option<String>, anyhow::Error>(
+            instances
+                .into_iter()
+                .find(|item| item.name.to_ascii_lowercase() == target)
+                .map(|item| item.state),
+        )
+    })
+    .await
+    .map_err(|e| anyhow!("Erreur JoinHandle lors de la lecture etat WSL: {e}"))?
+}
+
+async fn ensure_wsl_instance_running(instance: &str, trace_id: &str) -> Result<()> {
+    let Some(initial_state) = wsl_instance_state(instance).await? else {
+        anyhow::bail!("Instance WSL '{}' introuvable.", instance);
+    };
+
+    if wsl_state_is_running(&initial_state) {
+        info!(
+            target: "wsl",
+            trace_id = %trace_id,
+            instance = %instance,
+            state = %initial_state,
+            "Instance WSL deja demarree pour execution Kubernetes"
+        );
+        return Ok(());
+    }
+
+    info!(
+        target: "wsl",
+        trace_id = %trace_id,
+        instance = %instance,
+        state = %initial_state,
+        "Demarrage automatique de l'instance WSL pour execution Kubernetes"
+    );
+    log_wsl_event(format!(
+        "[{trace_id}] Demarrage auto de l'instance WSL {} (etat initial={})",
+        escape_for_log(instance),
+        escape_for_log(&initial_state)
+    ));
+
+    let instance_owned = instance.to_string();
+    let output = tauri::async_runtime::spawn_blocking(move || {
+        Command::new("wsl.exe")
+            .args(["-d", &instance_owned, "--", "sh", "-lc", "true"])
+            .output()
+    })
+    .await
+    .map_err(|e| anyhow!("Erreur JoinHandle lors du demarrage WSL: {e}"))?
+    .with_context(|| format!("Impossible de demarrer l'instance WSL '{}'", instance))?;
+
+    let stdout = decode_cli_output(&output.stdout);
+    let stderr = decode_cli_output(&output.stderr);
+    if !output.status.success() {
+        let detail = if !stderr.trim().is_empty() {
+            stderr.trim().to_string()
+        } else if !stdout.trim().is_empty() {
+            stdout.trim().to_string()
+        } else {
+            format!("wsl.exe -d {} a echoue ({})", instance, output.status)
+        };
+        anyhow::bail!("{detail}");
+    }
+
+    sleep(Duration::from_millis(300)).await;
+    let Some(final_state) = wsl_instance_state(instance).await? else {
+        anyhow::bail!(
+            "Instance WSL '{}' introuvable apres tentative de demarrage.",
+            instance
+        );
+    };
+
+    if !wsl_state_is_running(&final_state) {
+        anyhow::bail!(
+            "Instance WSL '{}' non demarree apres tentative automatique (etat='{}').",
+            instance,
+            final_state
+        );
+    }
+
+    info!(
+        target: "wsl",
+        trace_id = %trace_id,
+        instance = %instance,
+        state = %final_state,
+        "Instance WSL demarree pour execution Kubernetes"
+    );
+    log_wsl_event(format!(
+        "[{trace_id}] Instance WSL demarree: {} (etat={})",
+        escape_for_log(instance),
+        escape_for_log(&final_state)
+    ));
+    Ok(())
+}
+
+async fn wait_for_kube_api_port(instance: &str, trace_id: &str) -> Result<()> {
+    let api_port = k3s_api_port();
+    let started_at = Instant::now();
+    let timeout = Duration::from_secs(KUBE_API_READY_TIMEOUT_SECONDS);
+    let mut attempt: u32 = 0;
+    let mut last_error = String::new();
+
+    loop {
+        if started_at.elapsed() >= timeout {
+            let message = if last_error.trim().is_empty() {
+                format!(
+                    "API Kubernetes indisponible sur 127.0.0.1:{} apres {}s.",
+                    api_port, KUBE_API_READY_TIMEOUT_SECONDS
+                )
+            } else {
+                format!(
+                    "API Kubernetes indisponible sur 127.0.0.1:{} apres {}s (dernier essai: {}).",
+                    api_port, KUBE_API_READY_TIMEOUT_SECONDS, last_error
+                )
+            };
+            return Err(anyhow!(message));
+        }
+
+        attempt += 1;
+        match tokio::time::timeout(
+            Duration::from_millis(900),
+            TcpStream::connect(("127.0.0.1", api_port)),
+        )
+        .await
+        {
+            Ok(Ok(_stream)) => {
+                info!(
+                    target: "wsl",
+                    trace_id = %trace_id,
+                    instance = %instance,
+                    api_port = api_port,
+                    attempts = attempt,
+                    "Port API Kubernetes joignable"
+                );
+                return Ok(());
+            }
+            Ok(Err(err)) => {
+                last_error = err.to_string();
+            }
+            Err(_) => {
+                last_error = "timeout TCP".to_string();
+            }
+        }
+
+        sleep(Duration::from_millis(KUBE_API_READY_POLL_INTERVAL_MS)).await;
+    }
+}
+
 async fn build_kube_client_for_instance(
     instance: &str,
 ) -> Result<(Client, KubeClientConfig, String, PathBuf)> {
@@ -3165,6 +3353,8 @@ async fn build_kube_client_for_instance(
     config.connect_timeout = Some(Duration::from_secs(KUBE_CONNECT_TIMEOUT_SECONDS));
     config.read_timeout = Some(Duration::from_secs(KUBE_IO_TIMEOUT_SECONDS));
     config.write_timeout = Some(Duration::from_secs(KUBE_IO_TIMEOUT_SECONDS));
+    // Ignore system proxy settings for local k3s API access via 127.0.0.1.
+    config.proxy_url = None;
     let client = Client::try_from(config.clone())
         .with_context(|| format!("Creation du client Kubernetes pour '{}'", context_name))?;
 
@@ -4380,6 +4570,8 @@ async fn run_wsl_kubectl_exec(instance: &str, args: &[String]) -> Result<WslKube
         return Err(anyhow!("La commande kubectl est requise."));
     }
 
+    let started_at = Instant::now();
+    let trace_id = next_kubectl_trace_id();
     let context_name = kube_context_for_instance(instance);
     let command_line = build_kubectl_command_line(&context_name, args);
     let instance_log = escape_for_log(instance);
@@ -4390,55 +4582,153 @@ async fn run_wsl_kubectl_exec(instance: &str, args: &[String]) -> Result<WslKube
             let message = err.to_string();
             warn!(
                 target: "wsl",
+                trace_id = %trace_id,
                 instance = %instance,
                 command = %command_line,
                 error = %message,
                 "Commande kubectl refusee (syntaxe non supportee)"
             );
             log_wsl_event(format!(
-                "Commande kubectl refusee pour {} via {}: {}",
+                "[{trace_id}] Commande kubectl refusee pour {} via {}: {}",
                 instance_log,
                 command_line,
                 escape_for_log(&message)
             ));
-            return Ok(kubectl_error_result(instance, &command_line, message));
+            return Ok(kubectl_error_result(
+                instance,
+                &command_line,
+                &trace_id,
+                elapsed_ms(&started_at),
+                message,
+            ));
         }
     };
 
     info!(
         target: "wsl",
+        trace_id = %trace_id,
         instance = %instance,
         command = %command_line,
         context = %context_name,
         "Execution kubectl via client Kubernetes Rust"
     );
     log_wsl_event(format!(
-        "Execution kubectl pour {} via API Kubernetes: {}",
+        "[{trace_id}] Execution kubectl pour {} via API Kubernetes: {}",
         instance_log, command_line
     ));
 
-    let outcome = tokio::time::timeout(Duration::from_secs(KUBECTL_EXEC_TIMEOUT_SECONDS), async {
+    let prepare_outcome = tokio::time::timeout(
+        Duration::from_secs(KUBECTL_PREPARE_TIMEOUT_SECONDS),
+        async {
+            ensure_wsl_instance_running(instance, &trace_id).await?;
+            wait_for_kube_api_port(instance, &trace_id).await?;
+            Ok::<(), anyhow::Error>(())
+        },
+    )
+    .await;
+
+    match prepare_outcome {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+            let message = err.to_string();
+            warn!(
+                target: "wsl",
+                trace_id = %trace_id,
+                instance = %instance,
+                command = %command_line,
+                error = %message,
+                "Preparation Kubernetes en echec"
+            );
+            log_wsl_event(format!(
+                "[{trace_id}] Preparation Kubernetes en echec pour {}: {}",
+                instance_log,
+                escape_for_log(&message)
+            ));
+            return Ok(kubectl_error_result(
+                instance,
+                &command_line,
+                &trace_id,
+                elapsed_ms(&started_at),
+                message,
+            ));
+        }
+        Err(_) => {
+            let message = format!(
+                "Timeout apres {}s lors de la preparation Kubernetes (demarrage instance/API). \
+Verifie que '{}' peut demarrer et exposer l'API sur 127.0.0.1:{}.",
+                KUBECTL_PREPARE_TIMEOUT_SECONDS,
+                instance,
+                k3s_api_port()
+            );
+            warn!(
+                target: "wsl",
+                trace_id = %trace_id,
+                instance = %instance,
+                command = %command_line,
+                timeout_seconds = KUBECTL_PREPARE_TIMEOUT_SECONDS,
+                "Preparation Kubernetes en timeout"
+            );
+            log_wsl_event(format!(
+                "[{trace_id}] Preparation Kubernetes en timeout pour {}: timeout={}s",
+                instance_log, KUBECTL_PREPARE_TIMEOUT_SECONDS
+            ));
+            return Ok(kubectl_error_result(
+                instance,
+                &command_line,
+                &trace_id,
+                elapsed_ms(&started_at),
+                message,
+            ));
+        }
+    }
+
+    let trace_for_task = trace_id.clone();
+    let instance_for_task = instance.to_string();
+    let mut operation = tauri::async_runtime::spawn(async move {
+        info!(
+            target: "wsl",
+            trace_id = %trace_for_task,
+            instance = %instance_for_task,
+            "Initialisation du client Kubernetes"
+        );
         let (client, config, resolved_context, kubeconfig_path) =
-            build_kube_client_for_instance(instance).await?;
+            build_kube_client_for_instance(&instance_for_task).await?;
+        info!(
+            target: "wsl",
+            trace_id = %trace_for_task,
+            instance = %instance_for_task,
+            context = %resolved_context,
+            kubeconfig = %kubeconfig_path.display(),
+            "Client Kubernetes initialise"
+        );
         let stdout = execute_kubectl_command(&client, &config, command).await?;
         Ok::<(String, String, PathBuf), anyhow::Error>((stdout, resolved_context, kubeconfig_path))
-    })
+    });
+
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(KUBECTL_EXEC_TIMEOUT_SECONDS),
+        &mut operation,
+    )
     .await;
 
     match outcome {
-        Ok(Ok((stdout, resolved_context, kubeconfig_path))) => {
+        Ok(Ok(Ok((stdout, resolved_context, kubeconfig_path)))) => {
             let stdout_log = escape_for_log(stdout.trim());
+            let duration_ms = elapsed_ms(&started_at);
             info!(
                 target: "wsl",
+                trace_id = %trace_id,
                 instance = %instance,
                 context = %resolved_context,
                 kubeconfig = %kubeconfig_path.display(),
+                duration_ms = duration_ms,
                 stdout = %stdout_log,
                 "Commande kubectl terminee via API Kubernetes"
             );
             log_wsl_event(format!(
-                "Commande kubectl terminee pour {}: status=0 context={} kubeconfig={} stdout={}",
+                "[{trace_id}] Commande kubectl terminee pour {}: status=0 duration_ms={} context={} kubeconfig={} stdout={}",
                 instance_log,
+                duration_ms,
                 escape_for_log(&resolved_context),
                 escape_for_log(&kubeconfig_path.display().to_string()),
                 stdout_log
@@ -4449,27 +4739,60 @@ async fn run_wsl_kubectl_exec(instance: &str, args: &[String]) -> Result<WslKube
                 instance: instance.to_string(),
                 exit_code: Some(0),
                 command: command_line,
+                trace_id,
+                duration_ms,
                 stdout,
                 stderr: String::new(),
             })
         }
-        Ok(Err(err)) => {
+        Ok(Ok(Err(err))) => {
             let message = err.to_string();
             warn!(
                 target: "wsl",
+                trace_id = %trace_id,
                 instance = %instance,
                 command = %command_line,
                 error = %message,
                 "Commande kubectl en echec via API Kubernetes"
             );
             log_wsl_event(format!(
-                "Commande kubectl en echec pour {}: status=1 stderr={}",
+                "[{trace_id}] Commande kubectl en echec pour {}: status=1 stderr={}",
                 instance_log,
                 escape_for_log(&message)
             ));
-            Ok(kubectl_error_result(instance, &command_line, message))
+            Ok(kubectl_error_result(
+                instance,
+                &command_line,
+                &trace_id,
+                elapsed_ms(&started_at),
+                message,
+            ))
+        }
+        Ok(Err(join_err)) => {
+            let message = format!("Execution Kubernetes interrompue: {join_err}");
+            error!(
+                target: "wsl",
+                trace_id = %trace_id,
+                instance = %instance,
+                command = %command_line,
+                error = %message,
+                "JoinHandle kubectl en echec"
+            );
+            log_wsl_event(format!(
+                "[{trace_id}] JoinHandle kubectl en echec pour {}: {}",
+                instance_log,
+                escape_for_log(&message)
+            ));
+            Ok(kubectl_error_result(
+                instance,
+                &command_line,
+                &trace_id,
+                elapsed_ms(&started_at),
+                message,
+            ))
         }
         Err(_) => {
+            operation.abort();
             let message = format!(
                 "Timeout apres {}s lors de l'execution Kubernetes. \
 Verifie que k3s est demarre dans '{}' et que l'API est joignable depuis Windows.",
@@ -4477,16 +4800,23 @@ Verifie que k3s est demarre dans '{}' et que l'API est joignable depuis Windows.
             );
             warn!(
                 target: "wsl",
+                trace_id = %trace_id,
                 instance = %instance,
                 command = %command_line,
                 timeout_seconds = KUBECTL_EXEC_TIMEOUT_SECONDS,
                 "Commande kubectl en timeout via API Kubernetes"
             );
             log_wsl_event(format!(
-                "Commande kubectl en timeout pour {}: status=1 timeout={}s",
+                "[{trace_id}] Commande kubectl en timeout pour {}: status=1 timeout={}s",
                 instance_log, KUBECTL_EXEC_TIMEOUT_SECONDS
             ));
-            Ok(kubectl_error_result(instance, &command_line, message))
+            Ok(kubectl_error_result(
+                instance,
+                &command_line,
+                &trace_id,
+                elapsed_ms(&started_at),
+                message,
+            ))
         }
     }
 }

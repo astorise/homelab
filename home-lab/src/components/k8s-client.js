@@ -184,10 +184,20 @@ class K8sClient extends HTMLElement {
     }
 
     this._running = true;
+    const startedAt = Date.now();
     this.setMessage('running', `Execution kubectl sur ${instance}...`);
+    // eslint-disable-next-line no-console
+    console.info('[k8s-client] kubectl start', { instance, args });
     try {
       const result = await wsl_kubectl_exec(instance, args);
       this._result = result;
+      // eslint-disable-next-line no-console
+      console.info('[k8s-client] kubectl result', {
+        instance,
+        elapsed_ms: Date.now() - startedAt,
+        trace_id: result?.trace_id,
+        ok: !!result?.ok,
+      });
       if (result?.ok) {
         this.setMessage('success', `Commande terminee sur ${instance}.`);
       } else {
@@ -202,6 +212,12 @@ class K8sClient extends HTMLElement {
       this._result = null;
       this.setMessage('error', message);
       showError(message);
+      // eslint-disable-next-line no-console
+      console.error('[k8s-client] kubectl error', {
+        instance,
+        elapsed_ms: Date.now() - startedAt,
+        error: message,
+      });
     } finally {
       this._running = false;
       this.render();
@@ -216,6 +232,11 @@ class K8sClient extends HTMLElement {
     const command = escapeHtml(this._result.command || '');
     const stdout = String(this._result.stdout || '');
     const stderr = String(this._result.stderr || '');
+    const traceId = String(this._result.trace_id || '').trim();
+    const durationRaw = Number(this._result.duration_ms);
+    const durationMs = Number.isFinite(durationRaw) && durationRaw >= 0
+      ? Math.round(durationRaw)
+      : null;
     const hasStdout = stdout.trim().length > 0;
     const hasStderr = stderr.trim().length > 0;
     const statusText = this._result.ok
@@ -225,6 +246,11 @@ class K8sClient extends HTMLElement {
     return `
       <div class="mt-3 rounded border border-gray-200 bg-white p-3">
         <p class="text-[11px] text-gray-500">Commande: <code>${command}</code></p>
+        ${
+          traceId || durationMs !== null
+            ? `<p class="mt-1 text-[11px] text-gray-500">${traceId ? `trace_id: <code>${escapeHtml(traceId)}</code>` : ''}${traceId && durationMs !== null ? ' · ' : ''}${durationMs !== null ? `duree: ${escapeHtml(String(durationMs))} ms` : ''}</p>`
+            : ''
+        }
         <p class="mt-1 text-xs font-semibold ${this._result.ok ? 'text-green-600' : 'text-red-600'}">${statusText}</p>
         ${hasStdout ? `<div class="mt-2"><p class="text-xs font-semibold text-gray-700">stdout</p><pre class="mt-1 max-h-56 overflow-auto rounded bg-gray-900 p-2 text-[11px] leading-relaxed text-gray-100">${escapeHtml(stdout)}</pre></div>` : ''}
         ${hasStderr ? `<div class="mt-2"><p class="text-xs font-semibold text-gray-700">stderr</p><pre class="mt-1 max-h-40 overflow-auto rounded bg-red-950 p-2 text-[11px] leading-relaxed text-red-100">${escapeHtml(stderr)}</pre></div>` : ''}

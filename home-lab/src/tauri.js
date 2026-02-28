@@ -592,5 +592,26 @@ export async function wsl_kubectl_exec(instance, args = []) {
     throw new Error('La commande kubectl est requise.');
   }
 
-  return safeInvoke('wsl_kubectl_exec', { instance: value, args: commandArgs });
+  const startedAt = Date.now();
+  // eslint-disable-next-line no-console
+  console.info('[tauri.js] wsl_kubectl_exec invoke', { instance: value, args: commandArgs });
+  try {
+    const result = await safeInvoke('wsl_kubectl_exec', { instance: value, args: commandArgs });
+    // eslint-disable-next-line no-console
+    console.info('[tauri.js] wsl_kubectl_exec result', {
+      instance: value,
+      elapsed_ms: Date.now() - startedAt,
+      trace_id: result?.trace_id,
+      ok: !!result?.ok,
+    });
+    return result;
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.error('[tauri.js] wsl_kubectl_exec error', {
+      instance: value,
+      elapsed_ms: Date.now() - startedAt,
+      error: err?.message || String(err),
+    });
+    throw err;
+  }
 }
