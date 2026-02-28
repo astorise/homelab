@@ -3431,6 +3431,46 @@ fn apply_kube_api_endpoint_override(
     Ok(())
 }
 
+fn ensure_rustls_crypto_provider(trace_id: &str, instance: &str) -> Result<()> {
+    if rustls::crypto::CryptoProvider::get_default().is_some() {
+        return Ok(());
+    }
+
+    if rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .is_ok()
+    {
+        info!(
+            target: "wsl",
+            trace_id = %trace_id,
+            instance = %instance,
+            provider = "aws-lc-rs",
+            "Provider TLS Rustls installe"
+        );
+        return Ok(());
+    }
+
+    if rustls::crypto::ring::default_provider()
+        .install_default()
+        .is_ok()
+    {
+        info!(
+            target: "wsl",
+            trace_id = %trace_id,
+            instance = %instance,
+            provider = "ring",
+            "Provider TLS Rustls installe"
+        );
+        return Ok(());
+    }
+
+    if rustls::crypto::CryptoProvider::get_default().is_some() {
+        return Ok(());
+    }
+
+    anyhow::bail!("Impossible d'initialiser le provider TLS Rustls (aws-lc-rs/ring).");
+}
+
 async fn build_kube_client_for_instance(
     instance: &str,
     api_host: Option<&str>,
@@ -4771,6 +4811,30 @@ async fn run_wsl_kubectl_exec(instance: &str, args: &[String]) -> Result<WslKube
         }
     };
 
+    if let Err(err) = ensure_rustls_crypto_provider(&trace_id, instance) {
+        let message = err.to_string();
+        warn!(
+            target: "wsl",
+            trace_id = %trace_id,
+            instance = %instance,
+            command = %command_line,
+            error = %message,
+            "Initialisation provider TLS Rustls en echec"
+        );
+        log_wsl_event(format!(
+            "[{trace_id}] Initialisation provider TLS Rustls en echec pour {}: {}",
+            instance_log,
+            escape_for_log(&message)
+        ));
+        return Ok(kubectl_error_result(
+            instance,
+            &command_line,
+            &trace_id,
+            elapsed_ms(&started_at),
+            message,
+        ));
+    }
+
     info!(
         target: "wsl",
         trace_id = %trace_id,
@@ -4852,6 +4916,7 @@ Verifie que '{}' peut demarrer et exposer l'API Kubernetes.",
     let instance_for_task = instance.to_string();
     let api_host_for_task = api_host.clone();
     let mut operation = tauri::async_runtime::spawn(async move {
+        ensure_rustls_crypto_provider(&trace_for_task, &instance_for_task)?;
         info!(
             target: "wsl",
             trace_id = %trace_for_task,
