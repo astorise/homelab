@@ -1,4 +1,9 @@
-import { wsl_kubectl_exec, wsl_list_instances, wsl_sync_windows_kubeconfig } from '../tauri.js';
+import {
+  wsl_kubectl_apply_yaml,
+  wsl_kubectl_exec,
+  wsl_list_instances,
+  wsl_sync_windows_kubeconfig,
+} from '../tauri.js';
 import { showError } from './toast.js';
 
 const escapeHtml = (value) =>
@@ -95,6 +100,8 @@ class K8sClient extends HTMLElement {
     this._messageState = 'idle';
     this._kubeconfigPath = '';
     this._result = null;
+    this._applyFile = null;
+    this._applyFileName = '';
   }
 
   connectedCallback() {
@@ -224,6 +231,81 @@ class K8sClient extends HTMLElement {
     }
   }
 
+  async applyUploadedYaml() {
+    if (this._running) return;
+
+    const instance = String(this._selectedInstance || '').trim();
+    if (!instance) {
+      showError('Selectionne une instance WSL.');
+      return;
+    }
+
+    if (!this._applyFile) {
+      showError('Selectionne un fichier YAML a appliquer.');
+      return;
+    }
+
+    const file = this._applyFile;
+    let manifestYaml = '';
+    try {
+      manifestYaml = await file.text();
+    } catch (err) {
+      const message = err?.message || String(err);
+      this.setMessage('error', message);
+      showError(message);
+      return;
+    }
+
+    if (!manifestYaml.trim()) {
+      showError('Le fichier YAML selectionne est vide.');
+      return;
+    }
+
+    this._running = true;
+    const startedAt = Date.now();
+    this.setMessage('running', `Application YAML sur ${instance}...`);
+    // eslint-disable-next-line no-console
+    console.info('[k8s-client] kubectl apply start', {
+      instance,
+      file: file.name,
+      bytes: manifestYaml.length,
+    });
+    try {
+      const result = await wsl_kubectl_apply_yaml(instance, manifestYaml, file.name);
+      this._result = result;
+      // eslint-disable-next-line no-console
+      console.info('[k8s-client] kubectl apply result', {
+        instance,
+        elapsed_ms: Date.now() - startedAt,
+        trace_id: result?.trace_id,
+        ok: !!result?.ok,
+      });
+      if (result?.ok) {
+        this.setMessage('success', `Apply YAML termine sur ${instance}.`);
+      } else {
+        const stderr = (result?.stderr || '').trim();
+        const fallback = `Apply YAML a echoue sur ${instance}.`;
+        const message = stderr || fallback;
+        this.setMessage('error', message);
+        showError(message);
+      }
+    } catch (err) {
+      const message = err?.message || String(err);
+      this._result = null;
+      this.setMessage('error', message);
+      showError(message);
+      // eslint-disable-next-line no-console
+      console.error('[k8s-client] kubectl apply error', {
+        instance,
+        elapsed_ms: Date.now() - startedAt,
+        error: message,
+      });
+    } finally {
+      this._running = false;
+      this.render();
+    }
+  }
+
   renderResult() {
     if (!this._result || typeof this._result !== 'object') {
       return '<p class="mt-3 text-xs text-gray-500">Aucun resultat pour le moment.</p>';
@@ -259,6 +341,7 @@ class K8sClient extends HTMLElement {
 
   render() {
     const disableRun = this._running || this._loading || this._instances.length === 0;
+    const disableApply = disableRun || !this._applyFile;
     const disableSync = this._running || this._syncingKubeconfig;
     const message = this._message
       ? `<p class="mt-3 text-sm ${
@@ -350,6 +433,33 @@ class K8sClient extends HTMLElement {
           ${this._running ? 'Execution...' : 'Executer'}
         </button>
 
+        <div class="mt-4 rounded border border-gray-200 bg-white p-3">
+          <p class="text-xs font-semibold text-gray-700">Apply YAML (upload fichier)</p>
+          <p class="mt-1 text-[11px] text-gray-500">
+            Selectionne un fichier <code>.yaml</code>/<code>.yml</code> puis applique le manifest via l'API Kubernetes.
+          </p>
+          <input
+            data-role="apply-file"
+            type="file"
+            accept=".yaml,.yml,text/yaml,application/x-yaml,application/yaml"
+            class="mt-2 block w-full text-xs text-gray-700 file:mr-3 file:rounded file:border file:border-gray-300 file:bg-white file:px-2 file:py-1 file:text-xs file:font-semibold file:text-gray-700 hover:file:bg-gray-50"
+            ${this._running ? 'disabled' : ''}
+          />
+          ${
+            this._applyFileName
+              ? `<p class="mt-2 text-[11px] text-gray-500">Fichier: <code>${escapeHtml(this._applyFileName)}</code></p>`
+              : '<p class="mt-2 text-[11px] text-gray-500">Aucun fichier selectionne.</p>'
+          }
+          <button
+            type="button"
+            data-action="apply-upload"
+            class="mt-2 px-3 py-2 rounded bg-emerald-600 text-white text-sm font-semibold disabled:opacity-50 disabled:cursor-not-allowed"
+            ${disableApply ? 'disabled' : ''}
+          >
+            ${this._running ? 'Application...' : 'Uploader et appliquer'}
+          </button>
+        </div>
+
         ${message}
         ${this.renderResult()}
       </div>
@@ -360,6 +470,8 @@ class K8sClient extends HTMLElement {
     const refreshBtn = this.querySelector('[data-action="refresh"]');
     const syncKubeconfigBtn = this.querySelector('[data-action="sync-kubeconfig"]');
     const runBtn = this.querySelector('[data-action="run"]');
+    const applyFileInput = this.querySelector('[data-role="apply-file"]');
+    const applyUploadBtn = this.querySelector('[data-action="apply-upload"]');
 
     if (instanceSelect) {
       instanceSelect.addEventListener('change', (event) => {
@@ -390,6 +502,19 @@ class K8sClient extends HTMLElement {
 
     if (runBtn) {
       runBtn.addEventListener('click', () => this.runCommand());
+    }
+
+    if (applyFileInput) {
+      applyFileInput.addEventListener('change', (event) => {
+        const file = event?.target?.files?.[0] || null;
+        this._applyFile = file;
+        this._applyFileName = file?.name || '';
+        this.render();
+      });
+    }
+
+    if (applyUploadBtn) {
+      applyUploadBtn.addEventListener('click', () => this.applyUploadedYaml());
     }
 
     this.querySelectorAll('[data-quick]').forEach((button) => {
