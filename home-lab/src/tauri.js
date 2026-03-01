@@ -611,7 +611,11 @@ export async function oidc_register_client(payload = {}) {
 export async function oidc_remove_client(clientId) {
   const value = typeof clientId === 'string' ? clientId.trim() : '';
   if (!value) throw new Error("L'identifiant client est requis pour la suppression.");
-  return safeInvoke('oidc_remove_client', { client_id: value });
+  const result = await safeInvoke('oidc_remove_client', { client_id: value });
+  if (!result?.ok) {
+    throw new Error(result?.message || `Suppression du client OIDC '${value}' impossible.`);
+  }
+  return result;
 }
 
 export async function wsl_import_instance(options = {}) {
