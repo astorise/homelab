@@ -391,8 +391,10 @@ async function mockInvoke(cmd, args = {}) {
 
     case 'wsl_kubectl_apply_yaml': {
       const instance = (args?.instance || '').trim();
-      const manifestYaml = typeof args?.manifest_yaml === 'string' ? args.manifest_yaml : '';
-      const sourceName = (args?.source_name || '').trim() || '<uploaded-yaml>';
+      const manifestYaml = typeof args?.manifestYaml === 'string'
+        ? args.manifestYaml
+        : (typeof args?.manifest_yaml === 'string' ? args.manifest_yaml : '');
+      const sourceName = (args?.sourceName || args?.source_name || '').trim() || '<uploaded-yaml>';
       const context = `home-lab-wsl-${toManagedContextId(instance)}`;
       const command = `kubectl --context "${context}" apply -f ${sourceName}`;
       const startedAt = Date.now();
@@ -704,6 +706,16 @@ export async function wsl_kubectl_apply_yaml(instance, manifestYaml, sourceName 
 
   const source = typeof sourceName === 'string' ? sourceName.trim() : '';
   const startedAt = Date.now();
+  const invokeWithCamelCase = () => safeInvoke('wsl_kubectl_apply_yaml', {
+    instance: value,
+    manifestYaml: yaml,
+    sourceName: source || null,
+  });
+  const invokeWithSnakeCase = () => safeInvoke('wsl_kubectl_apply_yaml', {
+    instance: value,
+    manifest_yaml: yaml,
+    source_name: source || null,
+  });
   // eslint-disable-next-line no-console
   console.info('[tauri.js] wsl_kubectl_apply_yaml invoke', {
     instance: value,
@@ -711,11 +723,22 @@ export async function wsl_kubectl_apply_yaml(instance, manifestYaml, sourceName 
     bytes: yaml.length,
   });
   try {
-    const result = await safeInvoke('wsl_kubectl_apply_yaml', {
-      instance: value,
-      manifest_yaml: yaml,
-      source_name: source || null,
-    });
+    let result;
+    try {
+      result = await invokeWithCamelCase();
+    } catch (firstErr) {
+      const firstMessage = String(firstErr?.message || firstErr || '');
+      const shouldRetrySnakeCase = /manifest[_]?yaml|source[_]?name|unknown field|missing required key|invalid args/i.test(firstMessage);
+      if (!shouldRetrySnakeCase) {
+        throw firstErr;
+      }
+      // eslint-disable-next-line no-console
+      console.warn('[tauri.js] wsl_kubectl_apply_yaml retry with snake_case args', {
+        instance: value,
+        reason: firstMessage,
+      });
+      result = await invokeWithSnakeCase();
+    }
     // eslint-disable-next-line no-console
     console.info('[tauri.js] wsl_kubectl_apply_yaml result', {
       instance: value,
