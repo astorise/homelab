@@ -134,9 +134,8 @@ async fn connect_client() -> Result<DnsClient, String> {
                         pipe
                     );
                     if sampled_failures.len() < DIAG_MAX_FAILURES {
-                        sampled_failures.push(format!(
-                            "attempt={attempt}, pipe={pipe}, error={err_dbg}"
-                        ));
+                        sampled_failures
+                            .push(format!("attempt={attempt}, pipe={pipe}, error={err_dbg}"));
                     }
                     last_error = Some(err_dbg);
                 }

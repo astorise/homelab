@@ -199,6 +199,7 @@ pub fn run() {
             wsl::wsl_sync_windows_kubeconfig,
             wsl::wsl_remove_instance,
             wsl::wsl_kubectl_exec,
+            wsl::wsl_kubectl_apply_yaml,
             ui::ui_log,
         ])
         .run(tauri::generate_context!())

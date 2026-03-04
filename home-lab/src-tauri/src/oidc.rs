@@ -343,7 +343,7 @@ pub async fn oidc_register_client(payload: RegisterClientIn) -> Result<AckOut, S
     register_client_config(payload).await
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 #[instrument(level = "debug")]
 pub async fn oidc_remove_client(client_id: String) -> Result<AckOut, String> {
     remove_client_config(&client_id).await

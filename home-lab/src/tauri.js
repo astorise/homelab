@@ -389,6 +389,77 @@ async function mockInvoke(cmd, args = {}) {
       };
     }
 
+    case 'wsl_kubectl_apply_yaml': {
+      const instance = (args?.instance || '').trim();
+      const manifestYaml = typeof args?.manifest_yaml === 'string' ? args.manifest_yaml : '';
+      const sourceName = (args?.source_name || '').trim() || '<uploaded-yaml>';
+      const context = `home-lab-wsl-${toManagedContextId(instance)}`;
+      const command = `kubectl --context "${context}" apply -f ${sourceName}`;
+      const startedAt = Date.now();
+
+      if (!instance) {
+        return {
+          ok: false,
+          instance,
+          exit_code: 1,
+          command,
+          trace_id: `mock-${Date.now()}`,
+          duration_ms: Date.now() - startedAt,
+          stdout: '',
+          stderr: "Le nom de l'instance WSL est requis (mock).",
+        };
+      }
+      if (!manifestYaml.trim()) {
+        return {
+          ok: false,
+          instance,
+          exit_code: 1,
+          command,
+          trace_id: `mock-${Date.now()}`,
+          duration_ms: Date.now() - startedAt,
+          stdout: '',
+          stderr: 'Le contenu YAML est vide (mock).',
+        };
+      }
+
+      const target = __MOCK.wsl.instances.find(
+        (inst) => String(inst?.name || '').toLowerCase() === instance.toLowerCase(),
+      );
+      if (!target) {
+        return {
+          ok: false,
+          instance,
+          exit_code: 1,
+          command,
+          trace_id: `mock-${Date.now()}`,
+          duration_ms: Date.now() - startedAt,
+          stdout: '',
+          stderr: `Instance ${instance} introuvable (mock).`,
+        };
+      }
+
+      const documents = manifestYaml
+        .split(/^---\s*$/m)
+        .map((chunk) => chunk.trim())
+        .filter((chunk) => chunk.length > 0);
+      const appliedCount = Math.max(documents.length, 1);
+      const stdout = [
+        ...Array.from({ length: appliedCount }, (_, i) => `resource/${i + 1} configured`),
+        `${appliedCount} ressource(s) appliquee(s).`,
+      ].join('\n');
+
+      return {
+        ok: true,
+        instance: target.name,
+        exit_code: 0,
+        command,
+        trace_id: `mock-${Date.now()}`,
+        duration_ms: Date.now() - startedAt,
+        stdout,
+        stderr: '',
+      };
+    }
+
     default:
       return { ok: false, message: `Unknown mock command: ${cmd}` };
   }
@@ -540,7 +611,11 @@ export async function oidc_register_client(payload = {}) {
 export async function oidc_remove_client(clientId) {
   const value = typeof clientId === 'string' ? clientId.trim() : '';
   if (!value) throw new Error("L'identifiant client est requis pour la suppression.");
-  return safeInvoke('oidc_remove_client', { client_id: value });
+  const result = await safeInvoke('oidc_remove_client', { client_id: value });
+  if (!result?.ok) {
+    throw new Error(result?.message || `Suppression du client OIDC '${value}' impossible.`);
+  }
+  return result;
 }
 
 export async function wsl_import_instance(options = {}) {
@@ -592,5 +667,70 @@ export async function wsl_kubectl_exec(instance, args = []) {
     throw new Error('La commande kubectl est requise.');
   }
 
-  return safeInvoke('wsl_kubectl_exec', { instance: value, args: commandArgs });
+  const startedAt = Date.now();
+  // eslint-disable-next-line no-console
+  console.info('[tauri.js] wsl_kubectl_exec invoke', { instance: value, args: commandArgs });
+  try {
+    const result = await safeInvoke('wsl_kubectl_exec', { instance: value, args: commandArgs });
+    // eslint-disable-next-line no-console
+    console.info('[tauri.js] wsl_kubectl_exec result', {
+      instance: value,
+      elapsed_ms: Date.now() - startedAt,
+      trace_id: result?.trace_id,
+      ok: !!result?.ok,
+    });
+    return result;
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.error('[tauri.js] wsl_kubectl_exec error', {
+      instance: value,
+      elapsed_ms: Date.now() - startedAt,
+      error: err?.message || String(err),
+    });
+    throw err;
+  }
+}
+
+export async function wsl_kubectl_apply_yaml(instance, manifestYaml, sourceName = '') {
+  const value = typeof instance === 'string' ? instance.trim() : '';
+  if (!value) {
+    throw new Error("Le nom de l'instance WSL est requis.");
+  }
+
+  const yaml = typeof manifestYaml === 'string' ? manifestYaml : String(manifestYaml ?? '');
+  if (!yaml.trim()) {
+    throw new Error('Le contenu YAML est vide.');
+  }
+
+  const source = typeof sourceName === 'string' ? sourceName.trim() : '';
+  const startedAt = Date.now();
+  // eslint-disable-next-line no-console
+  console.info('[tauri.js] wsl_kubectl_apply_yaml invoke', {
+    instance: value,
+    source_name: source || '<uploaded-yaml>',
+    bytes: yaml.length,
+  });
+  try {
+    const result = await safeInvoke('wsl_kubectl_apply_yaml', {
+      instance: value,
+      manifest_yaml: yaml,
+      source_name: source || null,
+    });
+    // eslint-disable-next-line no-console
+    console.info('[tauri.js] wsl_kubectl_apply_yaml result', {
+      instance: value,
+      elapsed_ms: Date.now() - startedAt,
+      trace_id: result?.trace_id,
+      ok: !!result?.ok,
+    });
+    return result;
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.error('[tauri.js] wsl_kubectl_apply_yaml error', {
+      instance: value,
+      elapsed_ms: Date.now() - startedAt,
+      error: err?.message || String(err),
+    });
+    throw err;
+  }
 }
