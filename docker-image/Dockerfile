@@ -1,3 +1,7 @@
+# ---- CA bundle stage ----
+FROM alpine:3.21 AS ca-certs
+RUN apk add --no-cache ca-certificates
+
 # ---- BusyBox image  ----
 FROM busybox:1.37.0-musl
 
@@ -11,7 +15,9 @@ RUN mkdir -p /sbin \
 ENV WSL_ROLE=server
 ENV WSL_PORT_RANGE=6443-6550
 
-RUN mkdir -p /usr/local/bin
+RUN mkdir -p /usr/local/bin /etc/ssl/certs
+COPY --from=ca-certs /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+RUN ln -sf /etc/ssl/certs/ca-certificates.crt /etc/ssl/cert.pem
 
 # Copy initialization scripts and environment
 COPY docker-image/k3s-env /etc/k3s-env

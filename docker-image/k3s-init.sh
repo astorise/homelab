@@ -25,15 +25,66 @@ BOOTSTRAP_INTERVAL=${BOOTSTRAP_INTERVAL:-3}
 log_info "Role: $ROLE"
 log_info "Port range: $PORT_RANGE"
 
+detect_node_ip() {
+    # Prefer the primary WSL interface and always ignore loopback/link-local.
+    line=$(ip -4 addr show dev eth0 2>/dev/null | grep 'inet ' | head -n1 || true)
+    if [ -n "$line" ]; then
+        candidate=$(echo "$line" | tr -s ' ' | cut -d' ' -f3 | cut -d/ -f1)
+        case "$candidate" in
+            127.*|169.254.*|'')
+                ;;
+            *)
+                echo "$candidate"
+                return 0
+                ;;
+        esac
+    fi
+
+    ip -4 addr show 2>/dev/null \
+        | grep 'inet ' \
+        | tr -s ' ' \
+        | cut -d' ' -f3 \
+        | cut -d/ -f1 \
+        | while IFS= read -r candidate; do
+            case "$candidate" in
+                127.*|169.254.*|'')
+                    ;;
+                *)
+                    echo "$candidate"
+                    break
+                    ;;
+            esac
+        done
+}
+
 ensure_server_config() {
+    NODE_IP=$(detect_node_ip)
+    if [ -z "$NODE_IP" ]; then
+        log_error "Unable to determine a non-loopback IPv4 address for node-ip."
+        exit 1
+    fi
+
     mkdir -p /etc/rancher/k3s
     if [ ! -f /etc/rancher/k3s/config.yaml ]; then
-        log_info "Creating /etc/rancher/k3s/config.yaml"
+        log_info "Creating /etc/rancher/k3s/config.yaml with node-ip $NODE_IP"
         cat <<EOF > /etc/rancher/k3s/config.yaml
 write-kubeconfig-mode: "0644"
-node-ip: $(ip -4 addr show | awk '/inet / {print $2}' | head -n1 | cut -d/ -f1)
+node-ip: $NODE_IP
 node-port-range: $PORT_RANGE
 EOF
+        return
+    fi
+
+    CURRENT_NODE_IP=$(grep '^node-ip:' /etc/rancher/k3s/config.yaml 2>/dev/null | head -n1 | cut -d':' -f2 | tr -d '[:space:]')
+    if [ -z "$CURRENT_NODE_IP" ]; then
+        log_info "Adding node-ip $NODE_IP to /etc/rancher/k3s/config.yaml"
+        printf '\nnode-ip: %s\n' "$NODE_IP" >> /etc/rancher/k3s/config.yaml
+        return
+    fi
+
+    if [ "$CURRENT_NODE_IP" != "$NODE_IP" ]; then
+        log_info "Updating node-ip in /etc/rancher/k3s/config.yaml: $CURRENT_NODE_IP -> $NODE_IP"
+        sed -i "s/^node-ip:.*/node-ip: $NODE_IP/" /etc/rancher/k3s/config.yaml
     fi
 }
 
