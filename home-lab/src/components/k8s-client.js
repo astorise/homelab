@@ -120,18 +120,33 @@ function formatYamlSyntaxError(error) {
   return `YAML invalide: ${firstLine}`;
 }
 
-function validateYamlSyntax(yamlText) {
+function parseYamlSyntax(yamlText) {
   try {
     const documents = parseAllDocuments(yamlText, { prettyErrors: true });
+    const docCount = Array.isArray(documents) ? documents.length : 0;
     for (const document of documents) {
       if (Array.isArray(document?.errors) && document.errors.length > 0) {
-        return formatYamlSyntaxError(document.errors[0]);
+        return { ok: false, error: formatYamlSyntaxError(document.errors[0]), docCount };
       }
     }
-    return '';
+    return { ok: true, error: '', docCount };
   } catch (err) {
-    return formatYamlSyntaxError(err);
+    return { ok: false, error: formatYamlSyntaxError(err), docCount: 0 };
   }
+}
+
+function formatByteSize(bytes) {
+  const value = Number(bytes);
+  if (!Number.isFinite(value) || value <= 0) {
+    return '0 o';
+  }
+  if (value < 1024) {
+    return `${Math.round(value)} o`;
+  }
+  if (value < 1024 * 1024) {
+    return `${(value / 1024).toFixed(1)} Ko`;
+  }
+  return `${(value / (1024 * 1024)).toFixed(2)} Mo`;
 }
 
 function splitCommandLine(input) {
@@ -222,8 +237,11 @@ class K8sClient extends HTMLElement {
     this._result = null;
     this._applyFile = null;
     this._applyFileName = '';
+    this._applyFileBytes = 0;
     this._applyYamlContent = '';
     this._applyYamlSyntaxError = '';
+    this._applyParserDocCount = 0;
+    this._applyLoadMessage = '';
     this._loadingApplyFile = false;
   }
 
@@ -429,37 +447,83 @@ class K8sClient extends HTMLElement {
     const file = event?.target?.files?.[0] || null;
     this._applyFile = file;
     this._applyFileName = file?.name || '';
+    this._applyFileBytes = Number(file?.size || 0);
     this._applyYamlContent = '';
     this._applyYamlSyntaxError = '';
+    this._applyParserDocCount = 0;
+    this._applyLoadMessage = '';
 
     if (!file) {
       this.render();
       return;
     }
 
+    // eslint-disable-next-line no-console
+    console.info('[k8s-client] yaml upload selected', {
+      file: file.name,
+      bytes: this._applyFileBytes,
+      type: file.type || '<unknown>',
+    });
+
     this._loadingApplyFile = true;
+    this._applyLoadMessage = 'Lecture du fichier YAML...';
     this.render();
 
     try {
       const content = await readYamlFileText(file);
-      if (!content.trim()) {
-        throw new Error('Le fichier YAML selectionne est vide.');
-      }
       this._applyYamlContent = content;
-      const syntaxError = validateYamlSyntax(content);
-      if (syntaxError) {
-        this._applyYamlSyntaxError = syntaxError;
+      const charCount = content.length;
+      // eslint-disable-next-line no-console
+      console.info('[k8s-client] yaml upload loaded', {
+        file: file.name,
+        bytes: this._applyFileBytes,
+        chars: charCount,
+      });
+      if (!content.trim()) {
+        const message = 'Le fichier YAML selectionne est vide.';
+        this._applyYamlSyntaxError = message;
+        this._applyLoadMessage = `Lecture terminee (${formatByteSize(this._applyFileBytes)}, ${charCount} caractere).`;
+        this.setMessage('error', message);
+        showError(message);
+        return;
+      }
+
+      const parseResult = parseYamlSyntax(content);
+      this._applyParserDocCount = parseResult.docCount;
+      this._applyLoadMessage = `Lecture terminee (${formatByteSize(this._applyFileBytes)}, ${charCount} caracteres).`;
+
+      if (!parseResult.ok) {
+        this._applyYamlSyntaxError = parseResult.error;
+        // eslint-disable-next-line no-console
+        console.warn('[k8s-client] yaml parser error', {
+          file: file.name,
+          docs: parseResult.docCount,
+          error: parseResult.error,
+        });
+        this.setMessage('error', parseResult.error);
+        showError(parseResult.error);
       } else {
         this._applyYamlSyntaxError = '';
+        // eslint-disable-next-line no-console
+        console.info('[k8s-client] yaml parser ok', {
+          file: file.name,
+          docs: parseResult.docCount,
+        });
       }
     } catch (err) {
       const message = err?.message || String(err);
-      this._applyFile = null;
-      this._applyFileName = '';
       this._applyYamlContent = '';
-      this._applyYamlSyntaxError = '';
-      this.setMessage('error', message);
-      showError(message);
+      this._applyYamlSyntaxError = `Lecture du fichier impossible: ${message}`;
+      this._applyParserDocCount = 0;
+      this._applyLoadMessage = 'Echec pendant la lecture du fichier YAML.';
+      // eslint-disable-next-line no-console
+      console.error('[k8s-client] yaml upload read error', {
+        file: this._applyFileName || '<unknown>',
+        bytes: this._applyFileBytes,
+        error: message,
+      });
+      this.setMessage('error', this._applyYamlSyntaxError);
+      showError(this._applyYamlSyntaxError);
     } finally {
       this._loadingApplyFile = false;
       this.render();
@@ -518,12 +582,18 @@ class K8sClient extends HTMLElement {
         }">${escapeHtml(this._message)}</p>`
       : '';
     const yamlValidation = this._loadingApplyFile
-      ? ''
+      ? '<p class="mt-1 text-[11px] text-blue-600">Lecture du fichier YAML en cours...</p>'
       : this._applyYamlSyntaxError
         ? `<p class="mt-1 text-[11px] text-amber-700">${escapeHtml(this._applyYamlSyntaxError)} L'application reste possible.</p>`
         : this._applyFile && this._applyYamlContent.trim()
-          ? '<p class="mt-1 text-[11px] text-green-600">Syntaxe YAML valide.</p>'
+          ? `<p class="mt-1 text-[11px] text-green-600">Syntaxe YAML valide (${escapeHtml(String(this._applyParserDocCount || 1))} document(s)).</p>`
           : '';
+    const yamlFileMeta = this._applyFile
+      ? `<p class="mt-1 text-[11px] text-gray-500">Taille: <code>${escapeHtml(formatByteSize(this._applyFileBytes))}</code></p>`
+      : '';
+    const yamlLoadMessage = this._applyLoadMessage
+      ? `<p class="mt-1 text-[11px] text-gray-500">${escapeHtml(this._applyLoadMessage)}</p>`
+      : '';
 
     const instanceOptions = this._instances.length > 0
       ? this._instances
@@ -620,6 +690,8 @@ class K8sClient extends HTMLElement {
               ? `<p class="mt-2 text-[11px] text-gray-500">Fichier: <code>${escapeHtml(this._applyFileName)}</code>${this._loadingApplyFile ? ' (lecture en cours...)' : ''}</p>`
               : '<p class="mt-2 text-[11px] text-gray-500">Aucun fichier selectionne.</p>'
           }
+          ${yamlFileMeta}
+          ${yamlLoadMessage}
           ${yamlValidation}
           <button
             type="button"
