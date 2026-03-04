@@ -379,10 +379,6 @@ class K8sClient extends HTMLElement {
       showError('Le fichier YAML selectionne est vide.');
       return;
     }
-    if (this._applyYamlSyntaxError) {
-      showError(this._applyYamlSyntaxError);
-      return;
-    }
 
     this._running = true;
     const startedAt = Date.now();
@@ -449,13 +445,13 @@ class K8sClient extends HTMLElement {
       if (!content.trim()) {
         throw new Error('Le fichier YAML selectionne est vide.');
       }
+      this._applyYamlContent = content;
       const syntaxError = validateYamlSyntax(content);
       if (syntaxError) {
         this._applyYamlSyntaxError = syntaxError;
-        showError(syntaxError);
-        return;
+      } else {
+        this._applyYamlSyntaxError = '';
       }
-      this._applyYamlContent = content;
     } catch (err) {
       const message = err?.message || String(err);
       this._applyFile = null;
@@ -508,8 +504,7 @@ class K8sClient extends HTMLElement {
     const disableApply = disableRun
       || this._loadingApplyFile
       || !this._applyFile
-      || !this._applyYamlContent.trim()
-      || !!this._applyYamlSyntaxError;
+      || !this._applyYamlContent.trim();
     const disableSync = this._running || this._syncingKubeconfig;
     const message = this._message
       ? `<p class="mt-3 text-sm ${
@@ -525,7 +520,7 @@ class K8sClient extends HTMLElement {
     const yamlValidation = this._loadingApplyFile
       ? ''
       : this._applyYamlSyntaxError
-        ? `<p class="mt-1 text-[11px] text-red-600">${escapeHtml(this._applyYamlSyntaxError)}</p>`
+        ? `<p class="mt-1 text-[11px] text-amber-700">${escapeHtml(this._applyYamlSyntaxError)} L'application reste possible.</p>`
         : this._applyFile && this._applyYamlContent.trim()
           ? '<p class="mt-1 text-[11px] text-green-600">Syntaxe YAML valide.</p>'
           : '';
