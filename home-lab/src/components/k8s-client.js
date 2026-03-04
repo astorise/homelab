@@ -4,6 +4,7 @@ import {
   wsl_list_instances,
   wsl_sync_windows_kubeconfig,
 } from '../tauri.js';
+import { parseAllDocuments } from 'yaml';
 import { showError } from './toast.js';
 
 const escapeHtml = (value) =>
@@ -13,6 +14,125 @@ const escapeHtml = (value) =>
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#39;');
+
+function normalizeYamlText(value) {
+  return String(value ?? '')
+    .replace(/\u0000/g, '')
+    .replace(/^\uFEFF/, '');
+}
+
+function decodeYamlBytes(bytes) {
+  if (!(bytes instanceof Uint8Array) || bytes.length === 0) {
+    return '';
+  }
+
+  const hasUtf8Bom = bytes.length >= 3
+    && bytes[0] === 0xef
+    && bytes[1] === 0xbb
+    && bytes[2] === 0xbf;
+  const hasUtf16LeBom = bytes.length >= 2
+    && bytes[0] === 0xff
+    && bytes[1] === 0xfe;
+  const hasUtf16BeBom = bytes.length >= 2
+    && bytes[0] === 0xfe
+    && bytes[1] === 0xff;
+
+  const decode = (encoding, view) => {
+    try {
+      return new TextDecoder(encoding).decode(view);
+    } catch {
+      return null;
+    }
+  };
+
+  if (hasUtf8Bom) {
+    return decode('utf-8', bytes.slice(3)) ?? decode('utf-8', bytes) ?? '';
+  }
+
+  if (hasUtf16LeBom) {
+    return decode('utf-16le', bytes.slice(2)) ?? '';
+  }
+
+  if (hasUtf16BeBom) {
+    const content = bytes.slice(2);
+    const swapped = new Uint8Array(content.length);
+    for (let i = 0; i < content.length - 1; i += 2) {
+      swapped[i] = content[i + 1];
+      swapped[i + 1] = content[i];
+    }
+    if (content.length % 2 === 1) {
+      swapped[content.length - 1] = 0;
+    }
+    return decode('utf-16le', swapped) ?? '';
+  }
+
+  return decode('utf-8', bytes) ?? '';
+}
+
+function readBlobAsTextWithFileReader(blob) {
+  return new Promise((resolve, reject) => {
+    try {
+      const reader = new FileReader();
+      reader.onerror = () => {
+        reject(reader.error || new Error('Lecture du fichier impossible.'));
+      };
+      reader.onload = () => {
+        resolve(typeof reader.result === 'string' ? reader.result : '');
+      };
+      reader.readAsText(blob);
+    } catch (err) {
+      reject(err);
+    }
+  });
+}
+
+async function readYamlFileText(file) {
+  if (!file) {
+    return '';
+  }
+
+  if (typeof file.arrayBuffer === 'function') {
+    const buffer = await file.arrayBuffer();
+    const bytes = new Uint8Array(buffer);
+    return normalizeYamlText(decodeYamlBytes(bytes));
+  }
+
+  if (typeof file.text === 'function') {
+    return normalizeYamlText(await file.text());
+  }
+
+  return normalizeYamlText(await readBlobAsTextWithFileReader(file));
+}
+
+function formatYamlSyntaxError(error) {
+  const rawMessage = typeof error?.message === 'string'
+    ? error.message
+    : 'YAML invalide.';
+  const firstLine = rawMessage.split(/\r?\n/)[0].trim() || 'YAML invalide.';
+  const firstPos = Array.isArray(error?.linePos) ? error.linePos[0] : null;
+  const line = Number(firstPos?.line);
+  const col = Number(firstPos?.col);
+
+  if (Number.isInteger(line) && Number.isInteger(col) && line > 0 && col > 0) {
+    return `YAML invalide (ligne ${line}, colonne ${col}): ${firstLine}`;
+  }
+
+  return `YAML invalide: ${firstLine}`;
+}
+
+function validateYamlSyntax(yamlText) {
+  try {
+    const documents = parseAllDocuments(yamlText, { prettyErrors: true });
+    for (const document of documents) {
+      if (Array.isArray(document?.errors) && document.errors.length > 0) {
+        return formatYamlSyntaxError(document.errors[0]);
+      }
+    }
+    return '';
+  } catch (err) {
+    return formatYamlSyntaxError(err);
+  }
+}
 
 function splitCommandLine(input) {
   const tokens = [];
@@ -102,6 +222,9 @@ class K8sClient extends HTMLElement {
     this._result = null;
     this._applyFile = null;
     this._applyFileName = '';
+    this._applyYamlContent = '';
+    this._applyYamlSyntaxError = '';
+    this._loadingApplyFile = false;
   }
 
   connectedCallback() {
@@ -245,19 +368,19 @@ class K8sClient extends HTMLElement {
       return;
     }
 
-    const file = this._applyFile;
-    let manifestYaml = '';
-    try {
-      manifestYaml = await file.text();
-    } catch (err) {
-      const message = err?.message || String(err);
-      this.setMessage('error', message);
-      showError(message);
+    if (this._loadingApplyFile) {
+      showError('Lecture du fichier YAML en cours, patiente quelques secondes.');
       return;
     }
 
+    const file = this._applyFile;
+    const manifestYaml = this._applyYamlContent;
     if (!manifestYaml.trim()) {
       showError('Le fichier YAML selectionne est vide.');
+      return;
+    }
+    if (this._applyYamlSyntaxError) {
+      showError(this._applyYamlSyntaxError);
       return;
     }
 
@@ -306,6 +429,47 @@ class K8sClient extends HTMLElement {
     }
   }
 
+  async loadApplyFile(event) {
+    const file = event?.target?.files?.[0] || null;
+    this._applyFile = file;
+    this._applyFileName = file?.name || '';
+    this._applyYamlContent = '';
+    this._applyYamlSyntaxError = '';
+
+    if (!file) {
+      this.render();
+      return;
+    }
+
+    this._loadingApplyFile = true;
+    this.render();
+
+    try {
+      const content = await readYamlFileText(file);
+      if (!content.trim()) {
+        throw new Error('Le fichier YAML selectionne est vide.');
+      }
+      const syntaxError = validateYamlSyntax(content);
+      if (syntaxError) {
+        this._applyYamlSyntaxError = syntaxError;
+        showError(syntaxError);
+        return;
+      }
+      this._applyYamlContent = content;
+    } catch (err) {
+      const message = err?.message || String(err);
+      this._applyFile = null;
+      this._applyFileName = '';
+      this._applyYamlContent = '';
+      this._applyYamlSyntaxError = '';
+      this.setMessage('error', message);
+      showError(message);
+    } finally {
+      this._loadingApplyFile = false;
+      this.render();
+    }
+  }
+
   renderResult() {
     if (!this._result || typeof this._result !== 'object') {
       return '<p class="mt-3 text-xs text-gray-500">Aucun resultat pour le moment.</p>';
@@ -341,7 +505,11 @@ class K8sClient extends HTMLElement {
 
   render() {
     const disableRun = this._running || this._loading || this._instances.length === 0;
-    const disableApply = disableRun || !this._applyFile;
+    const disableApply = disableRun
+      || this._loadingApplyFile
+      || !this._applyFile
+      || !this._applyYamlContent.trim()
+      || !!this._applyYamlSyntaxError;
     const disableSync = this._running || this._syncingKubeconfig;
     const message = this._message
       ? `<p class="mt-3 text-sm ${
@@ -354,6 +522,13 @@ class K8sClient extends HTMLElement {
                 : 'text-gray-700'
         }">${escapeHtml(this._message)}</p>`
       : '';
+    const yamlValidation = this._loadingApplyFile
+      ? ''
+      : this._applyYamlSyntaxError
+        ? `<p class="mt-1 text-[11px] text-red-600">${escapeHtml(this._applyYamlSyntaxError)}</p>`
+        : this._applyFile && this._applyYamlContent.trim()
+          ? '<p class="mt-1 text-[11px] text-green-600">Syntaxe YAML valide.</p>'
+          : '';
 
     const instanceOptions = this._instances.length > 0
       ? this._instances
@@ -443,20 +618,21 @@ class K8sClient extends HTMLElement {
             type="file"
             accept=".yaml,.yml,text/yaml,application/x-yaml,application/yaml"
             class="mt-2 block w-full text-xs text-gray-700 file:mr-3 file:rounded file:border file:border-gray-300 file:bg-white file:px-2 file:py-1 file:text-xs file:font-semibold file:text-gray-700 hover:file:bg-gray-50"
-            ${this._running ? 'disabled' : ''}
+            ${this._running || this._loadingApplyFile ? 'disabled' : ''}
           />
           ${
             this._applyFileName
-              ? `<p class="mt-2 text-[11px] text-gray-500">Fichier: <code>${escapeHtml(this._applyFileName)}</code></p>`
+              ? `<p class="mt-2 text-[11px] text-gray-500">Fichier: <code>${escapeHtml(this._applyFileName)}</code>${this._loadingApplyFile ? ' (lecture en cours...)' : ''}</p>`
               : '<p class="mt-2 text-[11px] text-gray-500">Aucun fichier selectionne.</p>'
           }
+          ${yamlValidation}
           <button
             type="button"
             data-action="apply-upload"
             class="mt-2 px-3 py-2 rounded bg-emerald-600 text-white text-sm font-semibold disabled:opacity-50 disabled:cursor-not-allowed"
             ${disableApply ? 'disabled' : ''}
           >
-            ${this._running ? 'Application...' : 'Uploader et appliquer'}
+            ${this._loadingApplyFile ? 'Lecture...' : this._running ? 'Application...' : 'Uploader et appliquer'}
           </button>
         </div>
 
@@ -506,10 +682,7 @@ class K8sClient extends HTMLElement {
 
     if (applyFileInput) {
       applyFileInput.addEventListener('change', (event) => {
-        const file = event?.target?.files?.[0] || null;
-        this._applyFile = file;
-        this._applyFileName = file?.name || '';
-        this.render();
+        void this.loadApplyFile(event);
       });
     }
 
