@@ -1,5 +1,5 @@
 # ---- CA bundle stage ----
-FROM alpine:3.21 AS ca-certs
+FROM alpine:3.23 AS ca-certs
 RUN apk add --no-cache ca-certificates
 
 # ---- BusyBox image  ----
