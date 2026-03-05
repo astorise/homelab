@@ -3,16 +3,37 @@
     windows_subsystem = "windows"
 )]
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
+use base64::Engine;
+use base64::engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD};
 use flexi_logger::{Age, Cleanup, Criterion, Duplicate, FileSpec, Logger, Naming};
+use hickory_proto::op::{Message, MessageType, ResponseCode};
+use hickory_proto::rr::rdata::{A as RDataA, AAAA as RDataAAAA};
+use hickory_proto::rr::{DNSClass, RData, Record as DnsRecord, RecordType};
+use hickory_proto::serialize::binary::{BinEncodable, BinEncoder};
+use http::header::CONTENT_TYPE;
+use http::{Method, StatusCode};
+use http_body_util::{BodyExt, Full};
+use hyper::body::{Bytes, Incoming};
+use hyper::service::service_fn;
+use hyper::{Request, Response};
+use hyper_util::rt::TokioIo;
 use log::{LevelFilter, debug, error, info, warn};
 use parking_lot::Mutex;
 use pin_project::pin_project;
+use rcgen::{CertificateParams, DnType, IsCa, KeyPair, SanType};
+use rsa::RsaPrivateKey;
+use rsa::pkcs8::{EncodePrivateKey, LineEnding};
+use rsa::rand_core::OsRng;
+use rustls::ServerConfig;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::convert::{Infallible, TryInto};
 use std::ffi::{OsString, c_void};
 use std::fs::{self, File};
 use std::io::{self, Write};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::{Command, Stdio};
@@ -22,9 +43,11 @@ use std::task::{Context as TaskContext, Poll};
 use std::thread;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::net::TcpListener;
 use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
+use tokio_rustls::TlsAcceptor;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tonic::transport::{Server, server::Connected};
 use windows_service::define_windows_service;
@@ -105,6 +128,11 @@ const SERVICE_DESCRIPTION: &str =
     r"DNS config + rollback + Windows RPC IPC on ncalrpc endpoint home-dns";
 const DEFAULT_SERVERS_V4: &[&str] = &["127.0.0.1"];
 const LEGACY_DEFAULT_SERVERS_V4: &[&str] = &["1.1.1.1", "1.0.0.1"];
+const DEFAULT_DOH_UPSTREAMS: &[&str] = &[
+    "https://cloudflare-dns.com/dns-query",
+    "https://dns.google/dns-query",
+];
+const DEFAULT_DOH_TTL: u32 = 60;
 
 #[cfg(debug_assertions)]
 const NAMED_PIPE_NAME: &str = r"\\.\pipe\home-dns-dev";
@@ -154,6 +182,33 @@ fn build_log_basename(prefix: &str) -> String {
     format!("{prefix}_{}", build_label())
 }
 
+fn default_doh_enabled() -> bool {
+    true
+}
+
+fn default_doh_listen_addr() -> String {
+    "127.0.0.1".into()
+}
+
+fn default_doh_hostname() -> String {
+    "127.0.0.1".into()
+}
+
+fn default_doh_port() -> u16 {
+    5443
+}
+
+fn default_doh_path() -> String {
+    "/dns-query".into()
+}
+
+fn default_doh_upstreams() -> Vec<String> {
+    DEFAULT_DOH_UPSTREAMS
+        .iter()
+        .map(|value| value.to_string())
+        .collect()
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 struct RecordEntry {
     #[serde(default)]
@@ -162,6 +217,35 @@ struct RecordEntry {
     aaaa: Vec<String>,
     #[serde(default)]
     ttl: Option<u32>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct DohConfig {
+    #[serde(default = "default_doh_enabled")]
+    enabled: bool,
+    #[serde(default = "default_doh_listen_addr")]
+    listen_addr: String,
+    #[serde(default = "default_doh_hostname")]
+    hostname: String,
+    #[serde(default = "default_doh_port")]
+    port: u16,
+    #[serde(default = "default_doh_path")]
+    path: String,
+    #[serde(default = "default_doh_upstreams")]
+    upstreams: Vec<String>,
+}
+
+impl Default for DohConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_doh_enabled(),
+            listen_addr: default_doh_listen_addr(),
+            hostname: default_doh_hostname(),
+            port: default_doh_port(),
+            path: default_doh_path(),
+            upstreams: default_doh_upstreams(),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -175,6 +259,23 @@ struct DnsConfig {
     log_level: Option<String>,
     #[serde(default)]
     records: HashMap<String, RecordEntry>,
+    #[serde(default)]
+    doh: DohConfig,
+}
+
+impl DnsConfig {
+    fn normalized_doh_path(&self) -> String {
+        normalize_doh_path(&self.doh.path)
+    }
+
+    fn doh_template_url(&self) -> String {
+        format!(
+            "https://{}:{}{}",
+            self.doh.hostname.trim(),
+            self.doh.port,
+            self.normalized_doh_path()
+        )
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -210,6 +311,26 @@ fn logs_dir() -> PathBuf {
 }
 fn config_path() -> PathBuf {
     program_data_dir().join("dns.yaml")
+}
+
+fn doh_private_key_path() -> PathBuf {
+    program_data_dir().join("doh-private-key.pem")
+}
+
+fn doh_certificate_path() -> PathBuf {
+    program_data_dir().join("doh-cert.pem")
+}
+
+fn normalize_doh_path(path: &str) -> String {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return "/dns-query".to_string();
+    }
+    if trimmed.starts_with('/') {
+        trimmed.to_string()
+    } else {
+        format!("/{trimmed}")
+    }
 }
 
 fn init_logger(level: LevelFilter) -> Result<()> {
@@ -304,6 +425,7 @@ fn load_config_or_init() -> Result<DnsConfig> {
             backups: HashMap::new(),
             log_level: Some(default_level_str().into()),
             records: HashMap::new(),
+            doh: DohConfig::default(),
         };
         let yaml = serde_yaml::to_string(&cfg)?;
         write_atomic(&p, yaml.as_bytes())?;
@@ -311,11 +433,36 @@ fn load_config_or_init() -> Result<DnsConfig> {
     }
     let s = fs::read_to_string(&p).with_context(|| format!("lecture config: {}", p.display()))?;
     let mut cfg: DnsConfig = serde_yaml::from_str(&s).context("YAML invalide")?;
+    let mut changed = false;
     if cfg.servers_v4.is_empty() && cfg.servers_v6.is_empty() {
         anyhow::bail!("dns.yaml invalide: servers_v4 et servers_v6 sont vides");
     }
     if should_migrate_legacy_defaults(&cfg) {
         cfg.servers_v4 = as_string_vec(DEFAULT_SERVERS_V4);
+        changed = true;
+    }
+    if cfg.doh.listen_addr.trim().is_empty() {
+        cfg.doh.listen_addr = default_doh_listen_addr();
+        changed = true;
+    }
+    if cfg.doh.hostname.trim().is_empty() {
+        cfg.doh.hostname = default_doh_hostname();
+        changed = true;
+    }
+    if cfg.doh.port == 0 {
+        cfg.doh.port = default_doh_port();
+        changed = true;
+    }
+    let normalized_path = normalize_doh_path(&cfg.doh.path);
+    if normalized_path != cfg.doh.path {
+        cfg.doh.path = normalized_path;
+        changed = true;
+    }
+    if cfg.doh.upstreams.is_empty() {
+        cfg.doh.upstreams = default_doh_upstreams();
+        changed = true;
+    }
+    if changed {
         save_config(&cfg)?;
     }
     Ok(cfg)
@@ -531,7 +678,10 @@ fn restore_all() -> Result<()> {
                 .unwrap_or_else(|| entry.alias.clone());
             let interface_index = mac_to_if_index.get(&mac).copied().or(entry.if_index);
             let Some(interface_index) = interface_index else {
-                warn!("Cannot restore adapter {} (MAC={}): missing ifIndex", alias, mac);
+                warn!(
+                    "Cannot restore adapter {} (MAC={}): missing ifIndex",
+                    alias, mac
+                );
                 continue;
             };
             info!("Restoring adapter [{} MAC={}]", alias, mac);
@@ -560,6 +710,481 @@ fn restore_all() -> Result<()> {
 struct SharedState {
     cfg: Arc<Mutex<DnsConfig>>,
     stopping: Arc<AtomicBool>,
+}
+
+#[derive(Clone)]
+struct DohRuntimeState {
+    shared: SharedState,
+    upstream_client: reqwest::Client,
+}
+
+fn parse_doh_listen_addr(cfg: &DnsConfig) -> Result<SocketAddr> {
+    let ip: IpAddr = cfg
+        .doh
+        .listen_addr
+        .trim()
+        .parse()
+        .with_context(|| format!("doh.listen_addr invalide: {}", cfg.doh.listen_addr))?;
+    Ok(SocketAddr::new(ip, cfg.doh.port))
+}
+
+fn normalize_record_key(value: &str) -> String {
+    value.trim().trim_end_matches('.').to_ascii_lowercase()
+}
+
+fn find_record_entry<'a>(
+    records: &'a HashMap<String, RecordEntry>,
+    query_name: &str,
+) -> Option<&'a RecordEntry> {
+    let expected = normalize_record_key(query_name);
+    records
+        .iter()
+        .find(|(name, _)| normalize_record_key(name) == expected)
+        .map(|(_, entry)| entry)
+}
+
+fn build_local_dns_response(cfg: &DnsConfig, wire_query: &[u8]) -> Result<Option<Vec<u8>>> {
+    let request = Message::from_vec(wire_query).context("parse DNS message")?;
+    let mut response = Message::new();
+    response.set_id(request.id());
+    response.set_message_type(MessageType::Response);
+    response.set_op_code(request.op_code());
+    response.set_recursion_desired(request.recursion_desired());
+    response.set_recursion_available(true);
+    response.set_response_code(ResponseCode::NoError);
+
+    let mut local_hit = false;
+    for query in request.queries().iter().cloned() {
+        response.add_query(query.clone());
+        if query.query_class() != DNSClass::IN {
+            continue;
+        }
+        let query_name = query.name().to_utf8();
+        let Some(entry) = find_record_entry(&cfg.records, &query_name) else {
+            continue;
+        };
+        local_hit = true;
+        let ttl = entry.ttl.unwrap_or(DEFAULT_DOH_TTL);
+        match query.query_type() {
+            RecordType::A => {
+                for value in &entry.a {
+                    match value.parse::<Ipv4Addr>() {
+                        Ok(v4) => {
+                            response.add_answer(DnsRecord::from_rdata(
+                                query.name().clone(),
+                                ttl,
+                                RData::A(RDataA(v4)),
+                            ));
+                        }
+                        Err(e) => warn!("invalid IPv4 in record {query_name}: {value} ({e})"),
+                    }
+                }
+            }
+            RecordType::AAAA => {
+                for value in &entry.aaaa {
+                    match value.parse::<std::net::Ipv6Addr>() {
+                        Ok(v6) => {
+                            response.add_answer(DnsRecord::from_rdata(
+                                query.name().clone(),
+                                ttl,
+                                RData::AAAA(RDataAAAA(v6)),
+                            ));
+                        }
+                        Err(e) => warn!("invalid IPv6 in record {query_name}: {value} ({e})"),
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if !local_hit {
+        return Ok(None);
+    }
+
+    let mut bytes = Vec::with_capacity(512);
+    let mut encoder = BinEncoder::new(&mut bytes);
+    response
+        .emit(&mut encoder)
+        .context("encode local DNS response")?;
+    Ok(Some(bytes))
+}
+
+fn decode_doh_get_param(value: &str) -> Result<Vec<u8>> {
+    URL_SAFE_NO_PAD
+        .decode(value.as_bytes())
+        .or_else(|_| URL_SAFE.decode(value.as_bytes()))
+        .context("invalid base64url dns payload")
+}
+
+fn parse_doh_get_payload(query: Option<&str>) -> Result<Vec<u8>> {
+    let query = query.ok_or_else(|| anyhow!("missing query string"))?;
+    for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
+        if key == "dns" {
+            return decode_doh_get_param(value.as_ref());
+        }
+    }
+    Err(anyhow!("missing dns query parameter"))
+}
+
+type HttpBody = Full<Bytes>;
+type HttpResponse = Response<HttpBody>;
+
+fn plain_response(status: StatusCode, message: &str) -> HttpResponse {
+    Response::builder()
+        .status(status)
+        .header(CONTENT_TYPE, "text/plain; charset=utf-8")
+        .body(Full::from(Bytes::from(message.to_string())))
+        .expect("plain response")
+}
+
+fn dns_message_response(status: StatusCode, body: Vec<u8>) -> HttpResponse {
+    Response::builder()
+        .status(status)
+        .header(CONTENT_TYPE, "application/dns-message")
+        .body(Full::from(Bytes::from(body)))
+        .expect("dns response")
+}
+
+async fn forward_dns_query(state: &DohRuntimeState, wire_query: Vec<u8>) -> Result<Vec<u8>> {
+    let upstreams = state.shared.cfg.lock().doh.upstreams.clone();
+    if upstreams.is_empty() {
+        anyhow::bail!("doh.upstreams vide");
+    }
+
+    let mut last_error: Option<anyhow::Error> = None;
+    for upstream in upstreams {
+        let response = state
+            .upstream_client
+            .post(&upstream)
+            .header(CONTENT_TYPE, "application/dns-message")
+            .header("accept", "application/dns-message")
+            .body(wire_query.clone())
+            .send()
+            .await;
+        match response {
+            Ok(resp) => {
+                if !resp.status().is_success() {
+                    last_error = Some(anyhow!(
+                        "DoH upstream {} returned {}",
+                        upstream,
+                        resp.status()
+                    ));
+                    continue;
+                }
+                let payload = resp
+                    .bytes()
+                    .await
+                    .with_context(|| format!("reading upstream response from {}", upstream))?;
+                return Ok(payload.to_vec());
+            }
+            Err(err) => {
+                last_error = Some(anyhow!("DoH upstream {} failed: {}", upstream, err));
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| anyhow!("all DoH upstreams failed")))
+}
+
+async fn resolve_dns_query(state: &DohRuntimeState, wire_query: Vec<u8>) -> Result<Vec<u8>> {
+    if let Some(local) = {
+        let cfg = state.shared.cfg.lock();
+        build_local_dns_response(&cfg, &wire_query)?
+    } {
+        return Ok(local);
+    }
+    forward_dns_query(state, wire_query).await
+}
+
+async fn handle_doh_http_request(req: Request<Incoming>, state: DohRuntimeState) -> HttpResponse {
+    let expected_path = state.shared.cfg.lock().normalized_doh_path();
+    if req.uri().path() != expected_path {
+        return plain_response(StatusCode::NOT_FOUND, "not found");
+    }
+
+    let method = req.method().clone();
+    let wire_query = match method {
+        Method::GET => match parse_doh_get_payload(req.uri().query()) {
+            Ok(payload) => payload,
+            Err(e) => return plain_response(StatusCode::BAD_REQUEST, &format!("bad request: {e}")),
+        },
+        Method::POST => {
+            if let Some(value) = req.headers().get(CONTENT_TYPE) {
+                let content_type = value.to_str().unwrap_or_default();
+                if !content_type
+                    .to_ascii_lowercase()
+                    .contains("application/dns-message")
+                {
+                    return plain_response(
+                        StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                        "content-type must be application/dns-message",
+                    );
+                }
+            }
+            match req.into_body().collect().await {
+                Ok(collected) => collected.to_bytes().to_vec(),
+                Err(e) => return plain_response(StatusCode::BAD_REQUEST, &format!("{e}")),
+            }
+        }
+        _ => return plain_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed"),
+    };
+
+    match resolve_dns_query(&state, wire_query).await {
+        Ok(payload) => dns_message_response(StatusCode::OK, payload),
+        Err(e) => {
+            error!("DoH resolve failed: {e:#}");
+            plain_response(StatusCode::BAD_GATEWAY, "upstream resolution failed")
+        }
+    }
+}
+
+async fn serve_doh(shared: SharedState, tls: Arc<ServerConfig>) -> Result<()> {
+    let listen_addr = {
+        let cfg = shared.cfg.lock();
+        parse_doh_listen_addr(&cfg)?
+    };
+    let listener = TcpListener::bind(listen_addr)
+        .await
+        .with_context(|| format!("bind DoH listener on {listen_addr}"))?;
+    let acceptor = TlsAcceptor::from(tls);
+    let upstream_client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(8))
+        .build()
+        .context("building DoH upstream client")?;
+    let state = DohRuntimeState {
+        shared: shared.clone(),
+        upstream_client,
+    };
+    info!(
+        "DoH server listening on https://{}{}",
+        listen_addr,
+        shared.cfg.lock().normalized_doh_path()
+    );
+
+    loop {
+        if STOP_REQUESTED.load(Ordering::SeqCst) || shared.stopping.load(Ordering::SeqCst) {
+            break;
+        }
+        let accepted = tokio::time::timeout(Duration::from_millis(500), listener.accept()).await;
+        let (stream, _peer) = match accepted {
+            Ok(Ok(conn)) => conn,
+            Ok(Err(e)) => {
+                warn!("DoH accept error: {}", e);
+                continue;
+            }
+            Err(_) => continue,
+        };
+
+        let acceptor = acceptor.clone();
+        let request_state = state.clone();
+        tokio::spawn(async move {
+            match acceptor.accept(stream).await {
+                Ok(tls_stream) => {
+                    let svc_state = request_state.clone();
+                    let svc = service_fn(move |req| {
+                        let svc_state = svc_state.clone();
+                        async move {
+                            Ok::<HttpResponse, Infallible>(
+                                handle_doh_http_request(req, svc_state).await,
+                            )
+                        }
+                    });
+                    if let Err(e) = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(tls_stream), svc)
+                        .await
+                    {
+                        warn!("DoH connection error: {}", e);
+                    }
+                }
+                Err(e) => {
+                    warn!("DoH TLS accept error: {}", e);
+                }
+            }
+        });
+    }
+    info!("DoH server stopped");
+    Ok(())
+}
+
+fn ensure_doh_certificate(cfg: &DnsConfig) -> Result<()> {
+    if doh_private_key_path().exists() && doh_certificate_path().exists() {
+        return Ok(());
+    }
+
+    let host = cfg.doh.hostname.trim();
+    if host.is_empty() {
+        anyhow::bail!("doh.hostname is empty");
+    }
+
+    let mut params = CertificateParams::new(vec![host.to_string()])?;
+    params.is_ca = IsCa::NoCa;
+    params
+        .distinguished_name
+        .push(DnType::CommonName, host.to_string());
+    params
+        .subject_alt_names
+        .push(SanType::DnsName("localhost".to_string().try_into()?));
+    if host.eq_ignore_ascii_case("localhost") {
+        params
+            .subject_alt_names
+            .push(SanType::IpAddress(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+    } else if let Ok(ip) = host.parse::<IpAddr>() {
+        params.subject_alt_names.push(SanType::IpAddress(ip));
+    } else {
+        params
+            .subject_alt_names
+            .push(SanType::DnsName(host.to_string().try_into()?));
+    }
+    params
+        .subject_alt_names
+        .push(SanType::IpAddress(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+
+    let mut rng = OsRng;
+    let rsa_key = RsaPrivateKey::new(&mut rng, 4096).context("generate rsa key")?;
+    let key_pem = rsa_key
+        .to_pkcs8_pem(LineEnding::LF)
+        .context("serialize rsa key to PKCS#8")?
+        .to_string();
+    let key_pair = KeyPair::from_pem(&key_pem).context("load rcgen key pair")?;
+    let cert = params
+        .self_signed(&key_pair)
+        .context("self-sign DoH certificate")?;
+    write_atomic(&doh_private_key_path(), key_pem.as_bytes())?;
+    write_atomic(&doh_certificate_path(), cert.pem().as_bytes())?;
+    Ok(())
+}
+
+fn load_doh_tls_config(cfg: &DnsConfig) -> Result<Arc<ServerConfig>> {
+    use std::io::BufReader;
+
+    ensure_doh_certificate(cfg)?;
+
+    let key_pem = fs::read_to_string(doh_private_key_path()).context("read DoH private key")?;
+    let cert_pem = fs::read_to_string(doh_certificate_path()).context("read DoH certificate")?;
+
+    let mut cert_reader = BufReader::new(cert_pem.as_bytes());
+    let certs = rustls_pemfile::certs(&mut cert_reader)
+        .collect::<Result<Vec<CertificateDer<'static>>, _>>()
+        .context("read DoH cert chain")?;
+
+    let mut key_reader = BufReader::new(key_pem.as_bytes());
+    let pkcs8_keys = rustls_pemfile::pkcs8_private_keys(&mut key_reader)
+        .collect::<Result<Vec<_>, _>>()
+        .context("read DoH pkcs8 key")?;
+    let key = if let Some(key) = pkcs8_keys.into_iter().next() {
+        PrivateKeyDer::from(key)
+    } else {
+        key_reader = BufReader::new(key_pem.as_bytes());
+        let rsa_keys = rustls_pemfile::rsa_private_keys(&mut key_reader)
+            .collect::<Result<Vec<_>, _>>()
+            .context("read DoH rsa key")?;
+        match rsa_keys.into_iter().next() {
+            Some(key) => PrivateKeyDer::from(key),
+            None => return Err(anyhow!("no private key found for DoH")),
+        }
+    };
+
+    let tls = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .context("build DoH rustls config")?;
+    Ok(Arc::new(tls))
+}
+
+fn import_certificate_to_trust_store(path: &Path) -> Result<()> {
+    let path_str = path.display().to_string();
+    let script = format!(
+        "try {{ Import-Certificate -FilePath '{path}' -CertStoreLocation Cert:\\\\LocalMachine\\\\Root -ErrorAction Stop }} catch {{ Import-Certificate -FilePath '{path}' -CertStoreLocation Cert:\\\\CurrentUser\\\\Root }}",
+        path = path_str.replace('\'', "''"),
+    );
+    let status = Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            &script,
+        ])
+        .status()?;
+    if !status.success() {
+        warn!("DoH certificate import failed with status {:?}", status);
+    }
+    Ok(())
+}
+
+fn ensure_doh_firewall_rule(port: u16) -> Result<()> {
+    let rule_name = format!("Home DNS DoH {port}");
+    let check = Command::new("netsh")
+        .args([
+            "advfirewall",
+            "firewall",
+            "show",
+            "rule",
+            &format!("name={rule_name}"),
+        ])
+        .status();
+    if let Ok(status) = check {
+        if status.success() {
+            return Ok(());
+        }
+    }
+    let status = Command::new("netsh")
+        .args([
+            "advfirewall",
+            "firewall",
+            "add",
+            "rule",
+            &format!("name={rule_name}"),
+            "dir=in",
+            "action=allow",
+            "protocol=TCP",
+            &format!("localport={port}"),
+        ])
+        .status()?;
+    if !status.success() {
+        warn!("failed to create DoH firewall rule status {:?}", status);
+    }
+    Ok(())
+}
+
+fn register_windows_doh_template(cfg: &DnsConfig) -> Result<()> {
+    if cfg.servers_v4.is_empty() {
+        anyhow::bail!("servers_v4 vide: impossible d'enregistrer DoH");
+    }
+    let server_address = cfg.servers_v4[0].trim().to_string();
+    let template = cfg.doh_template_url();
+    let script = format!(
+        r#"$ErrorActionPreference = 'Stop'
+$server = '{server}'
+$template = '{template}'
+$existing = Get-DnsClientDohServerAddress -ServerAddress $server -ErrorAction SilentlyContinue
+if ($null -eq $existing) {{
+  Add-DnsClientDohServerAddress -ServerAddress $server -DohTemplate $template -AllowFallbackToUdp $false -AutoUpgrade $true
+}} else {{
+  Set-DnsClientDohServerAddress -ServerAddress $server -DohTemplate $template -AllowFallbackToUdp $false -AutoUpgrade $true
+}}"#,
+        server = server_address.replace('\'', "''"),
+        template = template.replace('\'', "''"),
+    );
+    let out = Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            &script,
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let details = if !stderr.is_empty() { stderr } else { stdout };
+        anyhow::bail!("register DoH template failed: {}", details);
+    }
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -772,11 +1397,38 @@ fn run_service() -> Result<()> {
             "build tag={} sha={} at {}",
             BUILD_GIT_TAG, BUILD_GIT_SHA, BUILD_TIME
         );
+        let doh_tls = if cfg.doh.enabled {
+            match load_doh_tls_config(&cfg) {
+                Ok(tls) => Some(tls),
+                Err(e) => {
+                    error!("failed to prepare DoH TLS: {e:#}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        if cfg.doh.enabled {
+            if let Err(e) = register_windows_doh_template(&cfg) {
+                warn!("DoH template registration skipped: {e:#}");
+            }
+        }
 
         let shared = SharedState {
             cfg: Arc::new(Mutex::new(cfg)),
             stopping: Arc::new(AtomicBool::new(false)),
         };
+
+        if let Some(tls) = doh_tls {
+            let doh_shared = shared.clone();
+            tokio::spawn(async move {
+                if let Err(e) = serve_doh(doh_shared, tls).await {
+                    error!("DoH server error: {e:#}");
+                }
+            });
+        } else {
+            info!("DoH server disabled");
+        }
 
         // Start gRPC server
         let grpc_service = MyDnsService {
@@ -846,10 +1498,37 @@ fn run_console() -> Result<()> {
                 load_config_or_init()?
             }
         };
+        let doh_tls = if cfg.doh.enabled {
+            match load_doh_tls_config(&cfg) {
+                Ok(tls) => Some(tls),
+                Err(e) => {
+                    error!("failed to prepare DoH TLS: {e:#}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        if cfg.doh.enabled {
+            if let Err(e) = register_windows_doh_template(&cfg) {
+                warn!("DoH template registration skipped: {e:#}");
+            }
+        }
         let shared = SharedState {
             cfg: Arc::new(Mutex::new(cfg)),
             stopping: Arc::new(AtomicBool::new(false)),
         };
+
+        if let Some(tls) = doh_tls {
+            let doh_shared = shared.clone();
+            tokio::spawn(async move {
+                if let Err(e) = serve_doh(doh_shared, tls).await {
+                    error!("DoH server error: {e:#}");
+                }
+            });
+        } else {
+            info!("DoH server disabled");
+        }
 
         // gRPC server
         let grpc_service = MyDnsService {
@@ -883,6 +1562,14 @@ fn install_service() -> Result<()> {
     let cfg = load_config_or_init()?;
     if let Err(e) = init_logger(level_from_cfg(&cfg)) {
         eprintln!("[install] logger init failed (continuing): {e}");
+    }
+    if cfg.doh.enabled {
+        ensure_doh_certificate(&cfg)?;
+        let _ = import_certificate_to_trust_store(&doh_certificate_path());
+        let _ = ensure_doh_firewall_rule(cfg.doh.port);
+        if let Err(e) = register_windows_doh_template(&cfg) {
+            warn!("DoH template registration failed during install: {e:#}");
+        }
     }
     let manager = ServiceManager::local_computer(
         None::<&str>,
@@ -1000,15 +1687,25 @@ fn main() -> Result<()> {
             restore_all()?;
             println!("DNS restaurés (toutes interfaces connues via dns.yaml).");
         }
+        "doh-register" => {
+            let cfg = load_config_or_init()?;
+            init_logger(level_from_cfg(&cfg))?;
+            ensure_doh_certificate(&cfg)?;
+            let _ = import_certificate_to_trust_store(&doh_certificate_path());
+            register_windows_doh_template(&cfg)?;
+            println!("Template DoH enregistré: {}", cfg.doh_template_url());
+        }
         _ => {
-            eprintln!("Usage: home-dns [install|uninstall|run|apply-once|restore]");
+            eprintln!(
+                "Usage: home-dns [install|uninstall|run|console|apply-once|restore|doh-register]"
+            );
         }
     }
     Ok(())
 }
 
-fn named_pipe_stream(
-) -> anyhow::Result<UnboundedReceiverStream<Result<PipeConnection, std::io::Error>>> {
+fn named_pipe_stream()
+-> anyhow::Result<UnboundedReceiverStream<Result<PipeConnection, std::io::Error>>> {
     let sddl = "D:(A;;GA;;;AC)(A;;GA;;;WD)(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;AU)(A;;FA;;;IU)"; // Allow AppContainer, Everyone, System, Admins, Authenticated, Interactive
     info!(
         "Preparing DNS named pipe listener: pipe={} sddl={}",
@@ -1052,8 +1749,7 @@ fn named_pipe_stream(
             let mut sa_first = windows_sys::Win32::Security::SECURITY_ATTRIBUTES {
                 nLength: std::mem::size_of::<windows_sys::Win32::Security::SECURITY_ATTRIBUTES>()
                     as u32,
-                lpSecurityDescriptor: sd_addr
-                    as windows_sys::Win32::Security::PSECURITY_DESCRIPTOR,
+                lpSecurityDescriptor: sd_addr as windows_sys::Win32::Security::PSECURITY_DESCRIPTOR,
                 bInheritHandle: 0,
             };
             match unsafe {
@@ -1090,8 +1786,9 @@ fn named_pipe_stream(
                         );
                         let new_server = {
                             let mut sa_loop = windows_sys::Win32::Security::SECURITY_ATTRIBUTES {
-                                nLength: std::mem::size_of::<windows_sys::Win32::Security::SECURITY_ATTRIBUTES>()
-                                    as u32,
+                                nLength: std::mem::size_of::<
+                                    windows_sys::Win32::Security::SECURITY_ATTRIBUTES,
+                                >() as u32,
                                 lpSecurityDescriptor: sd_addr
                                     as windows_sys::Win32::Security::PSECURITY_DESCRIPTOR,
                                 bInheritHandle: 0,
@@ -1141,5 +1838,3 @@ fn named_pipe_stream(
 
     Ok(UnboundedReceiverStream::new(rx))
 }
-
-

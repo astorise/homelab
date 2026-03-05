@@ -9,15 +9,26 @@ windows-sys = { version = "0.61.0", features = ["Win32_Foundation", "Win32_Secur
 sysinfo = { workspace = true }
 windows-service = { workspace = true }
 anyhow = "1.0"
+base64 = "0.22"
 serde = { version = "1.0", features = ["derive"] }
 serde_yaml = "0.9"
 serde_json = "1.0"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 log = "0.4"
 flexi_logger = { version = "0.31", default-features = false, features = ["colors"] }
+hickory-proto = "0.25"
+http = "1.1"
+http-body-util = "0.1"
+hyper = { version = "1.4", features = ["http1", "server"] }
 prost = "0.14"
 parking_lot = "0.12"
+rcgen = { version = "0.14", features = ["pem"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+rsa = { version = "0.9", features = ["pem"] }
+rustls = "0.23.36"
+rustls-pemfile = "2.0"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net"] }
+tokio-rustls = "0.26"
 tonic = { version = "0.14", features = ["transport"] }
 tonic-prost = "0.14"
 tower-http = { version = "0.6.0", features = ["cors"] }
@@ -25,6 +36,7 @@ tokio-stream = "0.1.15"
 futures-util = "0.3.30"
 pin-project = "1.1.5"
 hyper-util = { version = "0.1", features = ["tokio"] }
+url = "2.5"
 
 [build-dependencies]
 tonic-prost-build = "0.14"
