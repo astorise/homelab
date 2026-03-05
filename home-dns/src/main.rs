@@ -180,6 +180,8 @@ struct DnsConfig {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct DnsBackup {
     alias: String,
+    #[serde(default)]
+    if_index: Option<u32>,
     is_dhcp_v4: bool,
     is_dhcp_v6: bool,
     servers_v4: Vec<String>,
@@ -192,6 +194,8 @@ struct DnsBackup {
 struct PsAdapter {
     #[serde(rename = "Name")]
     name: String,
+    #[serde(rename = "ifIndex")]
+    if_index: Option<u32>,
     #[serde(rename = "MacAddress")]
     mac_address: Option<String>,
     #[serde(rename = "Status")]
@@ -288,10 +292,7 @@ fn matches_servers(values: &[String], expected: &[&str]) -> bool {
 }
 
 fn should_migrate_legacy_defaults(cfg: &DnsConfig) -> bool {
-    cfg.servers_v6.is_empty()
-        && cfg.backups.is_empty()
-        && cfg.records.is_empty()
-        && matches_servers(&cfg.servers_v4, LEGACY_DEFAULT_SERVERS_V4)
+    matches_servers(&cfg.servers_v4, LEGACY_DEFAULT_SERVERS_V4)
 }
 
 fn load_config_or_init() -> Result<DnsConfig> {
@@ -330,7 +331,7 @@ fn normalize_mac(mac: &str) -> String {
 }
 
 fn get_all_adapters() -> Result<Vec<PsAdapter>> {
-    let ps = r"Get-NetAdapter | Select-Object -Property Name,MacAddress,Status | ConvertTo-Json -Compress";
+    let ps = r"Get-NetAdapter | Select-Object -Property Name,ifIndex,MacAddress,Status | ConvertTo-Json -Compress";
     let out = Command::new("powershell")
         .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps])
         .stdout(Stdio::piped())
@@ -353,11 +354,11 @@ fn get_all_adapters() -> Result<Vec<PsAdapter>> {
     Ok(adapters)
 }
 
-fn read_current_dns(alias: &str, family: &str) -> Result<(bool, Vec<String>)> {
+fn read_current_dns(interface_index: u32, family: &str) -> Result<(bool, Vec<String>)> {
     let ps = format!(
-        "$x = Get-DnsClientServerAddress -InterfaceAlias \"{alias}\" -AddressFamily {family}
+        "$x = Get-DnsClientServerAddress -InterfaceIndex {interface_index} -AddressFamily {family}
 if ($x -eq $null -or $x.ServerAddresses -eq $null -or $x.ServerAddresses.Count -eq 0) {{\"DHCP\";\"\"}} else {{\"STATIC\"; [string]::Join(\",\", $x.ServerAddresses)}}",
-        alias = alias,
+        interface_index = interface_index,
         family = family,
     );
     let out = Command::new("powershell")
@@ -388,40 +389,57 @@ if ($x -eq $null -or $x.ServerAddresses -eq $null -or $x.ServerAddresses.Count -
     Ok((is_dhcp, servers))
 }
 
-fn set_dns_with_powershell(alias: &str, family: &str, servers: &[String]) -> Result<()> {
+fn set_dns_with_powershell(
+    interface_index: u32,
+    alias: &str,
+    family: &str,
+    servers: &[String],
+) -> Result<()> {
     let joined = servers
         .iter()
-        .map(|s| format!(r#"\"{}\""#, s))
+        .map(|s| format!("'{}'", s.replace('\'', "''")))
         .collect::<Vec<_>>()
         .join(",");
-    let cmd = format!(
-        "Set-DnsClientServerAddress -InterfaceAlias \"{alias}\" -AddressFamily {family} -ServerAddresses {joined}",
-        alias = alias,
-        family = family,
+    let ps = format!(
+        "$servers = @({joined}); Set-DnsClientServerAddress -InterfaceIndex {interface_index} -ServerAddresses $servers -ErrorAction Stop",
+        interface_index = interface_index,
         joined = joined,
     );
     debug!("Apply DNS [{} {} => {}]", alias, family, joined);
-    let status = Command::new("powershell")
-        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &cmd])
-        .status()?;
-    if !status.success() {
-        anyhow::bail!("Set-DnsClientServerAddress({}) a échoué", family);
+    let out = Command::new("powershell")
+        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &ps])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let details = if !stderr.is_empty() { stderr } else { stdout };
+        anyhow::bail!(
+            "Set-DnsClientServerAddress({}) a échoué: {}",
+            family,
+            details
+        );
     }
     Ok(())
 }
 
-fn reset_dns_to_dhcp(alias: &str, family: &str) -> Result<()> {
-    let cmd = format!(
-        "Set-DnsClientServerAddress -InterfaceAlias \"{alias}\" -AddressFamily {family} -ResetServerAddresses",
-        alias = alias,
-        family = family,
+fn reset_dns_to_dhcp(interface_index: u32, alias: &str, family: &str) -> Result<()> {
+    let ps = format!(
+        "Set-DnsClientServerAddress -InterfaceIndex {interface_index} -ResetServerAddresses -ErrorAction Stop",
+        interface_index = interface_index,
     );
     debug!("Reset DNS [{} {} to DHCP]", alias, family);
-    let status = Command::new("powershell")
-        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &cmd])
-        .status()?;
-    if !status.success() {
-        anyhow::bail!("ResetServerAddresses({}) a échoué", family);
+    let out = Command::new("powershell")
+        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &ps])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let details = if !stderr.is_empty() { stderr } else { stdout };
+        anyhow::bail!("ResetServerAddresses({}) a échoué: {}", family, details);
     }
     Ok(())
 }
@@ -438,17 +456,27 @@ fn snapshot_and_apply_all(mut cfg: DnsConfig) -> Result<DnsConfig> {
             }
         };
         let alias = ad.name;
+        let interface_index = match ad.if_index {
+            Some(index) => index,
+            None => {
+                warn!("Skip adapter without ifIndex: {}", alias);
+                continue;
+            }
+        };
         let status = ad.status.unwrap_or_default();
         debug!(
             "Processing adapter [{} MAC={} Status={}]",
             alias, mac, status
         );
-        let (is_dhcp_v4, servers_v4) = read_current_dns(&alias, "IPv4").unwrap_or((true, vec![]));
-        let (is_dhcp_v6, servers_v6) = read_current_dns(&alias, "IPv6").unwrap_or((true, vec![]));
+        let (is_dhcp_v4, servers_v4) =
+            read_current_dns(interface_index, "IPv4").unwrap_or((true, vec![]));
+        let (is_dhcp_v6, servers_v6) =
+            read_current_dns(interface_index, "IPv6").unwrap_or((true, vec![]));
         cfg.backups.insert(
             mac.clone(),
             DnsBackup {
                 alias: alias.clone(),
+                if_index: Some(interface_index),
                 is_dhcp_v4,
                 is_dhcp_v6,
                 servers_v4: servers_v4.clone(),
@@ -458,12 +486,16 @@ fn snapshot_and_apply_all(mut cfg: DnsConfig) -> Result<DnsConfig> {
             },
         );
         if !cfg.servers_v4.is_empty() {
-            if let Err(e) = set_dns_with_powershell(&alias, "IPv4", &cfg.servers_v4) {
+            if let Err(e) =
+                set_dns_with_powershell(interface_index, &alias, "IPv4", &cfg.servers_v4)
+            {
                 warn!("Failed to set IPv4 DNS on {}: {}", alias, e);
             }
         }
         if !cfg.servers_v6.is_empty() {
-            if let Err(e) = set_dns_with_powershell(&alias, "IPv6", &cfg.servers_v6) {
+            if let Err(e) =
+                set_dns_with_powershell(interface_index, &alias, "IPv6", &cfg.servers_v6)
+            {
                 warn!("Failed to set IPv6 DNS on {}: {}", alias, e);
             }
         }
@@ -476,9 +508,14 @@ fn restore_all() -> Result<()> {
     let mut cfg = load_config_or_init()?;
     let adapters = get_all_adapters().unwrap_or_default();
     let mut mac_to_alias: HashMap<String, String> = HashMap::new();
+    let mut mac_to_if_index: HashMap<String, u32> = HashMap::new();
     for ad in adapters {
         if let Some(mac) = ad.mac_address {
-            mac_to_alias.insert(normalize_mac(&mac), ad.name);
+            let mac = normalize_mac(&mac);
+            mac_to_alias.insert(mac.clone(), ad.name);
+            if let Some(if_index) = ad.if_index {
+                mac_to_if_index.insert(mac, if_index);
+            }
         }
     }
     let mut restored = 0usize;
@@ -492,16 +529,21 @@ fn restore_all() -> Result<()> {
                 .get(&mac)
                 .cloned()
                 .unwrap_or_else(|| entry.alias.clone());
+            let interface_index = mac_to_if_index.get(&mac).copied().or(entry.if_index);
+            let Some(interface_index) = interface_index else {
+                warn!("Cannot restore adapter {} (MAC={}): missing ifIndex", alias, mac);
+                continue;
+            };
             info!("Restoring adapter [{} MAC={}]", alias, mac);
             if entry.is_dhcp_v4 {
-                let _ = reset_dns_to_dhcp(&alias, "IPv4");
+                let _ = reset_dns_to_dhcp(interface_index, &alias, "IPv4");
             } else if !entry.servers_v4.is_empty() {
-                let _ = set_dns_with_powershell(&alias, "IPv4", &entry.servers_v4);
+                let _ = set_dns_with_powershell(interface_index, &alias, "IPv4", &entry.servers_v4);
             }
             if entry.is_dhcp_v6 {
-                let _ = reset_dns_to_dhcp(&alias, "IPv6");
+                let _ = reset_dns_to_dhcp(interface_index, &alias, "IPv6");
             } else if !entry.servers_v6.is_empty() {
-                let _ = set_dns_with_powershell(&alias, "IPv6", &entry.servers_v6);
+                let _ = set_dns_with_powershell(interface_index, &alias, "IPv6", &entry.servers_v6);
             }
             entry.dirty = false;
             restored += 1;
@@ -1099,3 +1141,5 @@ fn named_pipe_stream(
 
     Ok(UnboundedReceiverStream::new(rx))
 }
+
+
