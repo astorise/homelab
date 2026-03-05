@@ -268,13 +268,17 @@ impl DnsConfig {
         normalize_doh_path(&self.doh.path)
     }
 
-    fn doh_template_url(&self) -> String {
+    fn doh_endpoint_url(&self) -> String {
         format!(
             "https://{}:{}{}",
             self.doh.hostname.trim(),
             self.doh.port,
             self.normalized_doh_path()
         )
+    }
+
+    fn doh_template_url(&self) -> String {
+        format!("{}{{?dns}}", self.doh_endpoint_url())
     }
 }
 
@@ -1113,6 +1117,27 @@ fn import_certificate_to_trust_store(path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn install_rustls_provider() -> Result<()> {
+    if rustls::crypto::CryptoProvider::get_default().is_some() {
+        return Ok(());
+    }
+    if rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .is_ok()
+    {
+        return Ok(());
+    }
+    if rustls::crypto::ring::default_provider()
+        .install_default()
+        .is_ok()
+    {
+        return Ok(());
+    }
+    Err(anyhow!(
+        "impossible d'initialiser le provider Rustls (aws-lc-rs/ring)"
+    ))
+}
+
 fn ensure_doh_firewall_rule(port: u16) -> Result<()> {
     let rule_name = format!("Home DNS DoH {port}");
     let check = Command::new("netsh")
@@ -1390,6 +1415,7 @@ fn run_service() -> Result<()> {
     let rt = Runtime::new()?;
     rt.block_on(async {
         let cfg = load_config_or_init()?;
+        install_rustls_provider()?;
         let level = level_from_cfg(&cfg);
         init_logger(level)?;
         info!("Service starting (level={:?})", level);
@@ -1487,6 +1513,7 @@ fn run_console() -> Result<()> {
     let rt = Runtime::new()?;
     rt.block_on(async {
         let cfg = load_config_or_init()?;
+        install_rustls_provider()?;
         let level = level_from_cfg(&cfg);
         init_logger(level)?;
         info!("Console mode starting (level={:?})", level);
