@@ -103,6 +103,8 @@ const SERVICE_NAME: &str = "HomeDnsService";
 const SERVICE_DISPLAY_NAME: &str = "Home DNS Service";
 const SERVICE_DESCRIPTION: &str =
     r"DNS config + rollback + Windows RPC IPC on ncalrpc endpoint home-dns";
+const DEFAULT_SERVERS_V4: &[&str] = &["127.0.0.1"];
+const LEGACY_DEFAULT_SERVERS_V4: &[&str] = &["1.1.1.1", "1.0.0.1"];
 
 #[cfg(debug_assertions)]
 const NAMED_PIPE_NAME: &str = r"\\.\pipe\home-dns-dev";
@@ -273,11 +275,30 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+fn as_string_vec(values: &[&str]) -> Vec<String> {
+    values.iter().map(|value| (*value).to_string()).collect()
+}
+
+fn matches_servers(values: &[String], expected: &[&str]) -> bool {
+    values.len() == expected.len()
+        && values
+            .iter()
+            .zip(expected.iter())
+            .all(|(left, right)| left.trim().eq_ignore_ascii_case(right))
+}
+
+fn should_migrate_legacy_defaults(cfg: &DnsConfig) -> bool {
+    cfg.servers_v6.is_empty()
+        && cfg.backups.is_empty()
+        && cfg.records.is_empty()
+        && matches_servers(&cfg.servers_v4, LEGACY_DEFAULT_SERVERS_V4)
+}
+
 fn load_config_or_init() -> Result<DnsConfig> {
     let p = config_path();
     if !p.exists() {
         let cfg = DnsConfig {
-            servers_v4: vec!["1.1.1.1".into(), "1.0.0.1".into()],
+            servers_v4: as_string_vec(DEFAULT_SERVERS_V4),
             servers_v6: vec![],
             backups: HashMap::new(),
             log_level: Some(default_level_str().into()),
@@ -288,9 +309,13 @@ fn load_config_or_init() -> Result<DnsConfig> {
         return Ok(cfg);
     }
     let s = fs::read_to_string(&p).with_context(|| format!("lecture config: {}", p.display()))?;
-    let cfg: DnsConfig = serde_yaml::from_str(&s).context("YAML invalide")?;
+    let mut cfg: DnsConfig = serde_yaml::from_str(&s).context("YAML invalide")?;
     if cfg.servers_v4.is_empty() && cfg.servers_v6.is_empty() {
         anyhow::bail!("dns.yaml invalide: servers_v4 et servers_v6 sont vides");
+    }
+    if should_migrate_legacy_defaults(&cfg) {
+        cfg.servers_v4 = as_string_vec(DEFAULT_SERVERS_V4);
+        save_config(&cfg)?;
     }
     Ok(cfg)
 }

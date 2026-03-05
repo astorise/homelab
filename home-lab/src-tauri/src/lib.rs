@@ -6,7 +6,7 @@ use std::{fs, path::PathBuf};
 use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
 use tracing::{error, info, warn};
 use tracing_appender::{non_blocking::WorkerGuard, rolling};
-use tracing_subscriber::{fmt, EnvFilter};
+use tracing_subscriber::{EnvFilter, fmt};
 
 #[cfg(all(debug_assertions, target_os = "windows"))]
 mod dev_services;
@@ -131,6 +131,63 @@ fn init_file_logger() {
     }
 }
 
+#[cfg(all(target_os = "windows", not(debug_assertions)))]
+fn ensure_service_running(service_name: &'static str) {
+    let service = service_name.to_string();
+    tauri::async_runtime::spawn(async move {
+        let service_for_cmd = service.clone();
+        let result = tauri::async_runtime::spawn_blocking(move || {
+            let escaped = service_for_cmd.replace('\'', "''");
+            let cmd = format!(
+                "Try {{ $svc = Get-Service -Name '{escaped}' -ErrorAction Stop; if ($svc.Status -ne 'Running') {{ Start-Service -Name '{escaped}' -ErrorAction Stop; Write-Output 'started' }} else {{ Write-Output 'already-running' }} }} Catch {{ Write-Output ('error: ' + $_.Exception.Message) }}"
+            );
+            std::process::Command::new("powershell.exe")
+                .arg("-NoProfile")
+                .arg("-Command")
+                .arg(cmd)
+                .output()
+        })
+        .await;
+
+        match result {
+            Ok(Ok(output)) => {
+                let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                if !output.status.success() || stdout.starts_with("error:") {
+                    warn!(
+                        service = %service,
+                        status = %output.status,
+                        stdout = %stdout,
+                        stderr = %stderr,
+                        "Failed to ensure Windows service is running"
+                    );
+                } else {
+                    info!(
+                        service = %service,
+                        status = %output.status,
+                        stdout = %stdout,
+                        "Windows service startup check completed"
+                    );
+                }
+            }
+            Ok(Err(err)) => {
+                warn!(
+                    service = %service,
+                    error = %err,
+                    "Failed to run Start-Service command"
+                );
+            }
+            Err(err) => {
+                warn!(
+                    service = %service,
+                    error = %err,
+                    "Failed to join Start-Service task"
+                );
+            }
+        }
+    });
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     std::env::set_var("RUST_BACKTRACE", "1");
@@ -149,6 +206,11 @@ pub fn run() {
         .setup(|app| {
             let loaded_icons = Arc::new(crate::icons::Icons::load(&app.handle(), 20)?);
             crate::menu::setup_ui(&app.handle(), loaded_icons)?;
+
+            #[cfg(all(target_os = "windows", not(debug_assertions)))]
+            {
+                ensure_service_running("HomeDnsService");
+            }
 
             // En dev sur Windows, lance les services en mode console et redirige leurs logs
             #[cfg(all(debug_assertions, target_os = "windows"))]
