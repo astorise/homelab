@@ -28,7 +28,7 @@ use rsa::rand_core::OsRng;
 use rustls::ServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::convert::{Infallible, TryInto};
 use std::ffi::{OsString, c_void};
 use std::fs::{self, File};
@@ -42,8 +42,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context as TaskContext, Poll};
 use std::thread;
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpListener;
+use tokio::net::UdpSocket;
 use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
@@ -126,12 +127,14 @@ const SERVICE_NAME: &str = "HomeDnsService";
 const SERVICE_DISPLAY_NAME: &str = "Home DNS Service";
 const SERVICE_DESCRIPTION: &str =
     r"DNS config + rollback + Windows RPC IPC on ncalrpc endpoint home-dns";
-const DEFAULT_SERVERS_V4: &[&str] = &["127.0.0.1"];
+const DEFAULT_SERVERS_V4: &[&str] = &["127.0.0.2"];
 const LEGACY_DEFAULT_SERVERS_V4: &[&str] = &["1.1.1.1", "1.0.0.1"];
+const LEGACY_LOCALHOST_SERVERS_V4: &[&str] = &["127.0.0.1"];
 const DEFAULT_DOH_UPSTREAMS: &[&str] = &[
     "https://cloudflare-dns.com/dns-query",
     "https://dns.google/dns-query",
 ];
+const DEFAULT_UPSTREAM_DNS_V4: &[&str] = &["1.1.1.1", "8.8.8.8"];
 const DEFAULT_DOH_TTL: u32 = 60;
 
 #[cfg(debug_assertions)]
@@ -187,11 +190,11 @@ fn default_doh_enabled() -> bool {
 }
 
 fn default_doh_listen_addr() -> String {
-    "127.0.0.1".into()
+    "127.0.0.2".into()
 }
 
 fn default_doh_hostname() -> String {
-    "127.0.0.1".into()
+    "127.0.0.2".into()
 }
 
 fn default_doh_port() -> u16 {
@@ -204,6 +207,13 @@ fn default_doh_path() -> String {
 
 fn default_doh_upstreams() -> Vec<String> {
     DEFAULT_DOH_UPSTREAMS
+        .iter()
+        .map(|value| value.to_string())
+        .collect()
+}
+
+fn default_upstream_dns_v4() -> Vec<String> {
+    DEFAULT_UPSTREAM_DNS_V4
         .iter()
         .map(|value| value.to_string())
         .collect()
@@ -253,6 +263,8 @@ struct DnsConfig {
     servers_v4: Vec<String>,
     #[serde(default)]
     servers_v6: Vec<String>,
+    #[serde(default = "default_upstream_dns_v4")]
+    upstream_dns_v4: Vec<String>,
     #[serde(default)]
     backups: HashMap<String, DnsBackup>,
     #[serde(default)]
@@ -323,6 +335,10 @@ fn doh_private_key_path() -> PathBuf {
 
 fn doh_certificate_path() -> PathBuf {
     program_data_dir().join("doh-cert.pem")
+}
+
+fn doh_certificate_host_path() -> PathBuf {
+    program_data_dir().join("doh-cert-host.txt")
 }
 
 fn normalize_doh_path(path: &str) -> String {
@@ -418,6 +434,7 @@ fn matches_servers(values: &[String], expected: &[&str]) -> bool {
 
 fn should_migrate_legacy_defaults(cfg: &DnsConfig) -> bool {
     matches_servers(&cfg.servers_v4, LEGACY_DEFAULT_SERVERS_V4)
+        || matches_servers(&cfg.servers_v4, LEGACY_LOCALHOST_SERVERS_V4)
 }
 
 fn load_config_or_init() -> Result<DnsConfig> {
@@ -426,6 +443,7 @@ fn load_config_or_init() -> Result<DnsConfig> {
         let cfg = DnsConfig {
             servers_v4: as_string_vec(DEFAULT_SERVERS_V4),
             servers_v6: vec![],
+            upstream_dns_v4: default_upstream_dns_v4(),
             backups: HashMap::new(),
             log_level: Some(default_level_str().into()),
             records: HashMap::new(),
@@ -441,6 +459,10 @@ fn load_config_or_init() -> Result<DnsConfig> {
     if cfg.servers_v4.is_empty() && cfg.servers_v6.is_empty() {
         anyhow::bail!("dns.yaml invalide: servers_v4 et servers_v6 sont vides");
     }
+    if cfg.upstream_dns_v4.is_empty() {
+        cfg.upstream_dns_v4 = default_upstream_dns_v4();
+        changed = true;
+    }
     if should_migrate_legacy_defaults(&cfg) {
         cfg.servers_v4 = as_string_vec(DEFAULT_SERVERS_V4);
         changed = true;
@@ -448,8 +470,14 @@ fn load_config_or_init() -> Result<DnsConfig> {
     if cfg.doh.listen_addr.trim().is_empty() {
         cfg.doh.listen_addr = default_doh_listen_addr();
         changed = true;
+    } else if cfg.doh.listen_addr.trim().eq_ignore_ascii_case("127.0.0.1") {
+        cfg.doh.listen_addr = default_doh_listen_addr();
+        changed = true;
     }
     if cfg.doh.hostname.trim().is_empty() {
+        cfg.doh.hostname = default_doh_hostname();
+        changed = true;
+    } else if cfg.doh.hostname.trim().eq_ignore_ascii_case("127.0.0.1") {
         cfg.doh.hostname = default_doh_hostname();
         changed = true;
     }
@@ -722,6 +750,17 @@ struct DohRuntimeState {
     upstream_client: reqwest::Client,
 }
 
+fn build_runtime_state(shared: SharedState) -> Result<DohRuntimeState> {
+    let upstream_client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(8))
+        .build()
+        .context("building DoH upstream client")?;
+    Ok(DohRuntimeState {
+        shared,
+        upstream_client,
+    })
+}
+
 fn parse_doh_listen_addr(cfg: &DnsConfig) -> Result<SocketAddr> {
     let ip: IpAddr = cfg
         .doh
@@ -730,6 +769,29 @@ fn parse_doh_listen_addr(cfg: &DnsConfig) -> Result<SocketAddr> {
         .parse()
         .with_context(|| format!("doh.listen_addr invalide: {}", cfg.doh.listen_addr))?;
     Ok(SocketAddr::new(ip, cfg.doh.port))
+}
+
+fn parse_dns_bind_ipv4_addrs(cfg: &DnsConfig) -> Vec<Ipv4Addr> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for server in &cfg.servers_v4 {
+        let trimmed = server.trim();
+        let Ok(ip) = trimmed.parse::<Ipv4Addr>() else {
+            debug!("skip non-IPv4 DNS server for local bind: {}", trimmed);
+            continue;
+        };
+        if !ip.is_loopback() {
+            debug!(
+                "skip non-loopback DNS server for local listener bind: {}",
+                ip
+            );
+            continue;
+        }
+        if seen.insert(ip) {
+            out.push(ip);
+        }
+    }
+    out
 }
 
 fn normalize_record_key(value: &str) -> String {
@@ -850,14 +912,56 @@ fn dns_message_response(status: StatusCode, body: Vec<u8>) -> HttpResponse {
         .expect("dns response")
 }
 
+fn build_error_dns_response(wire_query: &[u8], code: ResponseCode) -> Option<Vec<u8>> {
+    let request = Message::from_vec(wire_query).ok()?;
+    let mut response = Message::new();
+    response.set_id(request.id());
+    response.set_message_type(MessageType::Response);
+    response.set_op_code(request.op_code());
+    response.set_recursion_desired(request.recursion_desired());
+    response.set_recursion_available(true);
+    response.set_response_code(code);
+    for query in request.queries().iter().cloned() {
+        response.add_query(query);
+    }
+    let mut bytes = Vec::with_capacity(512);
+    let mut encoder = BinEncoder::new(&mut bytes);
+    response.emit(&mut encoder).ok()?;
+    Some(bytes)
+}
+
 async fn forward_dns_query(state: &DohRuntimeState, wire_query: Vec<u8>) -> Result<Vec<u8>> {
-    let upstreams = state.shared.cfg.lock().doh.upstreams.clone();
-    if upstreams.is_empty() {
-        anyhow::bail!("doh.upstreams vide");
+    let (dns_upstreams, doh_upstreams) = {
+        let cfg = state.shared.cfg.lock();
+        (cfg.upstream_dns_v4.clone(), cfg.doh.upstreams.clone())
+    };
+    if doh_upstreams.is_empty() && dns_upstreams.is_empty() {
+        anyhow::bail!("aucun upstream configuré (DoH ou DNS UDP)");
     }
 
-    let mut last_error: Option<anyhow::Error> = None;
-    for upstream in upstreams {
+    let mut udp_error: Option<anyhow::Error> = None;
+    if !dns_upstreams.is_empty() {
+        match forward_dns_query_udp(&dns_upstreams, &wire_query).await {
+            Ok(response) => return Ok(response),
+            Err(e) => {
+                udp_error = Some(e);
+            }
+        }
+    }
+
+    let mut doh_last_error: Option<anyhow::Error> = None;
+    for upstream in doh_upstreams {
+        let should_skip = url::Url::parse(&upstream)
+            .ok()
+            .and_then(|url| url.host_str().map(|host| host.parse::<IpAddr>().is_err()))
+            .unwrap_or(false);
+        if should_skip {
+            debug!(
+                "skip DoH upstream with hostname (would recurse via local DNS): {}",
+                upstream
+            );
+            continue;
+        }
         let response = state
             .upstream_client
             .post(&upstream)
@@ -869,7 +973,7 @@ async fn forward_dns_query(state: &DohRuntimeState, wire_query: Vec<u8>) -> Resu
         match response {
             Ok(resp) => {
                 if !resp.status().is_success() {
-                    last_error = Some(anyhow!(
+                    doh_last_error = Some(anyhow!(
                         "DoH upstream {} returned {}",
                         upstream,
                         resp.status()
@@ -883,12 +987,54 @@ async fn forward_dns_query(state: &DohRuntimeState, wire_query: Vec<u8>) -> Resu
                 return Ok(payload.to_vec());
             }
             Err(err) => {
-                last_error = Some(anyhow!("DoH upstream {} failed: {}", upstream, err));
+                doh_last_error = Some(anyhow!("DoH upstream {} failed: {}", upstream, err));
             }
         }
     }
 
-    Err(last_error.unwrap_or_else(|| anyhow!("all DoH upstreams failed")))
+    if let Some(err) = udp_error {
+        return Err(err);
+    }
+    Err(doh_last_error.unwrap_or_else(|| anyhow!("all upstreams failed")))
+}
+
+async fn forward_dns_query_udp(upstreams: &[String], wire_query: &[u8]) -> Result<Vec<u8>> {
+    let mut last_error: Option<anyhow::Error> = None;
+    for upstream in upstreams {
+        let target_ip: IpAddr = match upstream.trim().parse() {
+            Ok(ip) => ip,
+            Err(e) => {
+                last_error = Some(anyhow!("invalid UDP upstream {}: {}", upstream, e));
+                continue;
+            }
+        };
+        let socket =
+            match UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)).await {
+                Ok(sock) => sock,
+                Err(e) => {
+                    last_error = Some(anyhow!("bind UDP upstream socket failed: {}", e));
+                    continue;
+                }
+            };
+        let target = SocketAddr::new(target_ip, 53);
+        if let Err(e) = socket.send_to(wire_query, target).await {
+            last_error = Some(anyhow!("UDP upstream send failed ({}): {}", target, e));
+            continue;
+        }
+        let mut buffer = vec![0u8; 4096];
+        let recv =
+            tokio::time::timeout(Duration::from_secs(3), socket.recv_from(&mut buffer)).await;
+        match recv {
+            Ok(Ok((size, _from))) => return Ok(buffer[..size].to_vec()),
+            Ok(Err(e)) => {
+                last_error = Some(anyhow!("UDP upstream recv failed ({}): {}", target, e));
+            }
+            Err(_) => {
+                last_error = Some(anyhow!("UDP upstream timeout ({})", target));
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow!("all UDP upstreams failed")))
 }
 
 async fn resolve_dns_query(state: &DohRuntimeState, wire_query: Vec<u8>) -> Result<Vec<u8>> {
@@ -899,6 +1045,133 @@ async fn resolve_dns_query(state: &DohRuntimeState, wire_query: Vec<u8>) -> Resu
         return Ok(local);
     }
     forward_dns_query(state, wire_query).await
+}
+
+async fn serve_dns_udp(bind_ip: Ipv4Addr, state: DohRuntimeState) -> Result<()> {
+    let bind_addr = SocketAddr::new(IpAddr::V4(bind_ip), 53);
+    let socket = UdpSocket::bind(bind_addr)
+        .await
+        .with_context(|| format!("bind DNS UDP listener on {bind_addr}"))?;
+    info!("DNS UDP listener on {}", bind_addr);
+    let mut buf = vec![0u8; 4096];
+    loop {
+        if STOP_REQUESTED.load(Ordering::SeqCst) || state.shared.stopping.load(Ordering::SeqCst) {
+            break;
+        }
+        let recv =
+            tokio::time::timeout(Duration::from_millis(500), socket.recv_from(&mut buf)).await;
+        let (size, peer) = match recv {
+            Ok(Ok(value)) => value,
+            Ok(Err(e)) => {
+                warn!("DNS UDP recv_from failed on {}: {}", bind_addr, e);
+                continue;
+            }
+            Err(_) => continue,
+        };
+
+        let wire_query = buf[..size].to_vec();
+        let wire_response = match resolve_dns_query(&state, wire_query.clone()).await {
+            Ok(payload) => payload,
+            Err(e) => {
+                warn!("DNS UDP resolve failed (peer={}): {}", peer, e);
+                build_error_dns_response(&wire_query, ResponseCode::ServFail).unwrap_or_default()
+            }
+        };
+
+        if wire_response.is_empty() {
+            continue;
+        }
+        if let Err(e) = socket.send_to(&wire_response, peer).await {
+            warn!("DNS UDP send_to failed (peer={}): {}", peer, e);
+        }
+    }
+    info!("DNS UDP listener stopped on {}", bind_addr);
+    Ok(())
+}
+
+async fn handle_dns_tcp_client(
+    mut stream: tokio::net::TcpStream,
+    peer: SocketAddr,
+    state: DohRuntimeState,
+) {
+    let mut len_buf = [0u8; 2];
+    loop {
+        match stream.read_exact(&mut len_buf).await {
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+            Err(e) if e.kind() == io::ErrorKind::ConnectionReset => break,
+            Err(e) => {
+                warn!("DNS TCP read length failed (peer={}): {}", peer, e);
+                break;
+            }
+        }
+        let size = u16::from_be_bytes(len_buf) as usize;
+        if size == 0 {
+            continue;
+        }
+        let mut wire_query = vec![0u8; size];
+        if let Err(e) = stream.read_exact(&mut wire_query).await {
+            warn!("DNS TCP read payload failed (peer={}): {}", peer, e);
+            break;
+        }
+
+        let wire_response = match resolve_dns_query(&state, wire_query.clone()).await {
+            Ok(payload) => payload,
+            Err(e) => {
+                warn!("DNS TCP resolve failed (peer={}): {}", peer, e);
+                build_error_dns_response(&wire_query, ResponseCode::ServFail).unwrap_or_default()
+            }
+        };
+        if wire_response.is_empty() {
+            continue;
+        }
+        if wire_response.len() > u16::MAX as usize {
+            warn!(
+                "DNS TCP response too large (peer={}, len={})",
+                peer,
+                wire_response.len()
+            );
+            break;
+        }
+        let response_len = (wire_response.len() as u16).to_be_bytes();
+        if let Err(e) = stream.write_all(&response_len).await {
+            warn!("DNS TCP write length failed (peer={}): {}", peer, e);
+            break;
+        }
+        if let Err(e) = stream.write_all(&wire_response).await {
+            warn!("DNS TCP write payload failed (peer={}): {}", peer, e);
+            break;
+        }
+    }
+    let _ = stream.shutdown().await;
+}
+
+async fn serve_dns_tcp(bind_ip: Ipv4Addr, state: DohRuntimeState) -> Result<()> {
+    let bind_addr = SocketAddr::new(IpAddr::V4(bind_ip), 53);
+    let listener = TcpListener::bind(bind_addr)
+        .await
+        .with_context(|| format!("bind DNS TCP listener on {bind_addr}"))?;
+    info!("DNS TCP listener on {}", bind_addr);
+    loop {
+        if STOP_REQUESTED.load(Ordering::SeqCst) || state.shared.stopping.load(Ordering::SeqCst) {
+            break;
+        }
+        let accepted = tokio::time::timeout(Duration::from_millis(500), listener.accept()).await;
+        let (stream, peer) = match accepted {
+            Ok(Ok(value)) => value,
+            Ok(Err(e)) => {
+                warn!("DNS TCP accept failed on {}: {}", bind_addr, e);
+                continue;
+            }
+            Err(_) => continue,
+        };
+        let state = state.clone();
+        tokio::spawn(async move {
+            handle_dns_tcp_client(stream, peer, state).await;
+        });
+    }
+    info!("DNS TCP listener stopped on {}", bind_addr);
+    Ok(())
 }
 
 async fn handle_doh_http_request(req: Request<Incoming>, state: DohRuntimeState) -> HttpResponse {
@@ -943,7 +1216,8 @@ async fn handle_doh_http_request(req: Request<Incoming>, state: DohRuntimeState)
     }
 }
 
-async fn serve_doh(shared: SharedState, tls: Arc<ServerConfig>) -> Result<()> {
+async fn serve_doh(state: DohRuntimeState, tls: Arc<ServerConfig>) -> Result<()> {
+    let shared = state.shared.clone();
     let listen_addr = {
         let cfg = shared.cfg.lock();
         parse_doh_listen_addr(&cfg)?
@@ -952,14 +1226,6 @@ async fn serve_doh(shared: SharedState, tls: Arc<ServerConfig>) -> Result<()> {
         .await
         .with_context(|| format!("bind DoH listener on {listen_addr}"))?;
     let acceptor = TlsAcceptor::from(tls);
-    let upstream_client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(8))
-        .build()
-        .context("building DoH upstream client")?;
-    let state = DohRuntimeState {
-        shared: shared.clone(),
-        upstream_client,
-    };
     info!(
         "DoH server listening on https://{}{}",
         listen_addr,
@@ -998,7 +1264,12 @@ async fn serve_doh(shared: SharedState, tls: Arc<ServerConfig>) -> Result<()> {
                         .serve_connection(TokioIo::new(tls_stream), svc)
                         .await
                     {
-                        warn!("DoH connection error: {}", e);
+                        let message = e.to_string();
+                        if message.contains("error shutting down connection") {
+                            debug!("DoH connection closed: {}", message);
+                        } else {
+                            warn!("DoH connection error: {}", message);
+                        }
                     }
                 }
                 Err(e) => {
@@ -1012,13 +1283,26 @@ async fn serve_doh(shared: SharedState, tls: Arc<ServerConfig>) -> Result<()> {
 }
 
 fn ensure_doh_certificate(cfg: &DnsConfig) -> Result<()> {
-    if doh_private_key_path().exists() && doh_certificate_path().exists() {
-        return Ok(());
-    }
-
     let host = cfg.doh.hostname.trim();
     if host.is_empty() {
         anyhow::bail!("doh.hostname is empty");
+    }
+    let host_marker = doh_certificate_host_path();
+    let normalized_host = host.to_ascii_lowercase();
+
+    let key_exists = doh_private_key_path().exists();
+    let cert_exists = doh_certificate_path().exists();
+    if key_exists && cert_exists {
+        let recorded_host = fs::read_to_string(&host_marker)
+            .ok()
+            .map(|value| value.trim().to_ascii_lowercase());
+        if recorded_host.as_deref() == Some(normalized_host.as_str()) {
+            return Ok(());
+        }
+        info!(
+            "DoH certificate host changed (old={:?}, new={}), regenerating certificate",
+            recorded_host, normalized_host
+        );
     }
 
     let mut params = CertificateParams::new(vec![host.to_string()])?;
@@ -1056,6 +1340,7 @@ fn ensure_doh_certificate(cfg: &DnsConfig) -> Result<()> {
         .context("self-sign DoH certificate")?;
     write_atomic(&doh_private_key_path(), key_pem.as_bytes())?;
     write_atomic(&doh_certificate_path(), cert.pem().as_bytes())?;
+    write_atomic(&host_marker, normalized_host.as_bytes())?;
     Ok(())
 }
 
@@ -1185,9 +1470,9 @@ $server = '{server}'
 $template = '{template}'
 $existing = Get-DnsClientDohServerAddress -ServerAddress $server -ErrorAction SilentlyContinue
 if ($null -eq $existing) {{
-  Add-DnsClientDohServerAddress -ServerAddress $server -DohTemplate $template -AllowFallbackToUdp $false -AutoUpgrade $true
+  Add-DnsClientDohServerAddress -ServerAddress $server -DohTemplate $template -AllowFallbackToUdp $true -AutoUpgrade $true
 }} else {{
-  Set-DnsClientDohServerAddress -ServerAddress $server -DohTemplate $template -AllowFallbackToUdp $false -AutoUpgrade $true
+  Set-DnsClientDohServerAddress -ServerAddress $server -DohTemplate $template -AllowFallbackToUdp $true -AutoUpgrade $true
 }}"#,
         server = server_address.replace('\'', "''"),
         template = template.replace('\'', "''"),
@@ -1435,6 +1720,7 @@ fn run_service() -> Result<()> {
             None
         };
         if cfg.doh.enabled {
+            let _ = import_certificate_to_trust_store(&doh_certificate_path());
             if let Err(e) = register_windows_doh_template(&cfg) {
                 warn!("DoH template registration skipped: {e:#}");
             }
@@ -1445,15 +1731,49 @@ fn run_service() -> Result<()> {
             stopping: Arc::new(AtomicBool::new(false)),
         };
 
+        let runtime_state = match build_runtime_state(shared.clone()) {
+            Ok(state) => Some(state),
+            Err(e) => {
+                error!("failed to initialize DNS runtime state: {e:#}");
+                None
+            }
+        };
+        let bind_ips = {
+            let cfg = shared.cfg.lock().clone();
+            parse_dns_bind_ipv4_addrs(&cfg)
+        };
+        if let Some(state) = runtime_state.clone() {
+            if bind_ips.is_empty() {
+                warn!("no loopback DNS address configured in servers_v4; DNS data-plane disabled");
+            }
+            for ip in bind_ips {
+                let state_udp = state.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = serve_dns_udp(ip, state_udp).await {
+                        error!("DNS UDP listener error on {}: {e:#}", ip);
+                    }
+                });
+                let state_tcp = state.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = serve_dns_tcp(ip, state_tcp).await {
+                        error!("DNS TCP listener error on {}: {e:#}", ip);
+                    }
+                });
+            }
+        }
+
         if let Some(tls) = doh_tls {
-            let doh_shared = shared.clone();
-            tokio::spawn(async move {
-                if let Err(e) = serve_doh(doh_shared, tls).await {
-                    error!("DoH server error: {e:#}");
-                }
-            });
+            if let Some(state) = runtime_state.clone() {
+                tokio::spawn(async move {
+                    if let Err(e) = serve_doh(state, tls).await {
+                        error!("DoH server error: {e:#}");
+                    }
+                });
+            } else {
+                error!("DoH server not started: runtime state unavailable");
+            }
         } else {
-            info!("DoH server disabled");
+            info!("DoH server disabled by configuration");
         }
 
         // Start gRPC server
@@ -1537,6 +1857,7 @@ fn run_console() -> Result<()> {
             None
         };
         if cfg.doh.enabled {
+            let _ = import_certificate_to_trust_store(&doh_certificate_path());
             if let Err(e) = register_windows_doh_template(&cfg) {
                 warn!("DoH template registration skipped: {e:#}");
             }
@@ -1546,15 +1867,49 @@ fn run_console() -> Result<()> {
             stopping: Arc::new(AtomicBool::new(false)),
         };
 
+        let runtime_state = match build_runtime_state(shared.clone()) {
+            Ok(state) => Some(state),
+            Err(e) => {
+                error!("failed to initialize DNS runtime state: {e:#}");
+                None
+            }
+        };
+        let bind_ips = {
+            let cfg = shared.cfg.lock().clone();
+            parse_dns_bind_ipv4_addrs(&cfg)
+        };
+        if let Some(state) = runtime_state.clone() {
+            if bind_ips.is_empty() {
+                warn!("no loopback DNS address configured in servers_v4; DNS data-plane disabled");
+            }
+            for ip in bind_ips {
+                let state_udp = state.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = serve_dns_udp(ip, state_udp).await {
+                        error!("DNS UDP listener error on {}: {e:#}", ip);
+                    }
+                });
+                let state_tcp = state.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = serve_dns_tcp(ip, state_tcp).await {
+                        error!("DNS TCP listener error on {}: {e:#}", ip);
+                    }
+                });
+            }
+        }
+
         if let Some(tls) = doh_tls {
-            let doh_shared = shared.clone();
-            tokio::spawn(async move {
-                if let Err(e) = serve_doh(doh_shared, tls).await {
-                    error!("DoH server error: {e:#}");
-                }
-            });
+            if let Some(state) = runtime_state.clone() {
+                tokio::spawn(async move {
+                    if let Err(e) = serve_doh(state, tls).await {
+                        error!("DoH server error: {e:#}");
+                    }
+                });
+            } else {
+                error!("DoH server not started: runtime state unavailable");
+            }
         } else {
-            info!("DoH server disabled");
+            info!("DoH server disabled by configuration");
         }
 
         // gRPC server
