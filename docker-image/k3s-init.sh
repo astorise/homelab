@@ -22,10 +22,50 @@ ENABLE_TRAEFIK=${ENABLE_TRAEFIK:-1}
 BOOTSTRAP_ONLY=${BOOTSTRAP_ONLY:-0}
 BOOTSTRAP_TIMEOUT=${BOOTSTRAP_TIMEOUT:-180}
 BOOTSTRAP_INTERVAL=${BOOTSTRAP_INTERVAL:-3}
+K3S_LOCK_DIR=${K3S_LOCK_DIR:-/run/k3s-init.lock}
+K3S_RESTART_BASE_DELAY=${K3S_RESTART_BASE_DELAY:-2}
+K3S_RESTART_MAX_DELAY=${K3S_RESTART_MAX_DELAY:-30}
+K3S_MIN_UPTIME=${K3S_MIN_UPTIME:-20}
 
 log_info "Role: $ROLE"
 log_info "Port range: $PORT_RANGE"
 log_info "Traefik enabled: $ENABLE_TRAEFIK"
+
+LOCK_HELD=0
+cleanup_lock() {
+    if [ "$LOCK_HELD" = "1" ] && [ -d "$K3S_LOCK_DIR" ]; then
+        rm -rf "$K3S_LOCK_DIR"
+    fi
+}
+
+acquire_lock_or_exit() {
+    if mkdir "$K3S_LOCK_DIR" 2>/dev/null; then
+        LOCK_HELD=1
+        echo "$$" > "$K3S_LOCK_DIR/pid"
+        trap cleanup_lock EXIT INT TERM
+        return 0
+    fi
+
+    if [ -f "$K3S_LOCK_DIR/pid" ]; then
+        lock_pid=$(cat "$K3S_LOCK_DIR/pid" 2>/dev/null || true)
+        if [ -n "$lock_pid" ] && kill -0 "$lock_pid" 2>/dev/null; then
+            log_info "Another k3s-init instance is already running (pid=$lock_pid), exiting."
+            exit 0
+        fi
+    fi
+
+    log_info "Removing stale k3s-init lock and retrying."
+    rm -rf "$K3S_LOCK_DIR"
+    if mkdir "$K3S_LOCK_DIR" 2>/dev/null; then
+        LOCK_HELD=1
+        echo "$$" > "$K3S_LOCK_DIR/pid"
+        trap cleanup_lock EXIT INT TERM
+        return 0
+    fi
+
+    log_error "Unable to acquire k3s-init lock at $K3S_LOCK_DIR."
+    exit 1
+}
 
 detect_node_ip() {
     # Prefer the primary WSL interface and always ignore loopback/link-local.
@@ -111,7 +151,37 @@ run_k3s_server() {
     fi
 }
 
+run_k3s_server_supervised() {
+    delay=$K3S_RESTART_BASE_DELAY
+    while true; do
+        started_at=$(date +%s)
+        run_k3s_server
+        rc=$?
+        ended_at=$(date +%s)
+        uptime=$((ended_at - started_at))
+
+        # Exit cleanly on explicit stop signals propagated as shell-friendly codes.
+        if [ "$rc" -eq 0 ] || [ "$rc" -eq 130 ] || [ "$rc" -eq 143 ]; then
+            log_info "k3s server exited with code $rc, stopping supervisor."
+            return "$rc"
+        fi
+
+        if [ "$uptime" -ge "$K3S_MIN_UPTIME" ]; then
+            delay=$K3S_RESTART_BASE_DELAY
+        else
+            delay=$((delay * 2))
+            if [ "$delay" -gt "$K3S_RESTART_MAX_DELAY" ]; then
+                delay=$K3S_RESTART_MAX_DELAY
+            fi
+        fi
+
+        log_error "k3s server exited with code $rc after ${uptime}s, restarting in ${delay}s."
+        sleep "$delay"
+    done
+}
+
 if [ "$ROLE" = "server" ]; then
+    acquire_lock_or_exit
     ensure_server_config
     sync_kubeconfig || true
 
@@ -155,8 +225,8 @@ if [ "$ROLE" = "server" ]; then
         exit 0
     fi
 
-    log_info "Starting k3s server on port $API_PORT"
-    run_k3s_server
+    log_info "Starting supervised k3s server on port $API_PORT"
+    run_k3s_server_supervised
 else
     if [ -z "$K3S_URL" ]; then
         log_error "K3S_URL environment variable is required for agent role."
