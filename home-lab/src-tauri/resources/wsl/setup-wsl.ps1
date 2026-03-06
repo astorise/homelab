@@ -109,8 +109,8 @@ function Clear-K3sLocks {
         [string]$Distro
     )
 
-    $cmd = @'
-set -euo pipefail
+$cmd = @'
+set -eu
 LOCK_FILE="/var/lib/rancher/k3s/data/.lock"
 if [ -f "$LOCK_FILE" ]; then
     rm -f "$LOCK_FILE"
@@ -130,7 +130,7 @@ function Invoke-K3sBootstrap {
     )
 
     Write-Info "Initialisation de k3s (bootstrap) dans $Distro"
-    $cmd = "set -euo pipefail; BOOTSTRAP_ONLY=1 BOOTSTRAP_TIMEOUT=$TimeoutSeconds /usr/local/bin/k3s-init.sh"
+    $cmd = "set -eu; BOOTSTRAP_ONLY=1 BOOTSTRAP_TIMEOUT=$TimeoutSeconds /usr/local/bin/k3s-init.sh"
     $std = & wsl.exe -d $Distro -- sh -c $cmd 2>&1
     $exitCode = $LASTEXITCODE
 
