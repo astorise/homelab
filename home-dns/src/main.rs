@@ -127,9 +127,10 @@ const SERVICE_NAME: &str = "HomeDnsService";
 const SERVICE_DISPLAY_NAME: &str = "Home DNS Service";
 const SERVICE_DESCRIPTION: &str =
     r"DNS config + rollback + Windows RPC IPC on ncalrpc endpoint home-dns";
-const DEFAULT_SERVERS_V4: &[&str] = &["127.0.0.2"];
+const DEFAULT_SERVERS_V4: &[&str] = &["127.0.0.1"];
 const LEGACY_DEFAULT_SERVERS_V4: &[&str] = &["1.1.1.1", "1.0.0.1"];
 const LEGACY_LOCALHOST_SERVERS_V4: &[&str] = &["127.0.0.1"];
+const LEGACY_LOOPBACK_2_SERVERS_V4: &[&str] = &["127.0.0.2"];
 const DEFAULT_DOH_UPSTREAMS: &[&str] = &[
     "https://cloudflare-dns.com/dns-query",
     "https://dns.google/dns-query",
@@ -190,11 +191,11 @@ fn default_doh_enabled() -> bool {
 }
 
 fn default_doh_listen_addr() -> String {
-    "127.0.0.2".into()
+    "127.0.0.1".into()
 }
 
 fn default_doh_hostname() -> String {
-    "127.0.0.2".into()
+    "127.0.0.1".into()
 }
 
 fn default_doh_port() -> u16 {
@@ -219,7 +220,7 @@ fn default_upstream_dns_v4() -> Vec<String> {
         .collect()
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 struct RecordEntry {
     #[serde(default)]
     a: Vec<String>,
@@ -435,6 +436,7 @@ fn matches_servers(values: &[String], expected: &[&str]) -> bool {
 fn should_migrate_legacy_defaults(cfg: &DnsConfig) -> bool {
     matches_servers(&cfg.servers_v4, LEGACY_DEFAULT_SERVERS_V4)
         || matches_servers(&cfg.servers_v4, LEGACY_LOCALHOST_SERVERS_V4)
+        || matches_servers(&cfg.servers_v4, LEGACY_LOOPBACK_2_SERVERS_V4)
 }
 
 fn load_config_or_init() -> Result<DnsConfig> {
@@ -470,14 +472,24 @@ fn load_config_or_init() -> Result<DnsConfig> {
     if cfg.doh.listen_addr.trim().is_empty() {
         cfg.doh.listen_addr = default_doh_listen_addr();
         changed = true;
-    } else if cfg.doh.listen_addr.trim().eq_ignore_ascii_case("127.0.0.1") {
+    } else if cfg
+        .doh
+        .listen_addr
+        .trim()
+        .eq_ignore_ascii_case("127.0.0.2")
+    {
         cfg.doh.listen_addr = default_doh_listen_addr();
         changed = true;
     }
     if cfg.doh.hostname.trim().is_empty() {
         cfg.doh.hostname = default_doh_hostname();
         changed = true;
-    } else if cfg.doh.hostname.trim().eq_ignore_ascii_case("127.0.0.1") {
+    } else if cfg
+        .doh
+        .hostname
+        .trim()
+        .eq_ignore_ascii_case("127.0.0.2")
+    {
         cfg.doh.hostname = default_doh_hostname();
         changed = true;
     }
@@ -494,6 +506,9 @@ fn load_config_or_init() -> Result<DnsConfig> {
         cfg.doh.upstreams = default_doh_upstreams();
         changed = true;
     }
+    if normalize_record_map(&mut cfg.records) {
+        changed = true;
+    }
     if changed {
         save_config(&cfg)?;
     }
@@ -507,6 +522,24 @@ fn save_config(cfg: &DnsConfig) -> Result<()> {
 
 fn normalize_mac(mac: &str) -> String {
     mac.trim().to_uppercase().replace(":", "-")
+}
+
+fn adapter_backup_key(alias: &str, if_index: Option<u32>, mac: Option<&str>) -> Option<String> {
+    if let Some(mac) = mac {
+        let trimmed = mac.trim();
+        if !trimmed.is_empty() {
+            return Some(normalize_mac(trimmed));
+        }
+    }
+    if let Some(idx) = if_index {
+        // VPN/virtual adapters may not expose a MAC; track them by ifIndex.
+        return Some(format!("IFINDEX-{}", idx));
+    }
+    warn!(
+        "Skip adapter without key material (alias={}): missing MAC/ifIndex",
+        alias
+    );
+    None
 }
 
 fn get_all_adapters() -> Result<Vec<PsAdapter>> {
@@ -627,14 +660,11 @@ fn snapshot_and_apply_all(mut cfg: DnsConfig) -> Result<DnsConfig> {
     let adapters = get_all_adapters()?;
     info!("Applying DNS to {} adapters", adapters.len());
     for ad in adapters {
-        let mac = match ad.mac_address {
-            Some(ref m) if !m.trim().is_empty() => normalize_mac(m),
-            _ => {
-                debug!("Skip adapter without MAC: {}", ad.name);
-                continue;
-            }
-        };
         let alias = ad.name;
+        let backup_key = match adapter_backup_key(&alias, ad.if_index, ad.mac_address.as_deref()) {
+            Some(key) => key,
+            None => continue,
+        };
         let interface_index = match ad.if_index {
             Some(index) => index,
             None => {
@@ -644,15 +674,15 @@ fn snapshot_and_apply_all(mut cfg: DnsConfig) -> Result<DnsConfig> {
         };
         let status = ad.status.unwrap_or_default();
         debug!(
-            "Processing adapter [{} MAC={} Status={}]",
-            alias, mac, status
+            "Processing adapter [{} key={} Status={}]",
+            alias, backup_key, status
         );
         let (is_dhcp_v4, servers_v4) =
             read_current_dns(interface_index, "IPv4").unwrap_or((true, vec![]));
         let (is_dhcp_v6, servers_v6) =
             read_current_dns(interface_index, "IPv6").unwrap_or((true, vec![]));
         cfg.backups.insert(
-            mac.clone(),
+            backup_key,
             DnsBackup {
                 alias: alias.clone(),
                 if_index: Some(interface_index),
@@ -686,37 +716,41 @@ fn snapshot_and_apply_all(mut cfg: DnsConfig) -> Result<DnsConfig> {
 fn restore_all() -> Result<()> {
     let mut cfg = load_config_or_init()?;
     let adapters = get_all_adapters().unwrap_or_default();
-    let mut mac_to_alias: HashMap<String, String> = HashMap::new();
-    let mut mac_to_if_index: HashMap<String, u32> = HashMap::new();
+    let mut key_to_alias: HashMap<String, String> = HashMap::new();
+    let mut key_to_if_index: HashMap<String, u32> = HashMap::new();
     for ad in adapters {
-        if let Some(mac) = ad.mac_address {
-            let mac = normalize_mac(&mac);
-            mac_to_alias.insert(mac.clone(), ad.name);
+        if let Some(key) = adapter_backup_key(&ad.name, ad.if_index, ad.mac_address.as_deref()) {
+            key_to_alias.insert(key.clone(), ad.name.clone());
             if let Some(if_index) = ad.if_index {
-                mac_to_if_index.insert(mac, if_index);
+                key_to_if_index.insert(key, if_index);
             }
+        }
+        if let Some(if_index) = ad.if_index {
+            let ifindex_key = format!("IFINDEX-{}", if_index);
+            key_to_alias.insert(ifindex_key.clone(), ad.name.clone());
+            key_to_if_index.insert(ifindex_key, if_index);
         }
     }
     let mut restored = 0usize;
     let keys: Vec<String> = cfg.backups.keys().cloned().collect();
-    for mac in keys {
-        if let Some(entry) = cfg.backups.get_mut(&mac) {
+    for key in keys {
+        if let Some(entry) = cfg.backups.get_mut(&key) {
             if !entry.dirty {
                 continue;
             }
-            let alias = mac_to_alias
-                .get(&mac)
+            let alias = key_to_alias
+                .get(&key)
                 .cloned()
                 .unwrap_or_else(|| entry.alias.clone());
-            let interface_index = mac_to_if_index.get(&mac).copied().or(entry.if_index);
+            let interface_index = key_to_if_index.get(&key).copied().or(entry.if_index);
             let Some(interface_index) = interface_index else {
                 warn!(
-                    "Cannot restore adapter {} (MAC={}): missing ifIndex",
-                    alias, mac
+                    "Cannot restore adapter {} (key={}): missing ifIndex",
+                    alias, key
                 );
                 continue;
             };
-            info!("Restoring adapter [{} MAC={}]", alias, mac);
+            info!("Restoring adapter [{} key={}]", alias, key);
             if entry.is_dhcp_v4 {
                 let _ = reset_dns_to_dhcp(interface_index, &alias, "IPv4");
             } else if !entry.servers_v4.is_empty() {
@@ -795,7 +829,57 @@ fn parse_dns_bind_ipv4_addrs(cfg: &DnsConfig) -> Vec<Ipv4Addr> {
 }
 
 fn normalize_record_key(value: &str) -> String {
-    value.trim().trim_end_matches('.').to_ascii_lowercase()
+    let mut out = String::new();
+    for ch in value.trim().trim_start_matches('\u{feff}').chars() {
+        let lower = ch.to_ascii_lowercase();
+        if lower.is_ascii_alphanumeric() || matches!(lower, '.' | '-') {
+            out.push(lower);
+        }
+    }
+    out.trim_matches('.').to_string()
+}
+
+fn normalize_record_values(values: &mut Vec<String>) {
+    values.iter_mut().for_each(|value| *value = value.trim().to_string());
+    values.retain(|value| !value.is_empty());
+    values.sort_unstable();
+    values.dedup();
+}
+
+fn normalize_record_map(records: &mut HashMap<String, RecordEntry>) -> bool {
+    let mut changed = false;
+    let mut normalized = HashMap::new();
+
+    for (name, mut entry) in std::mem::take(records) {
+        let key = normalize_record_key(&name);
+        if key.is_empty() {
+            changed = true;
+            continue;
+        }
+        normalize_record_values(&mut entry.a);
+        normalize_record_values(&mut entry.aaaa);
+
+        let merged = normalized.entry(key.clone()).or_insert_with(RecordEntry::default);
+        let before_a = merged.a.len();
+        merged.a.extend(entry.a);
+        normalize_record_values(&mut merged.a);
+        let before_aaaa = merged.aaaa.len();
+        merged.aaaa.extend(entry.aaaa);
+        normalize_record_values(&mut merged.aaaa);
+        if merged.ttl.is_none() {
+            merged.ttl = entry.ttl;
+        }
+
+        if key != name || merged.a.len() != before_a || merged.aaaa.len() != before_aaaa {
+            changed = true;
+        }
+    }
+
+    if *records != normalized {
+        *records = normalized;
+        changed = true;
+    }
+    changed
 }
 
 fn find_record_entry<'a>(
@@ -803,10 +887,12 @@ fn find_record_entry<'a>(
     query_name: &str,
 ) -> Option<&'a RecordEntry> {
     let expected = normalize_record_key(query_name);
-    records
-        .iter()
-        .find(|(name, _)| normalize_record_key(name) == expected)
-        .map(|(_, entry)| entry)
+    records.get(&expected).or_else(|| {
+        records
+            .iter()
+            .find(|(name, _)| normalize_record_key(name) == expected)
+            .map(|(_, entry)| entry)
+    })
 }
 
 fn build_local_dns_response(cfg: &DnsConfig, wire_query: &[u8]) -> Result<Option<Vec<u8>>> {
@@ -826,9 +912,27 @@ fn build_local_dns_response(cfg: &DnsConfig, wire_query: &[u8]) -> Result<Option
             continue;
         }
         let query_name = query.name().to_utf8();
+        let normalized_query = normalize_record_key(&query_name);
         let Some(entry) = find_record_entry(&cfg.records, &query_name) else {
+            // Defensive fallback: homelab cluster domains are expected to live under `.wsl`
+            // and point to localhost through home-http.
+            if normalized_query.ends_with(".wsl") && query.query_type() == RecordType::A {
+                local_hit = true;
+                response.add_answer(DnsRecord::from_rdata(
+                    query.name().clone(),
+                    DEFAULT_DOH_TTL,
+                    RData::A(RDataA(Ipv4Addr::LOCALHOST)),
+                ));
+                continue;
+            }
             continue;
         };
+        if normalized_query.ends_with(".wsl") {
+            debug!(
+                "DNS local hit: query={} normalized={} record_ttl={:?}",
+                query_name, normalized_query, entry.ttl
+            );
+        }
         local_hit = true;
         let ttl = entry.ttl.unwrap_or(DEFAULT_DOH_TTL);
         match query.query_type() {
@@ -1557,7 +1661,8 @@ impl HomeDns for MyDnsService {
         request: tonic::Request<AddRecordRequest>,
     ) -> Result<tonic::Response<Ack>, tonic::Status> {
         let r = request.into_inner();
-        if r.name.trim().is_empty() {
+        let key = normalize_record_key(&r.name);
+        if key.is_empty() {
             return Err(tonic::Status::invalid_argument("name required"));
         }
         let t = r.rrtype.to_ascii_uppercase();
@@ -1565,27 +1670,33 @@ impl HomeDns for MyDnsService {
             return Err(tonic::Status::invalid_argument("type must be A or AAAA"));
         }
         let mut cfg = self.state.cfg.lock();
-        let entry = cfg.records.entry(r.name.clone()).or_default();
+        let value = r.value.trim().to_string();
+        if value.is_empty() {
+            return Err(tonic::Status::invalid_argument("value required"));
+        }
+        let entry = cfg.records.entry(key.clone()).or_default();
         match t.as_str() {
             "A" => {
-                if !entry.a.contains(&r.value) {
-                    entry.a.push(r.value.clone());
+                if !entry.a.contains(&value) {
+                    entry.a.push(value.clone());
                 }
             }
             "AAAA" => {
-                if !entry.aaaa.contains(&r.value) {
-                    entry.aaaa.push(r.value.clone());
+                if !entry.aaaa.contains(&value) {
+                    entry.aaaa.push(value.clone());
                 }
             }
             _ => {}
         }
+        normalize_record_values(&mut entry.a);
+        normalize_record_values(&mut entry.aaaa);
         if r.ttl != 0 {
             entry.ttl = Some(r.ttl);
         }
         if let Err(e) = save_config(&cfg) {
             return Err(tonic::Status::internal(e.to_string()));
         }
-        info!("Record added: {} {} {}", r.name, t, r.value);
+        info!("Record added: {} {} {}", key, t, value);
         Ok(tonic::Response::new(Ack {
             ok: true,
             message: "added".into(),
@@ -1597,26 +1708,28 @@ impl HomeDns for MyDnsService {
         request: tonic::Request<RemoveRecordRequest>,
     ) -> Result<tonic::Response<Ack>, tonic::Status> {
         let r = request.into_inner();
-        if r.name.trim().is_empty() {
+        let key = normalize_record_key(&r.name);
+        if key.is_empty() {
             return Err(tonic::Status::invalid_argument("name required"));
         }
+        let value = r.value.trim().to_string();
         let mut cfg = self.state.cfg.lock();
         let mut should_remove_key = false;
-        if let Some(entry) = cfg.records.get_mut(&r.name) {
+        if let Some(entry) = cfg.records.get_mut(&key) {
             let t = r.rrtype.to_ascii_uppercase();
             if t.is_empty() {
                 should_remove_key = true;
             } else if t == "A" {
-                if r.value.is_empty() {
+                if value.is_empty() {
                     entry.a.clear();
                 } else {
-                    entry.a.retain(|v| v != &r.value);
+                    entry.a.retain(|v| v != &value);
                 }
             } else if t == "AAAA" {
-                if r.value.is_empty() {
+                if value.is_empty() {
                     entry.aaaa.clear();
                 } else {
-                    entry.aaaa.retain(|v| v != &r.value);
+                    entry.aaaa.retain(|v| v != &value);
                 }
             } else {
                 return Err(tonic::Status::invalid_argument(
@@ -1633,12 +1746,12 @@ impl HomeDns for MyDnsService {
             }));
         }
         if should_remove_key {
-            cfg.records.remove(&r.name);
+            cfg.records.remove(&key);
         }
         if let Err(e) = save_config(&cfg) {
             return Err(tonic::Status::internal(e.to_string()));
         }
-        info!("Record removed: {} {} {}", r.name, r.rrtype, r.value);
+        info!("Record removed: {} {} {}", key, r.rrtype, value);
         Ok(tonic::Response::new(Ack {
             ok: true,
             message: "removed".into(),
