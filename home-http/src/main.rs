@@ -279,6 +279,39 @@ fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
+fn parse_first_ipv4_token(output: &[u8]) -> Option<String> {
+    String::from_utf8_lossy(output)
+        .split_whitespace()
+        .find_map(|token| {
+            let candidate = token.split('/').next().unwrap_or(token);
+            let ip = candidate.parse::<Ipv4Addr>().ok()?;
+            if ip.is_loopback() || ip.is_unspecified() || ip.is_link_local() {
+                return None;
+            }
+            Some(ip.to_string())
+        })
+}
+
+fn resolve_wsl_ipv4() -> Option<String> {
+    // BusyBox images do not support `hostname -I`, so prefer parsing `ip -4`.
+    let probes = ["ip -4 -o addr show", "hostname -I", "hostname -i"];
+    for probe in probes {
+        let out = match std::process::Command::new("wsl.exe")
+            .args(["-e", "sh", "-lc", probe])
+            .output()
+        {
+            Ok(output) => output,
+            Err(_) => continue,
+        };
+        if out.status.success() {
+            if let Some(ip) = parse_first_ipv4_token(&out.stdout) {
+                return Some(ip);
+            }
+        }
+    }
+    None
+}
+
 fn wsl_ip(cfg: &HttpConfig, cache: &Arc<Mutex<(u64, Option<String>)>>) -> String {
     if cfg.wsl_resolve == "static" {
         return cfg.wsl_ip.clone().unwrap_or_else(|| "127.0.0.1".into());
@@ -291,20 +324,10 @@ fn wsl_ip(cfg: &HttpConfig, cache: &Arc<Mutex<(u64, Option<String>)>>) -> String
                 return ip.clone();
             }
         }
-        let out = std::process::Command::new("wsl.exe")
-            .args(["-e", "sh", "-lc", "hostname -I"])
-            .output();
-        if let Ok(out) = out {
-            if out.status.success() {
-                if let Some(ip) = String::from_utf8_lossy(&out.stdout)
-                    .split_whitespace()
-                    .find(|t| t.parse::<std::net::Ipv4Addr>().is_ok())
-                {
-                    guard.0 = now;
-                    guard.1 = Some(ip.to_string());
-                    return ip.to_string();
-                }
-            }
+        if let Some(ip) = resolve_wsl_ipv4() {
+            guard.0 = now;
+            guard.1 = Some(ip.clone());
+            return ip;
         }
         "127.0.0.1".into()
     }
