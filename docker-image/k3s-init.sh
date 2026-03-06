@@ -18,12 +18,14 @@ log_error() {
 ROLE=${WSL_ROLE:-server}
 PORT_RANGE=${PORT_RANGE:-6443-6550}
 API_PORT=$(echo "$PORT_RANGE" | cut -d"-" -f1)
+ENABLE_TRAEFIK=${ENABLE_TRAEFIK:-1}
 BOOTSTRAP_ONLY=${BOOTSTRAP_ONLY:-0}
 BOOTSTRAP_TIMEOUT=${BOOTSTRAP_TIMEOUT:-180}
 BOOTSTRAP_INTERVAL=${BOOTSTRAP_INTERVAL:-3}
 
 log_info "Role: $ROLE"
 log_info "Port range: $PORT_RANGE"
+log_info "Traefik enabled: $ENABLE_TRAEFIK"
 
 detect_node_ip() {
     # Prefer the primary WSL interface and always ignore loopback/link-local.
@@ -99,13 +101,23 @@ sync_kubeconfig() {
     return 0
 }
 
+run_k3s_server() {
+    if [ "$ENABLE_TRAEFIK" = "1" ]; then
+        log_info "Starting k3s with packaged Traefik (v3 on recent K3s)."
+        /usr/local/bin/k3s server --https-listen-port "$API_PORT"
+    else
+        log_info "Starting k3s with Traefik disabled."
+        /usr/local/bin/k3s server --https-listen-port "$API_PORT" --disable traefik
+    fi
+}
+
 if [ "$ROLE" = "server" ]; then
     ensure_server_config
     sync_kubeconfig || true
 
     if [ "$BOOTSTRAP_ONLY" = "1" ]; then
         log_info "Bootstrap mode enabled, starting k3s server to generate kubeconfig"
-        /usr/local/bin/k3s server --https-listen-port "$API_PORT" --disable traefik &
+        run_k3s_server &
         K3S_PID=$!
 
         trap 'kill "$K3S_PID" 2>/dev/null || true' INT TERM
@@ -144,7 +156,7 @@ if [ "$ROLE" = "server" ]; then
     fi
 
     log_info "Starting k3s server on port $API_PORT"
-    exec /usr/local/bin/k3s server --https-listen-port "$API_PORT" --disable traefik
+    run_k3s_server
 else
     if [ -z "$K3S_URL" ]; then
         log_error "K3S_URL environment variable is required for agent role."
