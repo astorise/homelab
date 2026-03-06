@@ -524,6 +524,24 @@ fn normalize_mac(mac: &str) -> String {
     mac.trim().to_uppercase().replace(":", "-")
 }
 
+fn adapter_backup_key(alias: &str, if_index: Option<u32>, mac: Option<&str>) -> Option<String> {
+    if let Some(mac) = mac {
+        let trimmed = mac.trim();
+        if !trimmed.is_empty() {
+            return Some(normalize_mac(trimmed));
+        }
+    }
+    if let Some(idx) = if_index {
+        // VPN/virtual adapters may not expose a MAC; track them by ifIndex.
+        return Some(format!("IFINDEX-{}", idx));
+    }
+    warn!(
+        "Skip adapter without key material (alias={}): missing MAC/ifIndex",
+        alias
+    );
+    None
+}
+
 fn get_all_adapters() -> Result<Vec<PsAdapter>> {
     let ps = r"Get-NetAdapter | Select-Object -Property Name,ifIndex,MacAddress,Status | ConvertTo-Json -Compress";
     let out = Command::new("powershell")
@@ -642,14 +660,11 @@ fn snapshot_and_apply_all(mut cfg: DnsConfig) -> Result<DnsConfig> {
     let adapters = get_all_adapters()?;
     info!("Applying DNS to {} adapters", adapters.len());
     for ad in adapters {
-        let mac = match ad.mac_address {
-            Some(ref m) if !m.trim().is_empty() => normalize_mac(m),
-            _ => {
-                debug!("Skip adapter without MAC: {}", ad.name);
-                continue;
-            }
-        };
         let alias = ad.name;
+        let backup_key = match adapter_backup_key(&alias, ad.if_index, ad.mac_address.as_deref()) {
+            Some(key) => key,
+            None => continue,
+        };
         let interface_index = match ad.if_index {
             Some(index) => index,
             None => {
@@ -659,15 +674,15 @@ fn snapshot_and_apply_all(mut cfg: DnsConfig) -> Result<DnsConfig> {
         };
         let status = ad.status.unwrap_or_default();
         debug!(
-            "Processing adapter [{} MAC={} Status={}]",
-            alias, mac, status
+            "Processing adapter [{} key={} Status={}]",
+            alias, backup_key, status
         );
         let (is_dhcp_v4, servers_v4) =
             read_current_dns(interface_index, "IPv4").unwrap_or((true, vec![]));
         let (is_dhcp_v6, servers_v6) =
             read_current_dns(interface_index, "IPv6").unwrap_or((true, vec![]));
         cfg.backups.insert(
-            mac.clone(),
+            backup_key,
             DnsBackup {
                 alias: alias.clone(),
                 if_index: Some(interface_index),
@@ -701,37 +716,41 @@ fn snapshot_and_apply_all(mut cfg: DnsConfig) -> Result<DnsConfig> {
 fn restore_all() -> Result<()> {
     let mut cfg = load_config_or_init()?;
     let adapters = get_all_adapters().unwrap_or_default();
-    let mut mac_to_alias: HashMap<String, String> = HashMap::new();
-    let mut mac_to_if_index: HashMap<String, u32> = HashMap::new();
+    let mut key_to_alias: HashMap<String, String> = HashMap::new();
+    let mut key_to_if_index: HashMap<String, u32> = HashMap::new();
     for ad in adapters {
-        if let Some(mac) = ad.mac_address {
-            let mac = normalize_mac(&mac);
-            mac_to_alias.insert(mac.clone(), ad.name);
+        if let Some(key) = adapter_backup_key(&ad.name, ad.if_index, ad.mac_address.as_deref()) {
+            key_to_alias.insert(key.clone(), ad.name.clone());
             if let Some(if_index) = ad.if_index {
-                mac_to_if_index.insert(mac, if_index);
+                key_to_if_index.insert(key, if_index);
             }
+        }
+        if let Some(if_index) = ad.if_index {
+            let ifindex_key = format!("IFINDEX-{}", if_index);
+            key_to_alias.insert(ifindex_key.clone(), ad.name.clone());
+            key_to_if_index.insert(ifindex_key, if_index);
         }
     }
     let mut restored = 0usize;
     let keys: Vec<String> = cfg.backups.keys().cloned().collect();
-    for mac in keys {
-        if let Some(entry) = cfg.backups.get_mut(&mac) {
+    for key in keys {
+        if let Some(entry) = cfg.backups.get_mut(&key) {
             if !entry.dirty {
                 continue;
             }
-            let alias = mac_to_alias
-                .get(&mac)
+            let alias = key_to_alias
+                .get(&key)
                 .cloned()
                 .unwrap_or_else(|| entry.alias.clone());
-            let interface_index = mac_to_if_index.get(&mac).copied().or(entry.if_index);
+            let interface_index = key_to_if_index.get(&key).copied().or(entry.if_index);
             let Some(interface_index) = interface_index else {
                 warn!(
-                    "Cannot restore adapter {} (MAC={}): missing ifIndex",
-                    alias, mac
+                    "Cannot restore adapter {} (key={}): missing ifIndex",
+                    alias, key
                 );
                 continue;
             };
-            info!("Restoring adapter [{} MAC={}]", alias, mac);
+            info!("Restoring adapter [{} key={}]", alias, key);
             if entry.is_dhcp_v4 {
                 let _ = reset_dns_to_dhcp(interface_index, &alias, "IPv4");
             } else if !entry.servers_v4.is_empty() {
