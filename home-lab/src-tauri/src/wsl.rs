@@ -2,8 +2,9 @@ use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::net::Ipv4Addr;
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -251,6 +252,8 @@ const KUBE_API_READY_TIMEOUT_SECONDS: u64 = 15;
 const KUBE_API_READY_POLL_INTERVAL_MS: u64 = 350;
 const KUBECTL_APPLY_MAX_BYTES: usize = 2 * 1024 * 1024;
 const KUBECTL_APPLY_FIELD_MANAGER: &str = "home-lab-tauri";
+const HOME_LAB_WSL_INSTANCE_PREFIX: &str = "home-lab-k3s";
+const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 fn env_or_default_u16(var: &str, default: u16) -> u16 {
     match std::env::var(var) {
@@ -1648,6 +1651,29 @@ pub async fn wsl_import_instance(
                 ));
             }
         }
+
+        if is_home_lab_wsl_instance(&sanitized_name) {
+            match ensure_wsl_keepalive(&sanitized_name, "post-import").await {
+                Ok(_) => {}
+                Err(err) => {
+                    warn!(
+                        target: "wsl",
+                        instance = %sanitized_name,
+                        error = %err,
+                        "Impossible de lancer keepalive WSL apres import"
+                    );
+                    append_provision_message(
+                        &mut provision.message,
+                        &format!("Activation keepalive WSL impossible: {err}"),
+                    );
+                    log_wsl_event(format!(
+                        "Activation keepalive WSL impossible apres import {}: {}",
+                        sanitized_debug,
+                        escape_for_log(&err.to_string())
+                    ));
+                }
+            }
+        }
     }
 
     Ok(provision)
@@ -2126,6 +2152,24 @@ pub async fn wsl_list_instances() -> Result<Vec<WslInstance>, String> {
         .map_err(|e| e.to_string())?;
 
     attach_cluster_details(&mut instances).await;
+
+    for instance in &instances {
+        if is_home_lab_wsl_instance(&instance.name) && wsl_state_is_running(&instance.state) {
+            if let Err(err) = ensure_wsl_keepalive(&instance.name, "list-instances").await {
+                warn!(
+                    target: "wsl",
+                    instance = %instance.name,
+                    error = %err,
+                    "Impossible de lancer keepalive WSL pendant le listing"
+                );
+                log_wsl_event(format!(
+                    "Keepalive WSL impossible pendant listing pour {}: {}",
+                    escape_for_log(&instance.name),
+                    escape_for_log(&err.to_string())
+                ));
+            }
+        }
+    }
 
     Ok(instances)
 }
@@ -3422,6 +3466,81 @@ fn wsl_state_is_running(state: &str) -> bool {
         || normalized.contains("execution")
 }
 
+fn is_home_lab_wsl_instance(name: &str) -> bool {
+    name.trim()
+        .to_ascii_lowercase()
+        .starts_with(HOME_LAB_WSL_INSTANCE_PREFIX)
+}
+
+fn keepalive_children() -> &'static Mutex<BTreeMap<String, Child>> {
+    static KEEPALIVE: OnceLock<Mutex<BTreeMap<String, Child>>> = OnceLock::new();
+    KEEPALIVE.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn run_keepalive_launcher(instance: &str) -> Result<()> {
+    let instance_trimmed = instance.trim();
+    if instance_trimmed.is_empty() {
+        anyhow::bail!("Nom d'instance WSL vide pour keepalive");
+    }
+
+    {
+        let mut guard = keepalive_children()
+            .lock()
+            .map_err(|e| anyhow!("Mutex keepalive WSL empoisonne: {e}"))?;
+        if let Some(child) = guard.get_mut(instance_trimmed) {
+            match child.try_wait() {
+                Ok(None) => return Ok(()),
+                Ok(Some(_)) | Err(_) => {
+                    guard.remove(instance_trimmed);
+                }
+            }
+        }
+    }
+
+    // Keep one Windows-side wsl.exe client attached so the distro does not idle-stop.
+    let child = Command::new("wsl.exe")
+        .args([
+            "-d",
+            instance_trimmed,
+            "--",
+            "sh",
+            "-lc",
+            "while true; do sleep 3600; done",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()
+        .with_context(|| format!("Impossible de demarrer le process keepalive WSL pour {}", instance_trimmed))?;
+
+    let mut guard = keepalive_children()
+        .lock()
+        .map_err(|e| anyhow!("Mutex keepalive WSL empoisonne: {e}"))?;
+    guard.insert(instance_trimmed.to_string(), child);
+    Ok(())
+}
+
+async fn ensure_wsl_keepalive(instance: &str, context: &str) -> Result<()> {
+    let instance_owned = instance.to_string();
+    tauri::async_runtime::spawn_blocking(move || run_keepalive_launcher(&instance_owned))
+        .await
+        .map_err(|e| anyhow!("Erreur JoinHandle keepalive WSL: {e}"))??;
+
+    info!(
+        target: "wsl",
+        instance = %instance,
+        context = %context,
+        "Keepalive WSL lance"
+    );
+    log_wsl_event(format!(
+        "Keepalive WSL lance pour {} (context={})",
+        escape_for_log(instance),
+        escape_for_log(context)
+    ));
+    Ok(())
+}
+
 async fn wsl_instance_state(instance: &str) -> Result<Option<String>> {
     let target = instance.to_ascii_lowercase();
     tauri::async_runtime::spawn_blocking(move || {
@@ -3450,6 +3569,9 @@ async fn ensure_wsl_instance_running(instance: &str, trace_id: &str) -> Result<(
             state = %initial_state,
             "Instance WSL deja demarree pour execution Kubernetes"
         );
+        if is_home_lab_wsl_instance(instance) {
+            ensure_wsl_keepalive(instance, "already-running").await?;
+        }
         return Ok(());
     }
 
@@ -3517,6 +3639,9 @@ async fn ensure_wsl_instance_running(instance: &str, trace_id: &str) -> Result<(
         escape_for_log(instance),
         escape_for_log(&final_state)
     ));
+    if is_home_lab_wsl_instance(instance) {
+        ensure_wsl_keepalive(instance, trace_id).await?;
+    }
     Ok(())
 }
 

@@ -155,8 +155,12 @@ run_k3s_server_supervised() {
     delay=$K3S_RESTART_BASE_DELAY
     while true; do
         started_at=$(date +%s)
+        # k3s can exit non-zero during transient failures; don't let `set -e`
+        # kill the supervisor loop before we can apply restart policy.
+        set +e
         run_k3s_server
         rc=$?
+        set -e
         ended_at=$(date +%s)
         uptime=$((ended_at - started_at))
 
