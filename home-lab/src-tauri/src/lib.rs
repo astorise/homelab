@@ -6,7 +6,7 @@ use std::{fs, path::PathBuf};
 use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
 use tracing::{error, info, warn};
 use tracing_appender::{non_blocking::WorkerGuard, rolling};
-use tracing_subscriber::{EnvFilter, fmt};
+use tracing_subscriber::{fmt, EnvFilter};
 
 #[cfg(all(debug_assertions, target_os = "windows"))]
 mod dev_services;

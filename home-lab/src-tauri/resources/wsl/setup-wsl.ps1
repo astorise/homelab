@@ -3,6 +3,8 @@ param(
     [string]$DistroName = 'home-lab-k3s',
     [string]$InstallDir = (Join-Path ${env:ProgramData} 'home-lab\\wsl'),
     [string]$Rootfs     = (Join-Path $PSScriptRoot 'wsl-rootfs.tar'),
+    [int]$ApiPort       = 6443,
+    [int]$NodePortSpan  = 57,
     [switch]$ForceImport
 )
 
@@ -123,6 +125,47 @@ fi
     & wsl.exe -d $Distro -- sh -c $cmd 2>$null | Out-Null
 }
 
+function Configure-K3sEnv {
+    param(
+        [string]$Distro,
+        [int]$ApiPort,
+        [int]$NodePortSpan
+    )
+
+    if ($ApiPort -lt 1 -or $ApiPort -gt 65535) {
+        throw "ApiPort invalide ($ApiPort). Valeur attendue entre 1 et 65535."
+    }
+    if ($NodePortSpan -lt 0) {
+        throw "NodePortSpan invalide ($NodePortSpan). Valeur attendue >= 0."
+    }
+
+    $rangeEnd = [Math]::Min(65535, $ApiPort + $NodePortSpan)
+    $rangeText = "$ApiPort-$rangeEnd"
+    Write-Info "Configuration de /etc/k3s-env avec PORT_RANGE=$rangeText"
+
+$cmd = @"
+set -eu
+cat > /etc/k3s-env <<'EOF'
+WSL_ROLE=server
+PORT_RANGE=$rangeText
+EOF
+"@
+    $std = & wsl.exe -d $Distro -- sh -c $cmd 2>&1
+    $exitCode = $LASTEXITCODE
+
+    if ($exitCode -ne 0) {
+        $details = ($std | Where-Object { $_ -and $_.Trim().Length -gt 0 }) -join "`n"
+        if ($details) {
+            throw "Configuration /etc/k3s-env echouee (code $exitCode) :`n$details"
+        }
+        throw "Configuration /etc/k3s-env echouee (code $exitCode)"
+    }
+
+    if ($std) {
+        Write-Info ("wsl.exe a renvoye:" + [Environment]::NewLine + ($std -join [Environment]::NewLine))
+    }
+}
+
 function Invoke-K3sBootstrap {
     param(
         [string]$Distro,
@@ -156,6 +199,8 @@ try {
     Write-Info "  - ForceImport = $($ForceImport.IsPresent)"
     Write-Info "  - InstallDir  = $InstallDir"
     Write-Info "  - Rootfs      = $Rootfs"
+    Write-Info "  - ApiPort     = $ApiPort"
+    Write-Info "  - NodePortSpan= $NodePortSpan"
 
     $distros = @(Get-RegisteredDistros)
     $detected = if ($distros.Count -gt 0) { $distros -join ', ' } else { '(aucune)' }
@@ -180,6 +225,7 @@ try {
         Write-Info "Distribution $DistroName deja presente, import ignore."
     }
 
+    Configure-K3sEnv -Distro $DistroName -ApiPort $ApiPort -NodePortSpan $NodePortSpan
     Clear-K3sLocks -Distro $DistroName
     Invoke-K3sBootstrap -Distro $DistroName
 

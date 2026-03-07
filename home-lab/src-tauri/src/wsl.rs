@@ -238,6 +238,13 @@ const ENV_HTTP_INBOUND: &str = "HOME_LAB_WSL_HTTP_INBOUND";
 const ENV_HTTPS_INBOUND: &str = "HOME_LAB_WSL_HTTPS_INBOUND";
 const DEFAULT_API_PORT: u16 = 6443;
 const ENV_API_PORT: &str = "HOME_LAB_WSL_K3S_API_PORT";
+const DEFAULT_API_PORT_BASE: u16 = 6443;
+const DEFAULT_API_PORT_STEP: u16 = 100;
+const DEFAULT_API_PORT_MAX: u16 = 60000;
+const ENV_API_PORT_BASE: &str = "HOME_LAB_WSL_K3S_API_PORT_BASE";
+const ENV_API_PORT_STEP: &str = "HOME_LAB_WSL_K3S_API_PORT_STEP";
+const ENV_API_PORT_MAX: &str = "HOME_LAB_WSL_K3S_API_PORT_MAX";
+const DEFAULT_K3S_NODEPORT_SPAN: u16 = 57;
 const SERVICE_RPC_RETRIES: usize = 8;
 const SERVICE_RPC_BASE_DELAY_MS: u64 = 750;
 const HTTP_SERVICE_NAME: &str = "HomeHttpService";
@@ -418,8 +425,68 @@ fn inbound_https_port() -> u16 {
     env_or_default_u16(ENV_HTTPS_INBOUND, DEFAULT_HTTPS_INBOUND)
 }
 
-fn k3s_api_port() -> u16 {
-    env_or_default_u16(ENV_API_PORT, DEFAULT_API_PORT)
+fn k3s_api_port_base() -> u16 {
+    env_or_default_u16(ENV_API_PORT_BASE, DEFAULT_API_PORT_BASE)
+}
+
+fn k3s_api_port_step() -> u16 {
+    let step = env_or_default_u16(ENV_API_PORT_STEP, DEFAULT_API_PORT_STEP);
+    if step == 0 {
+        DEFAULT_API_PORT_STEP
+    } else {
+        step
+    }
+}
+
+fn k3s_api_port_max() -> u16 {
+    let max = env_or_default_u16(ENV_API_PORT_MAX, DEFAULT_API_PORT_MAX);
+    max.max(k3s_api_port_base())
+}
+
+fn home_lab_instance_slot(instance: &str) -> Option<u32> {
+    let normalized = instance.trim().to_ascii_lowercase();
+    if normalized == HOME_LAB_WSL_INSTANCE_PREFIX {
+        return Some(0);
+    }
+
+    let suffix = normalized.strip_prefix(HOME_LAB_WSL_INSTANCE_PREFIX)?;
+    let numeric = suffix.strip_prefix('-')?;
+    let parsed = numeric.parse::<u32>().ok()?;
+    Some(parsed.saturating_sub(1))
+}
+
+fn fallback_instance_slot(instance: &str) -> u32 {
+    let mut hash: u32 = 0x811C_9DC5;
+    for byte in instance.trim().to_ascii_lowercase().bytes() {
+        hash ^= u32::from(byte);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    hash
+}
+
+fn k3s_api_port_for_instance(instance: &str) -> u16 {
+    if std::env::var(ENV_API_PORT).is_ok() {
+        return env_or_default_u16(ENV_API_PORT, DEFAULT_API_PORT);
+    }
+
+    let base = k3s_api_port_base();
+    let step = k3s_api_port_step();
+    let max = k3s_api_port_max();
+    let slots = ((u32::from(max) - u32::from(base)) / u32::from(step)).saturating_add(1);
+    if slots == 0 {
+        return base;
+    }
+
+    let slot = home_lab_instance_slot(instance).unwrap_or_else(|| fallback_instance_slot(instance));
+    let offset = slot % slots;
+    let computed = u32::from(base) + offset * u32::from(step);
+    u16::try_from(computed).unwrap_or(base)
+}
+
+fn k3s_port_range_for_instance(instance: &str) -> (u16, u16) {
+    let api_port = k3s_api_port_for_instance(instance);
+    let range_end = api_port.saturating_add(DEFAULT_K3S_NODEPORT_SPAN);
+    (api_port, range_end)
 }
 
 fn pick_http_port(used_ports: &HashSet<u16>) -> Result<u16> {
@@ -684,8 +751,6 @@ async fn attach_cluster_details(instances: &mut [WslInstance]) {
 
     let inbound_http = inbound_http_port();
     let inbound_https = inbound_https_port();
-    let api_port = k3s_api_port();
-
     let http_routes = match http::http_list_routes().await {
         Ok(list) => Some(list.routes),
         Err(err) => {
@@ -797,7 +862,7 @@ async fn attach_cluster_details(instances: &mut [WslInstance]) {
                 inbound_https,
                 routes,
             },
-            api_port,
+            api_port: k3s_api_port_for_instance(&instance.name),
             dns_records: dns_entries,
             oidc: oidc_info,
         });
@@ -1265,9 +1330,21 @@ fn build_managed_kube_entry(instance: &str) -> Result<ManagedKubeEntry> {
     let cluster_name = format!("{base_name}-cluster");
     let user_name = format!("{base_name}-user");
     let context_name = base_name;
+    let api_port = k3s_api_port_for_instance(instance);
 
-    let cluster_value =
-        serde_yaml::to_value(&selected_cluster.cluster).context("Conversion cluster YAML")?;
+    let mut cluster_json = selected_cluster.cluster.clone();
+    if let serde_json::Value::Object(map) = &mut cluster_json {
+        map.insert(
+            "server".to_string(),
+            serde_json::Value::String(format!("https://127.0.0.1:{api_port}")),
+        );
+        map.insert(
+            "tls-server-name".to_string(),
+            serde_json::Value::String("localhost".to_string()),
+        );
+    }
+
+    let cluster_value = serde_yaml::to_value(&cluster_json).context("Conversion cluster YAML")?;
     let user_value = serde_yaml::to_value(&selected_user.user).context("Conversion user YAML")?;
 
     Ok(ManagedKubeEntry {
@@ -1704,6 +1781,7 @@ fn run_wsl_setup(
 
     let install_dir = (resolve_install_dir(app)?).join(instance_name);
     let instance_debug = escape_for_log(instance_name);
+    let (api_port, api_range_end) = k3s_port_range_for_instance(instance_name);
 
     info!(
         target: "wsl",
@@ -1713,15 +1791,19 @@ fn run_wsl_setup(
         force = force_import,
         instance = %instance_name,
         instance_debug = %instance_debug,
+        api_port,
+        api_range_end,
         "Lancement de setup-wsl.ps1"
     );
     log_wsl_event(format!(
-        "Lancement de setup-wsl.ps1 (force={}, instance={}, script={}, rootfs={}, install={})",
+        "Lancement de setup-wsl.ps1 (force={}, instance={}, script={}, rootfs={}, install={}, api_port={} range_end={})",
         force_import,
         instance_debug,
         script_path.display(),
         rootfs_path.display(),
-        install_dir.display()
+        install_dir.display(),
+        api_port,
+        api_range_end
     ));
 
     let mut command = Command::new("powershell.exe");
@@ -1736,18 +1818,21 @@ fn run_wsl_setup(
         .arg("-Rootfs")
         .arg(&rootfs_path)
         .arg("-DistroName")
-        .arg(instance_name);
+        .arg(instance_name)
+        .arg("-ApiPort")
+        .arg(api_port.to_string());
 
     if force_import {
         command.arg("-ForceImport");
     }
 
     let mut command_preview = format!(
-        "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"{}\" -InstallDir \"{}\" -Rootfs \"{}\" -DistroName \"{}\"",
+        "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"{}\" -InstallDir \"{}\" -Rootfs \"{}\" -DistroName \"{}\" -ApiPort {}",
         script_path.display(),
         install_dir.display(),
         rootfs_path.display(),
-        instance_name
+        instance_name,
+        api_port
     );
     if force_import {
         command_preview.push_str(" -ForceImport");
@@ -3512,7 +3597,12 @@ fn run_keepalive_launcher(instance: &str) -> Result<()> {
         .stderr(Stdio::null())
         .creation_flags(CREATE_NO_WINDOW)
         .spawn()
-        .with_context(|| format!("Impossible de demarrer le process keepalive WSL pour {}", instance_trimmed))?;
+        .with_context(|| {
+            format!(
+                "Impossible de demarrer le process keepalive WSL pour {}",
+                instance_trimmed
+            )
+        })?;
 
     let mut guard = keepalive_children()
         .lock()
@@ -3710,7 +3800,7 @@ async fn resolve_wsl_instance_ipv4(instance: &str) -> Result<String> {
 }
 
 async fn resolve_kube_api_host_for_instance(instance: &str, trace_id: &str) -> Result<String> {
-    let api_port = k3s_api_port();
+    let api_port = k3s_api_port_for_instance(instance);
     if tcp_connect_once("127.0.0.1", api_port, Duration::from_millis(700))
         .await
         .is_ok()
@@ -3746,7 +3836,7 @@ async fn resolve_kube_api_host_for_instance(instance: &str, trace_id: &str) -> R
 
 async fn wait_for_kube_api_port(instance: &str, api_host: &str, trace_id: &str) -> Result<()> {
     let started_at = Instant::now();
-    let api_port = k3s_api_port();
+    let api_port = k3s_api_port_for_instance(instance);
     let timeout = Duration::from_secs(KUBE_API_READY_TIMEOUT_SECONDS);
     let mut attempt: u32 = 0;
     let mut last_error = String::new();
@@ -3944,8 +4034,9 @@ async fn build_kube_client_for_instance(
         }
     }
 
+    let api_port = k3s_api_port_for_instance(instance);
     if let Some(host) = api_host {
-        apply_kube_api_endpoint_override(&mut kubeconfig, &context_name, host, k3s_api_port())
+        apply_kube_api_endpoint_override(&mut kubeconfig, &context_name, host, api_port)
             .with_context(|| {
                 format!(
                     "Application endpoint API Kubernetes impossible pour le contexte '{}'",
@@ -3957,7 +4048,7 @@ async fn build_kube_client_for_instance(
             instance = %instance,
             context = %context_name,
             api_host = %host,
-            api_port = k3s_api_port(),
+            api_port = api_port,
             "Endpoint API Kubernetes applique au kubeconfig en memoire"
         );
     }
