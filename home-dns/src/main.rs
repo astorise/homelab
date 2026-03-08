@@ -472,24 +472,14 @@ fn load_config_or_init() -> Result<DnsConfig> {
     if cfg.doh.listen_addr.trim().is_empty() {
         cfg.doh.listen_addr = default_doh_listen_addr();
         changed = true;
-    } else if cfg
-        .doh
-        .listen_addr
-        .trim()
-        .eq_ignore_ascii_case("127.0.0.2")
-    {
+    } else if cfg.doh.listen_addr.trim().eq_ignore_ascii_case("127.0.0.2") {
         cfg.doh.listen_addr = default_doh_listen_addr();
         changed = true;
     }
     if cfg.doh.hostname.trim().is_empty() {
         cfg.doh.hostname = default_doh_hostname();
         changed = true;
-    } else if cfg
-        .doh
-        .hostname
-        .trim()
-        .eq_ignore_ascii_case("127.0.0.2")
-    {
+    } else if cfg.doh.hostname.trim().eq_ignore_ascii_case("127.0.0.2") {
         cfg.doh.hostname = default_doh_hostname();
         changed = true;
     }
@@ -840,7 +830,9 @@ fn normalize_record_key(value: &str) -> String {
 }
 
 fn normalize_record_values(values: &mut Vec<String>) {
-    values.iter_mut().for_each(|value| *value = value.trim().to_string());
+    values
+        .iter_mut()
+        .for_each(|value| *value = value.trim().to_string());
     values.retain(|value| !value.is_empty());
     values.sort_unstable();
     values.dedup();
@@ -859,7 +851,9 @@ fn normalize_record_map(records: &mut HashMap<String, RecordEntry>) -> bool {
         normalize_record_values(&mut entry.a);
         normalize_record_values(&mut entry.aaaa);
 
-        let merged = normalized.entry(key.clone()).or_insert_with(RecordEntry::default);
+        let merged = normalized
+            .entry(key.clone())
+            .or_insert_with(RecordEntry::default);
         let before_a = merged.a.len();
         merged.a.extend(entry.a);
         normalize_record_values(&mut merged.a);

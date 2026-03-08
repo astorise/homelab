@@ -67,12 +67,10 @@ impl AsyncWrite for SendablePipeClient {
 #[tokio::test]
 async fn test_grpc_connection() -> Result<()> {
     let channel = Endpoint::try_from("http://[::]:50051")?
-        .connect_with_connector(service_fn(|_uri| {
-            async {
-                ClientOptions::new()
-                    .open(PIPE_DEV)
-                    .map(SendablePipeClient::new)
-            }
+        .connect_with_connector(service_fn(|_uri| async {
+            ClientOptions::new()
+                .open(PIPE_DEV)
+                .map(SendablePipeClient::new)
         }))
         .await?;
 

@@ -18,9 +18,9 @@ use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use log::{error, info};
 use rand::{rng, Rng};
 use rcgen::{CertificateParams, DnType, IsCa, KeyPair, SanType};
-use rsa::rand_core::OsRng;
 use rsa::pkcs1::DecodeRsaPrivateKey;
 use rsa::pkcs8::{DecodePrivateKey, EncodePrivateKey, LineEnding};
+use rsa::rand_core::OsRng;
 use rsa::traits::PublicKeyParts;
 use rsa::RsaPrivateKey;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -1391,8 +1391,14 @@ fn named_pipe_stream() -> io::Result<UnboundedReceiverStream<Result<PipeConnecti
 
     if result == 0 {
         let err = unsafe { windows_sys::Win32::Foundation::GetLastError() };
-        error!("FATAL: ConvertStringSecurityDescriptorToSecurityDescriptorW failed: {}", err);
-        return Err(io::Error::new(io::ErrorKind::Other, "Security attributes creation failed"));
+        error!(
+            "FATAL: ConvertStringSecurityDescriptorToSecurityDescriptorW failed: {}",
+            err
+        );
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            "Security attributes creation failed",
+        ));
     }
 
     let sd_addr = sd as usize;
@@ -1413,14 +1419,18 @@ fn named_pipe_stream() -> io::Result<UnboundedReceiverStream<Result<PipeConnecti
 
         let server = {
             let mut sa_first = windows_sys::Win32::Security::SECURITY_ATTRIBUTES {
-                nLength: std::mem::size_of::<windows_sys::Win32::Security::SECURITY_ATTRIBUTES>() as u32,
+                nLength: std::mem::size_of::<windows_sys::Win32::Security::SECURITY_ATTRIBUTES>()
+                    as u32,
                 lpSecurityDescriptor: sd_addr as windows_sys::Win32::Security::PSECURITY_DESCRIPTOR,
                 bInheritHandle: 0,
             };
             match unsafe {
                 ServerOptions::new()
                     .first_pipe_instance(true)
-                    .create_with_security_attributes_raw(NAMED_PIPE_NAME, &mut sa_first as *mut _ as *mut _)
+                    .create_with_security_attributes_raw(
+                        NAMED_PIPE_NAME,
+                        &mut sa_first as *mut _ as *mut _,
+                    )
             } {
                 Ok(s) => s,
                 Err(e) => {
@@ -1437,8 +1447,11 @@ fn named_pipe_stream() -> io::Result<UnboundedReceiverStream<Result<PipeConnecti
                 match s.connect().await {
                     Ok(()) => {
                         let mut sa_loop = windows_sys::Win32::Security::SECURITY_ATTRIBUTES {
-                            nLength: std::mem::size_of::<windows_sys::Win32::Security::SECURITY_ATTRIBUTES>() as u32,
-                            lpSecurityDescriptor: sd_addr as windows_sys::Win32::Security::PSECURITY_DESCRIPTOR,
+                            nLength: std::mem::size_of::<
+                                windows_sys::Win32::Security::SECURITY_ATTRIBUTES,
+                            >() as u32,
+                            lpSecurityDescriptor: sd_addr
+                                as windows_sys::Win32::Security::PSECURITY_DESCRIPTOR,
                             bInheritHandle: 0,
                         };
                         let new_server = match unsafe {

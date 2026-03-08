@@ -1215,7 +1215,7 @@ fn kubectl_view_has_required_entries(view: &KubectlConfigView) -> bool {
 
 fn bootstrap_k3s_for_instance_if_available(instance: &str) -> Result<()> {
     let script = format!(
-        "set -euo pipefail; if [ ! -x /usr/local/bin/k3s-init.sh ]; then exit 0; fi; BOOTSTRAP_ONLY=1 BOOTSTRAP_TIMEOUT={} /usr/local/bin/k3s-init.sh",
+        "set -eu; if [ ! -x /usr/local/bin/k3s-init.sh ]; then exit 0; fi; BOOTSTRAP_ONLY=1 BOOTSTRAP_TIMEOUT={} /usr/local/bin/k3s-init.sh",
         K3S_BOOTSTRAP_TIMEOUT_SECONDS
     );
     let command_line = format_cli_command("wsl.exe", &["-d", instance, "--", "sh", "-lc", &script]);
@@ -1262,6 +1262,44 @@ fn bootstrap_k3s_for_instance_if_available(instance: &str) -> Result<()> {
         stdout_log,
         stderr_log
     ));
+    Ok(())
+}
+
+async fn enforce_instance_api_port_range(instance: &str, api_port: u16) -> Result<()> {
+    let instance_owned = instance.to_string();
+    let range_end = api_port.saturating_add(DEFAULT_K3S_NODEPORT_SPAN);
+    let script = format!(
+        "set -eu; cat > /etc/k3s-env <<'EOF'\nWSL_ROLE=server\nPORT_RANGE={api_port}-{range_end}\nEOF"
+    );
+    let command_line = format_cli_command("wsl.exe", &["-d", instance, "--", "sh", "-c", &script]);
+
+    let output = tauri::async_runtime::spawn_blocking(move || {
+        Command::new("wsl.exe")
+            .args(["-d", &instance_owned, "--", "sh", "-c", &script])
+            .output()
+    })
+    .await
+    .map_err(|e| anyhow!("Erreur JoinHandle lors de la correction /etc/k3s-env: {e}"))?
+    .with_context(|| format!("Impossible de corriger /etc/k3s-env pour '{}'", instance))?;
+
+    let stdout = decode_cli_output(&output.stdout);
+    let stderr = decode_cli_output(&output.stderr);
+    let stdout_trim = stdout.trim();
+    let stderr_trim = stderr.trim();
+    if !output.status.success() {
+        anyhow::bail!(
+            "Correction /etc/k3s-env impossible pour {} (cmd={}): {}",
+            instance,
+            command_line,
+            if !stderr_trim.is_empty() {
+                stderr_trim
+            } else if !stdout_trim.is_empty() {
+                stdout_trim
+            } else {
+                "erreur inconnue"
+            }
+        );
+    }
     Ok(())
 }
 
@@ -1580,9 +1618,36 @@ pub async fn wsl_import_instance(
     };
 
     let mut allow_post_config = provision.ok;
+    let (expected_api_port, _) = k3s_port_range_for_instance(&sanitized_name);
     if !allow_post_config {
         match is_wsl_instance_present(&sanitized_name).await {
             Ok(true) => {
+                match enforce_instance_api_port_range(&sanitized_name, expected_api_port).await {
+                    Ok(_) => {
+                        append_provision_message(
+                            &mut provision.message,
+                            &format!(
+                                "Port API Kubernetes reconcilie sur /etc/k3s-env ({expected_api_port})."
+                            ),
+                        );
+                        log_wsl_event(format!(
+                            "Reconciliation /etc/k3s-env pour {}: api_port={}",
+                            sanitized_debug, expected_api_port
+                        ));
+                    }
+                    Err(err) => {
+                        warn!(
+                            target: "wsl",
+                            instance = %sanitized_name,
+                            error = %err,
+                            "Reconciliation /etc/k3s-env impossible apres echec setup"
+                        );
+                        append_provision_message(
+                            &mut provision.message,
+                            &format!("Reconciliation /etc/k3s-env impossible: {err}"),
+                        );
+                    }
+                }
                 allow_post_config = true;
                 info!(
                     target: "wsl",
@@ -3799,8 +3864,59 @@ async fn resolve_wsl_instance_ipv4(instance: &str) -> Result<String> {
     Ok(ip)
 }
 
-async fn resolve_kube_api_host_for_instance(instance: &str, trace_id: &str) -> Result<String> {
-    let api_port = k3s_api_port_for_instance(instance);
+async fn resolve_kube_api_port_for_instance(instance: &str, trace_id: &str) -> u16 {
+    let expected_port = k3s_api_port_for_instance(instance);
+    let instance_owned = instance.to_string();
+    let script = "set -eu; if [ -f /etc/k3s-env ]; then line=$(grep '^PORT_RANGE=' /etc/k3s-env | head -n1 || true); if [ -n \"$line\" ]; then range=${line#PORT_RANGE=}; port=${range%%-*}; printf '%s\\n' \"$port\"; exit 0; fi; fi; if [ -f /etc/rancher/k3s/k3s.yaml ]; then line=$(grep -E '^[[:space:]]*server:[[:space:]]*https?://' /etc/rancher/k3s/k3s.yaml | head -n1 || true); if [ -n \"$line\" ]; then port=$(printf '%s\\n' \"$line\" | sed -n 's#.*://[^:]*:\\([0-9][0-9]*\\).*#\\1#p' | head -n1); if [ -n \"$port\" ]; then printf '%s\\n' \"$port\"; exit 0; fi; fi; fi; exit 0";
+    let detected = tauri::async_runtime::spawn_blocking(move || {
+        Command::new("wsl.exe")
+            .args(["-d", &instance_owned, "--", "sh", "-lc", script])
+            .output()
+    })
+    .await
+    .ok()
+    .and_then(|result| result.ok())
+    .and_then(|output| {
+        if !output.status.success() {
+            return None;
+        }
+        decode_cli_output(&output.stdout)
+            .lines()
+            .map(|line| line.trim())
+            .find_map(|line| line.parse::<u16>().ok())
+    });
+
+    let api_port = detected.unwrap_or(expected_port);
+    if api_port != expected_port {
+        warn!(
+            target: "wsl",
+            trace_id = %trace_id,
+            instance = %instance,
+            expected_api_port = expected_port,
+            detected_api_port = api_port,
+            "Port API Kubernetes detecte differe du port attendu; utilisation du port detecte"
+        );
+        log_wsl_event(format!(
+            "[{trace_id}] Port API Kubernetes detecte pour {}: {} (attendu={})",
+            escape_for_log(instance),
+            api_port,
+            expected_port
+        ));
+    }
+    api_port
+}
+
+#[derive(Clone, Debug)]
+struct KubeApiEndpoint {
+    host: String,
+    port: u16,
+}
+
+async fn resolve_kube_api_endpoint_for_instance(
+    instance: &str,
+    trace_id: &str,
+) -> Result<KubeApiEndpoint> {
+    let api_port = resolve_kube_api_port_for_instance(instance, trace_id).await;
     if tcp_connect_once("127.0.0.1", api_port, Duration::from_millis(700))
         .await
         .is_ok()
@@ -3813,7 +3929,10 @@ async fn resolve_kube_api_host_for_instance(instance: &str, trace_id: &str) -> R
             api_port = api_port,
             "Endpoint API Kubernetes retenu (forward localhost)"
         );
-        return Ok("127.0.0.1".to_string());
+        return Ok(KubeApiEndpoint {
+            host: "127.0.0.1".to_string(),
+            port: api_port,
+        });
     }
 
     let wsl_ip = resolve_wsl_instance_ipv4(instance).await?;
@@ -3831,12 +3950,18 @@ async fn resolve_kube_api_host_for_instance(instance: &str, trace_id: &str) -> R
         escape_for_log(&wsl_ip),
         api_port
     ));
-    Ok(wsl_ip)
+    Ok(KubeApiEndpoint {
+        host: wsl_ip,
+        port: api_port,
+    })
 }
 
-async fn wait_for_kube_api_port(instance: &str, api_host: &str, trace_id: &str) -> Result<()> {
+async fn wait_for_kube_api_port(
+    instance: &str,
+    endpoint: &KubeApiEndpoint,
+    trace_id: &str,
+) -> Result<()> {
     let started_at = Instant::now();
-    let api_port = k3s_api_port_for_instance(instance);
     let timeout = Duration::from_secs(KUBE_API_READY_TIMEOUT_SECONDS);
     let mut attempt: u32 = 0;
     let mut last_error = String::new();
@@ -3846,26 +3971,26 @@ async fn wait_for_kube_api_port(instance: &str, api_host: &str, trace_id: &str) 
             let message = if last_error.trim().is_empty() {
                 format!(
                     "API Kubernetes indisponible sur {}:{} apres {}s.",
-                    api_host, api_port, KUBE_API_READY_TIMEOUT_SECONDS
+                    endpoint.host, endpoint.port, KUBE_API_READY_TIMEOUT_SECONDS
                 )
             } else {
                 format!(
                     "API Kubernetes indisponible sur {}:{} apres {}s (dernier essai: {}).",
-                    api_host, api_port, KUBE_API_READY_TIMEOUT_SECONDS, last_error
+                    endpoint.host, endpoint.port, KUBE_API_READY_TIMEOUT_SECONDS, last_error
                 )
             };
             return Err(anyhow!(message));
         }
 
         attempt += 1;
-        match tcp_connect_once(api_host, api_port, Duration::from_millis(900)).await {
+        match tcp_connect_once(&endpoint.host, endpoint.port, Duration::from_millis(900)).await {
             Ok(()) => {
                 info!(
                     target: "wsl",
                     trace_id = %trace_id,
                     instance = %instance,
-                    api_host = %api_host,
-                    api_port = api_port,
+                    api_host = %endpoint.host,
+                    api_port = endpoint.port,
                     attempts = attempt,
                     "Port API Kubernetes joignable"
                 );
@@ -3976,7 +4101,7 @@ fn ensure_rustls_crypto_provider(trace_id: &str, instance: &str) -> Result<()> {
 
 async fn build_kube_client_for_instance(
     instance: &str,
-    api_host: Option<&str>,
+    api_endpoint: Option<&KubeApiEndpoint>,
 ) -> Result<(Client, KubeClientConfig, String, PathBuf)> {
     let context_name = kube_context_for_instance(instance);
     let kubeconfig_path = windows_kubeconfig_path()?;
@@ -4034,21 +4159,25 @@ async fn build_kube_client_for_instance(
         }
     }
 
-    let api_port = k3s_api_port_for_instance(instance);
-    if let Some(host) = api_host {
-        apply_kube_api_endpoint_override(&mut kubeconfig, &context_name, host, api_port)
-            .with_context(|| {
-                format!(
-                    "Application endpoint API Kubernetes impossible pour le contexte '{}'",
-                    context_name
-                )
-            })?;
+    if let Some(endpoint) = api_endpoint {
+        apply_kube_api_endpoint_override(
+            &mut kubeconfig,
+            &context_name,
+            &endpoint.host,
+            endpoint.port,
+        )
+        .with_context(|| {
+            format!(
+                "Application endpoint API Kubernetes impossible pour le contexte '{}'",
+                context_name
+            )
+        })?;
         info!(
             target: "wsl",
             instance = %instance,
             context = %context_name,
-            api_host = %host,
-            api_port = api_port,
+            api_host = %endpoint.host,
+            api_port = endpoint.port,
             "Endpoint API Kubernetes applique au kubeconfig en memoire"
         );
     }
@@ -5356,15 +5485,15 @@ async fn run_wsl_kubectl_exec(instance: &str, args: &[String]) -> Result<WslKube
         Duration::from_secs(KUBECTL_PREPARE_TIMEOUT_SECONDS),
         async {
             ensure_wsl_instance_running(instance, &trace_id).await?;
-            let api_host = resolve_kube_api_host_for_instance(instance, &trace_id).await?;
-            wait_for_kube_api_port(instance, &api_host, &trace_id).await?;
-            Ok::<String, anyhow::Error>(api_host)
+            let endpoint = resolve_kube_api_endpoint_for_instance(instance, &trace_id).await?;
+            wait_for_kube_api_port(instance, &endpoint, &trace_id).await?;
+            Ok::<KubeApiEndpoint, anyhow::Error>(endpoint)
         },
     )
     .await;
 
-    let api_host = match prepare_outcome {
-        Ok(Ok(host)) => host,
+    let api_endpoint = match prepare_outcome {
+        Ok(Ok(endpoint)) => endpoint,
         Ok(Err(err)) => {
             let message = err.to_string();
             warn!(
@@ -5418,18 +5547,20 @@ Verifie que '{}' peut demarrer et exposer l'API Kubernetes.",
 
     let trace_for_task = trace_id.clone();
     let instance_for_task = instance.to_string();
-    let api_host_for_task = api_host.clone();
+    let api_endpoint_for_task = api_endpoint.clone();
     let mut operation = tauri::async_runtime::spawn(async move {
         ensure_rustls_crypto_provider(&trace_for_task, &instance_for_task)?;
         info!(
             target: "wsl",
             trace_id = %trace_for_task,
             instance = %instance_for_task,
-            api_host = %api_host_for_task,
+            api_host = %api_endpoint_for_task.host,
+            api_port = api_endpoint_for_task.port,
             "Initialisation du client Kubernetes"
         );
         let (client, config, resolved_context, kubeconfig_path) =
-            build_kube_client_for_instance(&instance_for_task, Some(&api_host_for_task)).await?;
+            build_kube_client_for_instance(&instance_for_task, Some(&api_endpoint_for_task))
+                .await?;
         info!(
             target: "wsl",
             trace_id = %trace_for_task,
@@ -5627,15 +5758,15 @@ async fn run_wsl_kubectl_apply_yaml(
         Duration::from_secs(KUBECTL_PREPARE_TIMEOUT_SECONDS),
         async {
             ensure_wsl_instance_running(instance, &trace_id).await?;
-            let api_host = resolve_kube_api_host_for_instance(instance, &trace_id).await?;
-            wait_for_kube_api_port(instance, &api_host, &trace_id).await?;
-            Ok::<String, anyhow::Error>(api_host)
+            let endpoint = resolve_kube_api_endpoint_for_instance(instance, &trace_id).await?;
+            wait_for_kube_api_port(instance, &endpoint, &trace_id).await?;
+            Ok::<KubeApiEndpoint, anyhow::Error>(endpoint)
         },
     )
     .await;
 
-    let api_host = match prepare_outcome {
-        Ok(Ok(host)) => host,
+    let api_endpoint = match prepare_outcome {
+        Ok(Ok(endpoint)) => endpoint,
         Ok(Err(err)) => {
             let message = err.to_string();
             warn!(
@@ -5689,7 +5820,7 @@ Verifie que '{}' peut demarrer et exposer l'API Kubernetes.",
 
     let trace_for_task = trace_id.clone();
     let instance_for_task = instance.to_string();
-    let api_host_for_task = api_host.clone();
+    let api_endpoint_for_task = api_endpoint.clone();
     let manifest_for_task = manifest_yaml.to_string();
     let mut operation = tauri::async_runtime::spawn(async move {
         ensure_rustls_crypto_provider(&trace_for_task, &instance_for_task)?;
@@ -5697,11 +5828,13 @@ Verifie que '{}' peut demarrer et exposer l'API Kubernetes.",
             target: "wsl",
             trace_id = %trace_for_task,
             instance = %instance_for_task,
-            api_host = %api_host_for_task,
+            api_host = %api_endpoint_for_task.host,
+            api_port = api_endpoint_for_task.port,
             "Initialisation du client Kubernetes (apply)"
         );
         let (client, config, resolved_context, kubeconfig_path) =
-            build_kube_client_for_instance(&instance_for_task, Some(&api_host_for_task)).await?;
+            build_kube_client_for_instance(&instance_for_task, Some(&api_endpoint_for_task))
+                .await?;
         let stdout = execute_kubectl_apply_yaml(&client, &config, &manifest_for_task).await?;
         Ok::<(String, String, PathBuf), anyhow::Error>((stdout, resolved_context, kubeconfig_path))
     });

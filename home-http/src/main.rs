@@ -4,23 +4,23 @@
     windows_subsystem = "windows"
 )]
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
 use flexi_logger::{Age, Cleanup, Criterion, Duplicate, FileSpec, Logger, Naming};
 use http::Uri;
-use http_body_util::{BodyExt, Full, combinators::BoxBody};
+use http_body_util::{combinators::BoxBody, BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::{Request, Response};
 use hyper_util::{
-    client::legacy::{Client, connect::HttpConnector},
+    client::legacy::{connect::HttpConnector, Client},
     rt::{TokioExecutor, TokioIo},
     server::conn::auto::Builder as ServerBuilder,
 };
-use log::{LevelFilter, error, info, warn};
+use log::{error, info, warn, LevelFilter};
 use parking_lot::Mutex;
 use pin_project::pin_project;
 use serde::{Deserialize, Serialize};
-use std::ffi::{OsString, c_void};
+use std::ffi::{c_void, OsString};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::pin::Pin;
@@ -29,8 +29,8 @@ use std::{
     collections::HashMap,
     path::{Path, PathBuf},
     sync::{
-        Arc,
         atomic::{AtomicBool, Ordering},
+        Arc,
     },
     thread,
     time::Duration,
@@ -41,7 +41,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
-use tonic::transport::{Server, server::Connected};
+use tonic::transport::{server::Connected, Server};
 use windows_service::service::*;
 use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
 use windows_service::{define_windows_service, service_manager::*};
@@ -110,8 +110,8 @@ mod proto {
 
 use proto::homehttp::v1::home_http_server::{HomeHttp, HomeHttpServer};
 use proto::homehttp::v1::{
-    Acknowledge, AddRouteRequest, Empty, ListRoutesResponse, RemoveRouteRequest, StatusResponse,
-    list_routes_response,
+    list_routes_response, Acknowledge, AddRouteRequest, Empty, ListRoutesResponse,
+    RemoveRouteRequest, StatusResponse,
 };
 
 // Harmonized naming with DNS service
@@ -950,8 +950,14 @@ fn named_pipe_stream() -> io::Result<UnboundedReceiverStream<Result<PipeConnecti
 
     if result == 0 {
         let err = unsafe { windows_sys::Win32::Foundation::GetLastError() };
-        error!("FATAL: ConvertStringSecurityDescriptorToSecurityDescriptorW failed: {}", err);
-        return Err(io::Error::new(io::ErrorKind::Other, "Security attributes creation failed"));
+        error!(
+            "FATAL: ConvertStringSecurityDescriptorToSecurityDescriptorW failed: {}",
+            err
+        );
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            "Security attributes creation failed",
+        ));
     }
 
     let sd_addr = sd as usize;
@@ -972,14 +978,18 @@ fn named_pipe_stream() -> io::Result<UnboundedReceiverStream<Result<PipeConnecti
 
         let first_server = {
             let mut sa = windows_sys::Win32::Security::SECURITY_ATTRIBUTES {
-                nLength: std::mem::size_of::<windows_sys::Win32::Security::SECURITY_ATTRIBUTES>() as u32,
+                nLength: std::mem::size_of::<windows_sys::Win32::Security::SECURITY_ATTRIBUTES>()
+                    as u32,
                 lpSecurityDescriptor: sd_addr as windows_sys::Win32::Security::PSECURITY_DESCRIPTOR,
                 bInheritHandle: 0,
             };
             match unsafe {
                 ServerOptions::new()
                     .first_pipe_instance(true)
-                    .create_with_security_attributes_raw(NAMED_PIPE_NAME, &mut sa as *mut _ as *mut _)
+                    .create_with_security_attributes_raw(
+                        NAMED_PIPE_NAME,
+                        &mut sa as *mut _ as *mut _,
+                    )
             } {
                 Ok(s) => s,
                 Err(e) => {
@@ -1008,8 +1018,11 @@ fn named_pipe_stream() -> io::Result<UnboundedReceiverStream<Result<PipeConnecti
                             accepted_count
                         );
                         let mut sa = windows_sys::Win32::Security::SECURITY_ATTRIBUTES {
-                            nLength: std::mem::size_of::<windows_sys::Win32::Security::SECURITY_ATTRIBUTES>() as u32,
-                            lpSecurityDescriptor: sd_addr as windows_sys::Win32::Security::PSECURITY_DESCRIPTOR,
+                            nLength: std::mem::size_of::<
+                                windows_sys::Win32::Security::SECURITY_ATTRIBUTES,
+                            >() as u32,
+                            lpSecurityDescriptor: sd_addr
+                                as windows_sys::Win32::Security::PSECURITY_DESCRIPTOR,
                             bInheritHandle: 0,
                         };
                         let new_server = match unsafe {
