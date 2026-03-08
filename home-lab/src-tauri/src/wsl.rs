@@ -3886,7 +3886,41 @@ async fn resolve_kube_api_port_for_instance(instance: &str, trace_id: &str) -> u
             .find_map(|line| line.parse::<u16>().ok())
     });
 
-    let api_port = detected.unwrap_or(expected_port);
+    let mut candidates = Vec::new();
+    if let Some(port) = detected {
+        candidates.push(port);
+    }
+    candidates.push(expected_port);
+    candidates.push(6443);
+    candidates.push(6444);
+    candidates.sort_unstable();
+    candidates.dedup();
+
+    let mut reachable_port = None;
+    let mut resolved_ip: Option<String> = None;
+    for candidate in &candidates {
+        if tcp_connect_once("127.0.0.1", *candidate, Duration::from_millis(350))
+            .await
+            .is_ok()
+        {
+            reachable_port = Some(*candidate);
+            break;
+        }
+        if resolved_ip.is_none() {
+            resolved_ip = resolve_wsl_instance_ipv4(instance).await.ok();
+        }
+        if let Some(ip) = resolved_ip.as_deref() {
+            if tcp_connect_once(ip, *candidate, Duration::from_millis(350))
+                .await
+                .is_ok()
+            {
+                reachable_port = Some(*candidate);
+                break;
+            }
+        }
+    }
+
+    let api_port = reachable_port.or(detected).unwrap_or(expected_port);
     if api_port != expected_port {
         warn!(
             target: "wsl",
@@ -3902,6 +3936,16 @@ async fn resolve_kube_api_port_for_instance(instance: &str, trace_id: &str) -> u
             api_port,
             expected_port
         ));
+    }
+    if reachable_port.is_none() {
+        warn!(
+            target: "wsl",
+            trace_id = %trace_id,
+            instance = %instance,
+            selected_api_port = api_port,
+            candidates = %candidates.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(","),
+            "Aucun port API Kubernetes joignable pendant la detection; utilisation d'un fallback"
+        );
     }
     api_port
 }
