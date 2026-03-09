@@ -4030,6 +4030,7 @@ async fn ensure_wsl_instance_running(instance: &str, trace_id: &str) -> Result<(
         );
         if is_home_lab_wsl_instance(instance) {
             ensure_wsl_keepalive(instance, "already-running").await?;
+            ensure_home_lab_k3s_runtime_started(instance, trace_id).await?;
         }
         return Ok(());
     }
@@ -4100,7 +4101,63 @@ async fn ensure_wsl_instance_running(instance: &str, trace_id: &str) -> Result<(
     ));
     if is_home_lab_wsl_instance(instance) {
         ensure_wsl_keepalive(instance, trace_id).await?;
+        ensure_home_lab_k3s_runtime_started(instance, trace_id).await?;
     }
+    Ok(())
+}
+
+async fn ensure_home_lab_k3s_runtime_started(instance: &str, trace_id: &str) -> Result<()> {
+    if !is_home_lab_wsl_instance(instance) {
+        return Ok(());
+    }
+
+    let instance_owned = instance.to_string();
+    let script = "set -eu; if [ ! -x /usr/local/bin/k3s-init.sh ]; then exit 0; fi; nohup sh /usr/local/bin/k3s-init.sh >/tmp/k3s-init.out 2>/tmp/k3s-init.err </dev/null &";
+    let command_line = format_cli_command("wsl.exe", &["-d", instance, "--", "sh", "-lc", script]);
+    let output = tauri::async_runtime::spawn_blocking(move || {
+        Command::new("wsl.exe")
+            .args(["-d", &instance_owned, "--", "sh", "-lc", script])
+            .output()
+    })
+    .await
+    .map_err(|e| anyhow!("Erreur JoinHandle lors du lancement k3s-init: {e}"))?
+    .with_context(|| format!("Impossible de lancer k3s-init.sh pour '{}'", instance))?;
+
+    let stdout = decode_cli_output(&output.stdout);
+    let stderr = decode_cli_output(&output.stderr);
+    if !output.status.success() {
+        let detail = if !stderr.trim().is_empty() {
+            stderr.trim().to_string()
+        } else if !stdout.trim().is_empty() {
+            stdout.trim().to_string()
+        } else {
+            format!("wsl.exe -d {} a echoue ({})", instance, output.status)
+        };
+        anyhow::bail!(
+            "Demarrage k3s-init impossible pour {} (cmd={}): {}",
+            instance,
+            command_line,
+            detail
+        );
+    }
+
+    info!(
+        target: "wsl",
+        trace_id = %trace_id,
+        instance = %instance,
+        command = %command_line,
+        stdout = %escape_for_log(stdout.trim()),
+        stderr = %escape_for_log(stderr.trim()),
+        "Lancement k3s-init demande pour l'instance WSL"
+    );
+    log_wsl_event(format!(
+        "[{trace_id}] Lancement k3s-init demande pour {}: stdout={} stderr={}",
+        escape_for_log(instance),
+        escape_for_log(stdout.trim()),
+        escape_for_log(stderr.trim())
+    ));
+
+    sleep(Duration::from_millis(350)).await;
     Ok(())
 }
 
@@ -4231,7 +4288,7 @@ async fn resolve_kube_api_endpoint_for_instance(
 ) -> Result<KubeApiEndpoint> {
     let api_port = resolve_kube_api_port_for_instance(instance, trace_id).await;
     let wsl_ip = resolve_wsl_instance_ipv4(instance).await?;
-    if tcp_connect_once(&wsl_ip, api_port, Duration::from_millis(700))
+    if tcp_connect_once("127.0.0.1", api_port, Duration::from_millis(700))
         .await
         .is_ok()
     {
@@ -4239,17 +4296,17 @@ async fn resolve_kube_api_endpoint_for_instance(
             target: "wsl",
             trace_id = %trace_id,
             instance = %instance,
-            api_host = %wsl_ip,
+            api_host = "127.0.0.1",
             api_port = api_port,
-            "Endpoint API Kubernetes retenu (IP WSL)"
+            "Endpoint API Kubernetes retenu (forward localhost)"
         );
         return Ok(KubeApiEndpoint {
-            host: wsl_ip,
+            host: "127.0.0.1".to_string(),
             port: api_port,
         });
     }
 
-    if tcp_connect_once("127.0.0.1", api_port, Duration::from_millis(700))
+    if tcp_connect_once(&wsl_ip, api_port, Duration::from_millis(700))
         .await
         .is_ok()
     {
@@ -4276,18 +4333,17 @@ async fn resolve_kube_api_endpoint_for_instance(
         target: "wsl",
         trace_id = %trace_id,
         instance = %instance,
-        api_host = %wsl_ip,
+        api_host = "127.0.0.1",
         api_port = api_port,
-        "Endpoint API Kubernetes retenu (IP WSL, en attente d'ouverture du port)"
+        "Endpoint API Kubernetes retenu (forward localhost, en attente d'ouverture du port)"
     );
     log_wsl_event(format!(
-        "[{trace_id}] Endpoint API Kubernetes pour {}: {}:{}",
+        "[{trace_id}] Endpoint API Kubernetes pour {}: 127.0.0.1:{}",
         escape_for_log(instance),
-        escape_for_log(&wsl_ip),
         api_port
     ));
     Ok(KubeApiEndpoint {
-        host: wsl_ip,
+        host: "127.0.0.1".to_string(),
         port: api_port,
     })
 }
