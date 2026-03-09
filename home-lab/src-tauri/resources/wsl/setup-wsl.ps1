@@ -166,6 +166,85 @@ EOF
     }
 }
 
+function Get-InstanceSlot {
+    param([string]$Name)
+
+    if ($Name -eq 'home-lab-k3s') {
+        return 0
+    }
+
+    $match = [System.Text.RegularExpressions.Regex]::Match($Name, '^home-lab-k3s-(\d+)$')
+    if ($match.Success) {
+        $index = [int]$match.Groups[1].Value
+        if ($index -gt 0) {
+            return ($index - 1)
+        }
+    }
+
+    # Fallback stable slot when the name does not follow home-lab-k3s(-N)
+    $hash = 2166136261
+    foreach ($ch in $Name.ToCharArray()) {
+        $hash = ($hash -bxor [int][char]$ch)
+        $hash = [uint32](($hash * 16777619) -band 0xffffffff)
+    }
+    return [int]($hash % 1000)
+}
+
+function Get-ContainerdStreamPortForInstance {
+    param([string]$Name)
+
+    $basePort = 10010
+    $slot = Get-InstanceSlot -Name $Name
+    $port = $basePort + $slot
+    if ($port -gt 65535) {
+        throw "Port stream containerd invalide ($port) pour l'instance '$Name'."
+    }
+    return [int]$port
+}
+
+function Configure-ContainerdStreamPort {
+    param(
+        [string]$Distro,
+        [int]$StreamPort
+    )
+
+    if ($StreamPort -lt 1 -or $StreamPort -gt 65535) {
+        throw "StreamPort invalide ($StreamPort). Valeur attendue entre 1 et 65535."
+    }
+
+    Write-Info "Configuration containerd stream_server_port=$StreamPort"
+
+    $template = @"
+{{ template "base" . }}
+
+[plugins.'io.containerd.grpc.v1.cri']
+  stream_server_address = "127.0.0.1"
+  stream_server_port = "$StreamPort"
+"@
+
+    $escapedTemplate = $template.Replace("'", "'\''")
+    $cmd = @"
+set -eu
+mkdir -p /var/lib/rancher/k3s/agent/etc/containerd
+cat > /var/lib/rancher/k3s/agent/etc/containerd/config-v3.toml.tmpl <<'EOF'
+$escapedTemplate
+EOF
+cat > /var/lib/rancher/k3s/agent/etc/containerd/config.toml.tmpl <<'EOF'
+$escapedTemplate
+EOF
+"@
+
+    $std = & wsl.exe -d $Distro -- sh -c $cmd 2>&1
+    $exitCode = $LASTEXITCODE
+    if ($exitCode -ne 0) {
+        $details = ($std | Where-Object { $_ -and $_.Trim().Length -gt 0 }) -join "`n"
+        if ($details) {
+            throw "Configuration containerd stream port echouee (code $exitCode) :`n$details"
+        }
+        throw "Configuration containerd stream port echouee (code $exitCode)"
+    }
+}
+
 function Invoke-K3sBootstrap {
     param(
         [string]$Distro,
@@ -201,6 +280,8 @@ try {
     Write-Info "  - Rootfs      = $Rootfs"
     Write-Info "  - ApiPort     = $ApiPort"
     Write-Info "  - NodePortSpan= $NodePortSpan"
+    $streamPort = Get-ContainerdStreamPortForInstance -Name $DistroName
+    Write-Info "  - StreamPort  = $streamPort"
 
     $distros = @(Get-RegisteredDistros)
     $detected = if ($distros.Count -gt 0) { $distros -join ', ' } else { '(aucune)' }
@@ -226,6 +307,7 @@ try {
     }
 
     Configure-K3sEnv -Distro $DistroName -ApiPort $ApiPort -NodePortSpan $NodePortSpan
+    Configure-ContainerdStreamPort -Distro $DistroName -StreamPort $streamPort
     Clear-K3sLocks -Distro $DistroName
     Invoke-K3sBootstrap -Distro $DistroName
 
