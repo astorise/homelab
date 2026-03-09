@@ -2,7 +2,7 @@
 param(
     [string]$DistroName = 'home-lab-k3s',
     [string]$InstallDir = (Join-Path ${env:ProgramData} 'home-lab\\wsl'),
-    [string]$Rootfs     = (Join-Path $PSScriptRoot 'wsl-rootfs.tar'),
+    [string]$Rootfs     = '',
     [int]$ApiPort       = 6443,
     [int]$NodePortSpan  = 57,
     [switch]$ForceImport
@@ -20,6 +20,32 @@ function Ensure-WslBinary {
     if (-not (Get-Command 'wsl.exe' -ErrorAction SilentlyContinue)) {
         throw 'wsl.exe introuvable. Activez WSL (wsl --install) puis relancez.'
     }
+}
+
+function Get-ScriptDirectory {
+    $cached = Get-Variable -Name SetupScriptDir -Scope Script -ValueOnly -ErrorAction SilentlyContinue
+    if (-not [string]::IsNullOrWhiteSpace($cached)) {
+        return $cached
+    }
+
+    $candidate = $PSScriptRoot
+    if ([string]::IsNullOrWhiteSpace($candidate)) {
+        $candidate = [System.IO.Path]::GetDirectoryName($PSCommandPath)
+    }
+    if ([string]::IsNullOrWhiteSpace($candidate)) {
+        $candidate = [System.IO.Path]::GetDirectoryName($MyInvocation.MyCommand.Path)
+    }
+    if ([string]::IsNullOrWhiteSpace($candidate)) {
+        throw 'Impossible de determiner le dossier du script setup-wsl.ps1.'
+    }
+
+    # Normalize long-path prefix for cmdlets/providers that do not handle it.
+    if ($candidate.StartsWith('\\?\')) {
+        $candidate = $candidate.Substring(4)
+    }
+
+    Set-Variable -Name SetupScriptDir -Scope Script -Value $candidate
+    return $candidate
 }
 
 function Get-RegisteredDistros {
@@ -172,7 +198,7 @@ fi
 function Install-K3sInitScript {
     param([string]$Distro)
 
-    $sourcePath = Join-Path $PSScriptRoot 'k3s-init.sh'
+    $sourcePath = [System.IO.Path]::Combine((Get-ScriptDirectory), 'k3s-init.sh')
     if (-not (Test-Path -LiteralPath $sourcePath)) {
         throw "Script k3s-init.sh introuvable: $sourcePath"
     }
@@ -382,6 +408,9 @@ BOOTSTRAP_ONLY=1 BOOTSTRAP_TIMEOUT=$TimeoutSeconds sh /usr/local/bin/k3s-init.sh
 try {
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
     Ensure-WslBinary
+    if ([string]::IsNullOrWhiteSpace($Rootfs)) {
+        $Rootfs = [System.IO.Path]::Combine((Get-ScriptDirectory), 'wsl-rootfs.tar')
+    }
 
     Write-Info "Parametres d'execution :"
     Write-Info "  - DistroName = $DistroName"
