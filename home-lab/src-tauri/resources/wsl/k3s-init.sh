@@ -32,18 +32,18 @@ CONTAINERD_STREAM_PATCH_TIMEOUT=${CONTAINERD_STREAM_PATCH_TIMEOUT:-30}
 K3S_LB_SERVER_PORT=${K3S_LB_SERVER_PORT:-}
 K3S_KUBELET_PORT=${K3S_KUBELET_PORT:-}
 K3S_KUBELET_HEALTHZ_PORT=${K3S_KUBELET_HEALTHZ_PORT:-}
-K3S_KUBE_PROXY_HEALTHZ_PORT=${K3S_KUBE_PROXY_HEALTHZ_PORT:-}
-K3S_KUBE_PROXY_METRICS_PORT=${K3S_KUBE_PROXY_METRICS_PORT:-}
 K3S_KUBE_CONTROLLER_MANAGER_SECURE_PORT=${K3S_KUBE_CONTROLLER_MANAGER_SECURE_PORT:-}
 K3S_KUBE_CLOUD_CONTROLLER_MANAGER_SECURE_PORT=${K3S_KUBE_CLOUD_CONTROLLER_MANAGER_SECURE_PORT:-}
 K3S_KUBE_SCHEDULER_SECURE_PORT=${K3S_KUBE_SCHEDULER_SECURE_PORT:-}
+K3S_RUNTIME_BIN_DIR=${K3S_RUNTIME_BIN_DIR:-/var/lib/rancher/k3s/data/current/bin}
+K3S_RUNTIME_AUX_BIN_DIR=${K3S_RUNTIME_AUX_BIN_DIR:-$K3S_RUNTIME_BIN_DIR/aux}
 CONTAINERD_STREAM_PATCH_PID=
 
 log_info "Role: $ROLE"
 log_info "Port range: $PORT_RANGE"
 log_info "Traefik enabled: $ENABLE_TRAEFIK"
 if [ -n "$K3S_LB_SERVER_PORT" ]; then
-    log_info "Local k3s port plan: lb=$K3S_LB_SERVER_PORT kubelet=$K3S_KUBELET_PORT kubelet-healthz=$K3S_KUBELET_HEALTHZ_PORT kube-proxy-healthz=$K3S_KUBE_PROXY_HEALTHZ_PORT kube-proxy-metrics=$K3S_KUBE_PROXY_METRICS_PORT controller-manager=$K3S_KUBE_CONTROLLER_MANAGER_SECURE_PORT cloud-controller-manager=$K3S_KUBE_CLOUD_CONTROLLER_MANAGER_SECURE_PORT scheduler=$K3S_KUBE_SCHEDULER_SECURE_PORT"
+    log_info "Local k3s port plan: lb=$K3S_LB_SERVER_PORT kubelet=$K3S_KUBELET_PORT kubelet-healthz=$K3S_KUBELET_HEALTHZ_PORT controller-manager=$K3S_KUBE_CONTROLLER_MANAGER_SECURE_PORT cloud-controller-manager=$K3S_KUBE_CLOUD_CONTROLLER_MANAGER_SECURE_PORT scheduler=$K3S_KUBE_SCHEDULER_SECURE_PORT"
 fi
 
 LOCK_HELD=0
@@ -194,8 +194,21 @@ stop_containerd_stream_patch_watcher() {
     CONTAINERD_STREAM_PATCH_PID=
 }
 
+ensure_k3s_runtime_path() {
+    case ":$PATH:" in
+        *":$K3S_RUNTIME_AUX_BIN_DIR:"*) ;;
+        *) PATH="$K3S_RUNTIME_AUX_BIN_DIR:$PATH" ;;
+    esac
+    case ":$PATH:" in
+        *":$K3S_RUNTIME_BIN_DIR:"*) ;;
+        *) PATH="$K3S_RUNTIME_BIN_DIR:$PATH" ;;
+    esac
+    export PATH
+}
+
 run_k3s_server() {
     start_containerd_stream_patch_watcher
+    ensure_k3s_runtime_path
     set -- /usr/local/bin/k3s server --https-listen-port "$API_PORT"
 
     if [ -n "$K3S_LB_SERVER_PORT" ]; then
@@ -206,12 +219,6 @@ run_k3s_server() {
     fi
     if [ -n "$K3S_KUBELET_HEALTHZ_PORT" ]; then
         set -- "$@" --kubelet-arg "healthz-port=$K3S_KUBELET_HEALTHZ_PORT"
-    fi
-    if [ -n "$K3S_KUBE_PROXY_HEALTHZ_PORT" ]; then
-        set -- "$@" --kube-proxy-arg "healthz-bind-address=127.0.0.1:$K3S_KUBE_PROXY_HEALTHZ_PORT"
-    fi
-    if [ -n "$K3S_KUBE_PROXY_METRICS_PORT" ]; then
-        set -- "$@" --kube-proxy-arg "metrics-bind-address=127.0.0.1:$K3S_KUBE_PROXY_METRICS_PORT"
     fi
     if [ -n "$K3S_KUBE_CONTROLLER_MANAGER_SECURE_PORT" ]; then
         set -- "$@" --kube-controller-manager-arg "secure-port=$K3S_KUBE_CONTROLLER_MANAGER_SECURE_PORT"

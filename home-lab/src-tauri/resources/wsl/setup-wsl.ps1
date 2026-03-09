@@ -256,8 +256,6 @@ CONTAINERD_STREAM_PORT=$StreamPort
 K3S_LB_SERVER_PORT=$($LocalPorts.LbServerPort)
 K3S_KUBELET_PORT=$($LocalPorts.KubeletPort)
 K3S_KUBELET_HEALTHZ_PORT=$($LocalPorts.KubeletHealthzPort)
-K3S_KUBE_PROXY_HEALTHZ_PORT=$($LocalPorts.KubeProxyHealthzPort)
-K3S_KUBE_PROXY_METRICS_PORT=$($LocalPorts.KubeProxyMetricsPort)
 K3S_KUBE_CONTROLLER_MANAGER_SECURE_PORT=$($LocalPorts.KubeControllerManagerSecurePort)
 K3S_KUBE_CLOUD_CONTROLLER_MANAGER_SECURE_PORT=$($LocalPorts.KubeCloudControllerManagerSecurePort)
 K3S_KUBE_SCHEDULER_SECURE_PORT=$($LocalPorts.KubeSchedulerSecurePort)
@@ -370,8 +368,6 @@ function Get-K3sLocalPortLayoutForInstance {
         LbServerPort                         = [int]$blockBase
         KubeletPort                          = [int]($blockBase + 1)
         KubeletHealthzPort                   = [int]($blockBase + 2)
-        KubeProxyHealthzPort                 = [int]($blockBase + 3)
-        KubeProxyMetricsPort                 = [int]($blockBase + 4)
         KubeControllerManagerSecurePort      = [int]($blockBase + 5)
         KubeCloudControllerManagerSecurePort = [int]($blockBase + 6)
         KubeSchedulerSecurePort              = [int]($blockBase + 7)
@@ -422,7 +418,7 @@ try {
     $streamPort = Get-ContainerdStreamPortForInstance -Name $DistroName
     $localPorts = Get-K3sLocalPortLayoutForInstance -Name $DistroName
     Write-Info "  - StreamPort  = $streamPort"
-    Write-Info "  - LocalPorts  = lb:$($localPorts.LbServerPort) kubelet:$($localPorts.KubeletPort) kubelet-healthz:$($localPorts.KubeletHealthzPort) kube-proxy-healthz:$($localPorts.KubeProxyHealthzPort) kube-proxy-metrics:$($localPorts.KubeProxyMetricsPort) controller-manager:$($localPorts.KubeControllerManagerSecurePort) cloud-controller-manager:$($localPorts.KubeCloudControllerManagerSecurePort) scheduler:$($localPorts.KubeSchedulerSecurePort)"
+    Write-Info "  - LocalPorts  = lb:$($localPorts.LbServerPort) kubelet:$($localPorts.KubeletPort) kubelet-healthz:$($localPorts.KubeletHealthzPort) controller-manager:$($localPorts.KubeControllerManagerSecurePort) cloud-controller-manager:$($localPorts.KubeCloudControllerManagerSecurePort) scheduler:$($localPorts.KubeSchedulerSecurePort)"
 
     $distros = @(Get-RegisteredDistros)
     $detected = if ($distros.Count -gt 0) { $distros -join ', ' } else { '(aucune)' }

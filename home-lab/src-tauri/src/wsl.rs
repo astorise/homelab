@@ -524,8 +524,6 @@ struct K3sLocalPortLayout {
     lb_server_port: u16,
     kubelet_port: u16,
     kubelet_healthz_port: u16,
-    kube_proxy_healthz_port: u16,
-    kube_proxy_metrics_port: u16,
     kube_controller_manager_secure_port: u16,
     kube_cloud_controller_manager_secure_port: u16,
     kube_scheduler_secure_port: u16,
@@ -553,8 +551,6 @@ fn k3s_local_port_layout_for_instance(instance: &str) -> Result<K3sLocalPortLayo
         lb_server_port: port_at(0)?,
         kubelet_port: port_at(1)?,
         kubelet_healthz_port: port_at(2)?,
-        kube_proxy_healthz_port: port_at(3)?,
-        kube_proxy_metrics_port: port_at(4)?,
         kube_controller_manager_secure_port: port_at(5)?,
         kube_cloud_controller_manager_secure_port: port_at(6)?,
         kube_scheduler_secure_port: port_at(7)?,
@@ -1360,12 +1356,10 @@ fn render_k3s_env_file_for_instance(instance: &str) -> Result<String> {
     let local_ports = k3s_local_port_layout_for_instance(instance)?;
 
     Ok(format!(
-        "WSL_ROLE=server\nPORT_RANGE={api_port}-{range_end}\nCONTAINERD_STREAM_PORT={stream_port}\nK3S_LB_SERVER_PORT={lb_server_port}\nK3S_KUBELET_PORT={kubelet_port}\nK3S_KUBELET_HEALTHZ_PORT={kubelet_healthz_port}\nK3S_KUBE_PROXY_HEALTHZ_PORT={kube_proxy_healthz_port}\nK3S_KUBE_PROXY_METRICS_PORT={kube_proxy_metrics_port}\nK3S_KUBE_CONTROLLER_MANAGER_SECURE_PORT={kube_controller_manager_secure_port}\nK3S_KUBE_CLOUD_CONTROLLER_MANAGER_SECURE_PORT={kube_cloud_controller_manager_secure_port}\nK3S_KUBE_SCHEDULER_SECURE_PORT={kube_scheduler_secure_port}\n",
+        "WSL_ROLE=server\nPORT_RANGE={api_port}-{range_end}\nCONTAINERD_STREAM_PORT={stream_port}\nK3S_LB_SERVER_PORT={lb_server_port}\nK3S_KUBELET_PORT={kubelet_port}\nK3S_KUBELET_HEALTHZ_PORT={kubelet_healthz_port}\nK3S_KUBE_CONTROLLER_MANAGER_SECURE_PORT={kube_controller_manager_secure_port}\nK3S_KUBE_CLOUD_CONTROLLER_MANAGER_SECURE_PORT={kube_cloud_controller_manager_secure_port}\nK3S_KUBE_SCHEDULER_SECURE_PORT={kube_scheduler_secure_port}\n",
         lb_server_port = local_ports.lb_server_port,
         kubelet_port = local_ports.kubelet_port,
         kubelet_healthz_port = local_ports.kubelet_healthz_port,
-        kube_proxy_healthz_port = local_ports.kube_proxy_healthz_port,
-        kube_proxy_metrics_port = local_ports.kube_proxy_metrics_port,
         kube_controller_manager_secure_port = local_ports.kube_controller_manager_secure_port,
         kube_cloud_controller_manager_secure_port =
             local_ports.kube_cloud_controller_manager_secure_port,
