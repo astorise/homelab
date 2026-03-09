@@ -251,6 +251,8 @@ const HTTP_SERVICE_NAME: &str = "HomeHttpService";
 const DNS_SERVICE_NAME: &str = "HomeDnsService";
 const MANAGED_KUBECONFIG_PREFIX: &str = "home-lab-wsl-";
 const K3S_BOOTSTRAP_TIMEOUT_SECONDS: u64 = 180;
+const KUBECTL_CONFIG_VIEW_RETRY_ATTEMPTS_AFTER_BOOTSTRAP: usize = 12;
+const KUBECTL_CONFIG_VIEW_RETRY_DELAY_MS: u64 = 1000;
 const KUBECTL_EXEC_TIMEOUT_SECONDS: u64 = 25;
 const KUBECTL_PREPARE_TIMEOUT_SECONDS: u64 = 20;
 const KUBE_CONNECT_TIMEOUT_SECONDS: u64 = 5;
@@ -1304,36 +1306,83 @@ async fn enforce_instance_api_port_range(instance: &str, api_port: u16) -> Resul
 }
 
 fn read_instance_kubectl_config_view(instance: &str) -> Result<KubectlConfigView> {
-    let first = read_instance_kubectl_config_view_once(instance)?;
-    if kubectl_view_has_required_entries(&first) {
-        return Ok(first);
-    }
+    let mut last_issue = match read_instance_kubectl_config_view_once(instance) {
+        Ok(first) => {
+            if kubectl_view_has_required_entries(&first) {
+                return Ok(first);
+            }
 
-    warn!(
-        target: "wsl",
-        instance = %instance,
-        contexts = first.contexts.len(),
-        clusters = first.clusters.len(),
-        users = first.users.len(),
-        "kubectl config view incomplet; tentative de bootstrap k3s"
-    );
-    log_wsl_event(format!(
-        "kubectl config view incomplet pour {} (contexts={}, clusters={}, users={}), tentative bootstrap k3s",
-        escape_for_log(instance),
-        first.contexts.len(),
-        first.clusters.len(),
-        first.users.len()
-    ));
+            let issue = format!(
+                "config incomplet (contexts={}, clusters={}, users={})",
+                first.contexts.len(),
+                first.clusters.len(),
+                first.users.len()
+            );
+
+            warn!(
+                target: "wsl",
+                instance = %instance,
+                contexts = first.contexts.len(),
+                clusters = first.clusters.len(),
+                users = first.users.len(),
+                "kubectl config view incomplet; tentative de bootstrap k3s"
+            );
+            log_wsl_event(format!(
+                "kubectl config view incomplet pour {} (contexts={}, clusters={}, users={}), tentative bootstrap k3s",
+                escape_for_log(instance),
+                first.contexts.len(),
+                first.clusters.len(),
+                first.users.len()
+            ));
+            Some(issue)
+        }
+        Err(err) => {
+            let issue = err.to_string();
+            warn!(
+                target: "wsl",
+                instance = %instance,
+                error = %err,
+                "kubectl config view initial indisponible; tentative de bootstrap k3s"
+            );
+            log_wsl_event(format!(
+                "kubectl config view initial indisponible pour {}: {}, tentative bootstrap k3s",
+                escape_for_log(instance),
+                escape_for_log(&issue)
+            ));
+            Some(issue)
+        }
+    };
 
     bootstrap_k3s_for_instance_if_available(instance)?;
-    let second = read_instance_kubectl_config_view_once(instance)?;
-    if kubectl_view_has_required_entries(&second) {
-        return Ok(second);
+
+    for attempt in 1..=KUBECTL_CONFIG_VIEW_RETRY_ATTEMPTS_AFTER_BOOTSTRAP {
+        match read_instance_kubectl_config_view_once(instance) {
+            Ok(view) if kubectl_view_has_required_entries(&view) => return Ok(view),
+            Ok(view) => {
+                last_issue = Some(format!(
+                    "config incomplet apres bootstrap (tentative {attempt}/{}) (contexts={}, clusters={}, users={})",
+                    KUBECTL_CONFIG_VIEW_RETRY_ATTEMPTS_AFTER_BOOTSTRAP,
+                    view.contexts.len(),
+                    view.clusters.len(),
+                    view.users.len()
+                ));
+            }
+            Err(err) => {
+                last_issue = Some(format!(
+                    "lecture kubectl impossible apres bootstrap (tentative {attempt}/{}): {}",
+                    KUBECTL_CONFIG_VIEW_RETRY_ATTEMPTS_AFTER_BOOTSTRAP,
+                    err
+                ));
+            }
+        }
+
+        std::thread::sleep(Duration::from_millis(KUBECTL_CONFIG_VIEW_RETRY_DELAY_MS));
     }
 
     anyhow::bail!(
-        "Aucun contexte kubectl disponible pour {} apres tentative de bootstrap k3s.",
-        instance
+        "Aucun contexte kubectl disponible pour {} apres tentative de bootstrap k3s (dernier etat: {}).",
+        instance,
+        last_issue.unwrap_or_else(|| "etat inconnu".to_string())
     )
 }
 
