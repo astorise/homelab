@@ -29,7 +29,7 @@ RUN chmod +x /usr/local/bin/mount_all.sh /usr/local/bin/k3s-init.sh
 
 # Script de démarrage auto
 RUN mkdir -p /etc/local.d \
-    && printf '#!/bin/sh\n/usr/local/bin/k3s-init.sh\n' > /etc/local.d/k3s.start \
+    && printf '#!/bin/sh\nexec sh /usr/local/bin/k3s-init.sh\n' > /etc/local.d/k3s.start \
     && chmod +x /etc/local.d/k3s.start
 
-ENTRYPOINT ["/usr/local/bin/k3s-init.sh"]
+ENTRYPOINT ["/bin/sh", "/usr/local/bin/k3s-init.sh"]

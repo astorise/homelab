@@ -27,7 +27,9 @@ function Get-RegisteredDistros {
     if ($LASTEXITCODE -ne 0) {
         throw "Impossible de recuperer la liste des distributions WSL (code $LASTEXITCODE)."
     }
-    $list | Where-Object { $_ -and ($_.Trim().Length -gt 0) } | ForEach-Object { $_.Trim() }
+    $list `
+        | ForEach-Object { ($_ -replace "`0", '').Trim() } `
+        | Where-Object { $_ -and ($_.Length -gt 0) }
 }
 
 function Import-Distro {
@@ -106,6 +108,45 @@ function Remove-Distro {
     }
 }
 
+function Invoke-WslScript {
+    param(
+        [string]$Distro,
+        [string]$Script,
+        [string]$Operation
+    )
+
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = 'wsl.exe'
+    $psi.Arguments = "-d $Distro -- sh -s"
+    $psi.RedirectStandardInput = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+
+    $process = New-Object System.Diagnostics.Process
+    $process.StartInfo = $psi
+    $null = $process.Start()
+
+    $normalizedScript = $Script.Replace("`r`n", "`n").Replace("`r", "`n")
+    $process.StandardInput.Write($normalizedScript)
+    if (-not $normalizedScript.EndsWith("`n")) {
+        $process.StandardInput.WriteLine()
+    }
+    $process.StandardInput.Close()
+
+    $stdout = $process.StandardOutput.ReadToEnd()
+    $stderr = $process.StandardError.ReadToEnd()
+    $process.WaitForExit()
+
+    [pscustomobject]@{
+        ExitCode = $process.ExitCode
+        Stdout   = $stdout
+        Stderr   = $stderr
+        Output   = @($stdout, $stderr) | Where-Object { $_ -and $_.Trim().Length -gt 0 }
+    }
+}
+
 function Clear-K3sLocks {
     param(
         [string]$Distro
@@ -122,14 +163,54 @@ if pidof k3s >/dev/null 2>&1; then
 fi
 '@
     Write-Info "Nettoyage des verrous k3s (si presents)"
-    & wsl.exe -d $Distro -- sh -c $cmd 2>$null | Out-Null
+    $result = Invoke-WslScript -Distro $Distro -Script $cmd -Operation 'Nettoyage des verrous k3s'
+    if ($result.ExitCode -ne 0) {
+        $result.Output | Out-Null
+    }
+}
+
+function Install-K3sInitScript {
+    param([string]$Distro)
+
+    $sourcePath = Join-Path $PSScriptRoot 'k3s-init.sh'
+    if (-not (Test-Path -LiteralPath $sourcePath)) {
+        throw "Script k3s-init.sh introuvable: $sourcePath"
+    }
+
+    Write-Info "Installation du script /usr/local/bin/k3s-init.sh"
+    $scriptContent = Get-Content -Raw -LiteralPath $sourcePath
+    $normalizedScript = $scriptContent.Replace("`r`n", "`n").Replace("`r", "`n")
+
+    $mkdirResult = Invoke-WslScript -Distro $Distro -Script "set -eu; mkdir -p /usr/local/bin" -Operation 'Preparation /usr/local/bin'
+    if ($mkdirResult.ExitCode -ne 0) {
+        $details = ($mkdirResult.Output) -join "`n"
+        if ($details) {
+            throw "Preparation /usr/local/bin echouee (code $($mkdirResult.ExitCode)) :`n$details"
+        }
+        throw "Preparation /usr/local/bin echouee (code $($mkdirResult.ExitCode))"
+    }
+
+    $uncPath = "\\wsl$\$Distro\usr\local\bin\k3s-init.sh"
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($uncPath, $normalizedScript, $utf8NoBom)
+
+    $chmodStd = & wsl.exe -d $Distro -- chmod +x /usr/local/bin/k3s-init.sh 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        $details = ($chmodStd | Where-Object { $_ -and $_.Trim().Length -gt 0 }) -join "`n"
+        if ($details) {
+            throw "Installation k3s-init.sh echouee (chmod, code $LASTEXITCODE) :`n$details"
+        }
+        throw "Installation k3s-init.sh echouee (chmod, code $LASTEXITCODE)"
+    }
 }
 
 function Configure-K3sEnv {
     param(
         [string]$Distro,
         [int]$ApiPort,
-        [int]$NodePortSpan
+        [int]$NodePortSpan,
+        [int]$StreamPort,
+        [psobject]$LocalPorts
     )
 
     if ($ApiPort -lt 1 -or $ApiPort -gt 65535) {
@@ -142,27 +223,55 @@ function Configure-K3sEnv {
     $rangeEnd = [Math]::Min(65535, $ApiPort + $NodePortSpan)
     $rangeText = "$ApiPort-$rangeEnd"
     Write-Info "Configuration de /etc/k3s-env avec PORT_RANGE=$rangeText"
-
-$cmd = @"
-set -eu
-cat > /etc/k3s-env <<'EOF'
+    $content = @"
 WSL_ROLE=server
 PORT_RANGE=$rangeText
-EOF
-"@
-    $std = & wsl.exe -d $Distro -- sh -c $cmd 2>&1
-    $exitCode = $LASTEXITCODE
+CONTAINERD_STREAM_PORT=$StreamPort
+K3S_LB_SERVER_PORT=$($LocalPorts.LbServerPort)
+K3S_KUBELET_PORT=$($LocalPorts.KubeletPort)
+K3S_KUBELET_HEALTHZ_PORT=$($LocalPorts.KubeletHealthzPort)
+K3S_KUBE_PROXY_HEALTHZ_PORT=$($LocalPorts.KubeProxyHealthzPort)
+K3S_KUBE_PROXY_METRICS_PORT=$($LocalPorts.KubeProxyMetricsPort)
+K3S_KUBE_CONTROLLER_MANAGER_SECURE_PORT=$($LocalPorts.KubeControllerManagerSecurePort)
+K3S_KUBE_CLOUD_CONTROLLER_MANAGER_SECURE_PORT=$($LocalPorts.KubeCloudControllerManagerSecurePort)
+K3S_KUBE_SCHEDULER_SECURE_PORT=$($LocalPorts.KubeSchedulerSecurePort)
+"@.Replace("`r`n", "`n").Replace("`r", "`n")
 
-    if ($exitCode -ne 0) {
-        $details = ($std | Where-Object { $_ -and $_.Trim().Length -gt 0 }) -join "`n"
+    $uncPath = "\\wsl$\$Distro\etc\k3s-env"
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($uncPath, $content, $utf8NoBom)
+}
+
+function Configure-K3sAutostart {
+    param([string]$Distro)
+
+    Write-Info "Configuration de l'autostart WSL/local.d pour k3s-init.sh"
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+
+    $wslConfPath = "\\wsl$\$Distro\etc\wsl.conf"
+    $wslConfContent = "[boot]`ncommand=`"sh /usr/local/bin/k3s-init.sh`"`n".Replace("`r`n", "`n").Replace("`r", "`n")
+    [System.IO.File]::WriteAllText($wslConfPath, $wslConfContent, $utf8NoBom)
+
+    $localDResult = Invoke-WslScript -Distro $Distro -Script "set -eu; mkdir -p /etc/local.d" -Operation 'Preparation /etc/local.d'
+    if ($localDResult.ExitCode -ne 0) {
+        $details = ($localDResult.Output) -join "`n"
         if ($details) {
-            throw "Configuration /etc/k3s-env echouee (code $exitCode) :`n$details"
+            throw "Preparation /etc/local.d echouee (code $($localDResult.ExitCode)) :`n$details"
         }
-        throw "Configuration /etc/k3s-env echouee (code $exitCode)"
+        throw "Preparation /etc/local.d echouee (code $($localDResult.ExitCode))"
     }
 
-    if ($std) {
-        Write-Info ("wsl.exe a renvoye:" + [Environment]::NewLine + ($std -join [Environment]::NewLine))
+    $localStartPath = "\\wsl$\$Distro\etc\local.d\k3s.start"
+    $localStartContent = "#!/bin/sh`nexec sh /usr/local/bin/k3s-init.sh`n".Replace("`r`n", "`n").Replace("`r", "`n")
+    [System.IO.File]::WriteAllText($localStartPath, $localStartContent, $utf8NoBom)
+
+    $chmodStd = & wsl.exe -d $Distro -- chmod +x /etc/local.d/k3s.start 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        $details = ($chmodStd | Where-Object { $_ -and $_.Trim().Length -gt 0 }) -join "`n"
+        if ($details) {
+            throw "Activation /etc/local.d/k3s.start echouee (code $LASTEXITCODE) :`n$details"
+        }
+        throw "Activation /etc/local.d/k3s.start echouee (code $LASTEXITCODE)"
     }
 }
 
@@ -190,11 +299,30 @@ function Get-InstanceSlot {
     return [int]($hash % 1000)
 }
 
+function Get-BoundedInstanceSlot {
+    param(
+        [string]$Name,
+        [int]$Capacity
+    )
+
+    if ($Capacity -le 1) {
+        return 0
+    }
+
+    $slot = Get-InstanceSlot -Name $Name
+    if ($slot -lt 0) {
+        return 0
+    }
+
+    return [int]($slot % $Capacity)
+}
+
 function Get-ContainerdStreamPortForInstance {
     param([string]$Name)
 
     $basePort = 10010
-    $slot = Get-InstanceSlot -Name $Name
+    $capacity = 65536 - $basePort
+    $slot = Get-BoundedInstanceSlot -Name $Name -Capacity $capacity
     $port = $basePort + $slot
     if ($port -gt 65535) {
         throw "Port stream containerd invalide ($port) pour l'instance '$Name'."
@@ -202,46 +330,25 @@ function Get-ContainerdStreamPortForInstance {
     return [int]$port
 }
 
-function Configure-ContainerdStreamPort {
-    param(
-        [string]$Distro,
-        [int]$StreamPort
-    )
+function Get-K3sLocalPortLayoutForInstance {
+    param([string]$Name)
 
-    if ($StreamPort -lt 1 -or $StreamPort -gt 65535) {
-        throw "StreamPort invalide ($StreamPort). Valeur attendue entre 1 et 65535."
-    }
+    $basePort = 11040
+    $step = 20
+    $maxOffset = 7
+    $capacity = [int]([Math]::Floor(((65535 - $basePort - $maxOffset) / $step) + 1))
+    $slot = Get-BoundedInstanceSlot -Name $Name -Capacity $capacity
+    $blockBase = $basePort + ($slot * $step)
 
-    Write-Info "Configuration containerd stream_server_port=$StreamPort"
-
-    $template = @"
-{{ template "base" . }}
-
-[plugins.'io.containerd.grpc.v1.cri']
-  stream_server_address = "127.0.0.1"
-  stream_server_port = "$StreamPort"
-"@
-
-    $escapedTemplate = $template.Replace("'", "'\''")
-    $cmd = @"
-set -eu
-mkdir -p /var/lib/rancher/k3s/agent/etc/containerd
-cat > /var/lib/rancher/k3s/agent/etc/containerd/config-v3.toml.tmpl <<'EOF'
-$escapedTemplate
-EOF
-cat > /var/lib/rancher/k3s/agent/etc/containerd/config.toml.tmpl <<'EOF'
-$escapedTemplate
-EOF
-"@
-
-    $std = & wsl.exe -d $Distro -- sh -c $cmd 2>&1
-    $exitCode = $LASTEXITCODE
-    if ($exitCode -ne 0) {
-        $details = ($std | Where-Object { $_ -and $_.Trim().Length -gt 0 }) -join "`n"
-        if ($details) {
-            throw "Configuration containerd stream port echouee (code $exitCode) :`n$details"
-        }
-        throw "Configuration containerd stream port echouee (code $exitCode)"
+    [pscustomobject]@{
+        LbServerPort                         = [int]$blockBase
+        KubeletPort                          = [int]($blockBase + 1)
+        KubeletHealthzPort                   = [int]($blockBase + 2)
+        KubeProxyHealthzPort                 = [int]($blockBase + 3)
+        KubeProxyMetricsPort                 = [int]($blockBase + 4)
+        KubeControllerManagerSecurePort      = [int]($blockBase + 5)
+        KubeCloudControllerManagerSecurePort = [int]($blockBase + 6)
+        KubeSchedulerSecurePort              = [int]($blockBase + 7)
     }
 }
 
@@ -252,20 +359,23 @@ function Invoke-K3sBootstrap {
     )
 
     Write-Info "Initialisation de k3s (bootstrap) dans $Distro"
-    $cmd = "set -eu; BOOTSTRAP_ONLY=1 BOOTSTRAP_TIMEOUT=$TimeoutSeconds /usr/local/bin/k3s-init.sh"
-    $std = & wsl.exe -d $Distro -- sh -c $cmd 2>&1
-    $exitCode = $LASTEXITCODE
+$cmd = @"
+set -eu
+BOOTSTRAP_ONLY=1 BOOTSTRAP_TIMEOUT=$TimeoutSeconds sh /usr/local/bin/k3s-init.sh
+"@
+    $result = Invoke-WslScript -Distro $Distro -Script $cmd -Operation 'Initialisation k3s'
+    $exitCode = $result.ExitCode
 
     if ($exitCode -ne 0) {
-        $details = ($std | Where-Object { $_ -and $_.Trim().Length -gt 0 }) -join "`n"
+        $details = ($result.Output) -join "`n"
         if ($details) {
             throw "Initialisation k3s echouee (code $exitCode) :`n$details"
         }
         throw "Initialisation k3s echouee (code $exitCode)"
     }
 
-    if ($std) {
-        Write-Info ("k3s-init.sh a renvoye :" + [Environment]::NewLine + ($std -join [Environment]::NewLine))
+    if ($result.Output) {
+        Write-Info ("k3s-init.sh a renvoye :" + [Environment]::NewLine + ($result.Output -join [Environment]::NewLine))
     }
 }
 
@@ -281,7 +391,9 @@ try {
     Write-Info "  - ApiPort     = $ApiPort"
     Write-Info "  - NodePortSpan= $NodePortSpan"
     $streamPort = Get-ContainerdStreamPortForInstance -Name $DistroName
+    $localPorts = Get-K3sLocalPortLayoutForInstance -Name $DistroName
     Write-Info "  - StreamPort  = $streamPort"
+    Write-Info "  - LocalPorts  = lb:$($localPorts.LbServerPort) kubelet:$($localPorts.KubeletPort) kubelet-healthz:$($localPorts.KubeletHealthzPort) kube-proxy-healthz:$($localPorts.KubeProxyHealthzPort) kube-proxy-metrics:$($localPorts.KubeProxyMetricsPort) controller-manager:$($localPorts.KubeControllerManagerSecurePort) cloud-controller-manager:$($localPorts.KubeCloudControllerManagerSecurePort) scheduler:$($localPorts.KubeSchedulerSecurePort)"
 
     $distros = @(Get-RegisteredDistros)
     $detected = if ($distros.Count -gt 0) { $distros -join ', ' } else { '(aucune)' }
@@ -306,8 +418,9 @@ try {
         Write-Info "Distribution $DistroName deja presente, import ignore."
     }
 
-    Configure-K3sEnv -Distro $DistroName -ApiPort $ApiPort -NodePortSpan $NodePortSpan
-    Configure-ContainerdStreamPort -Distro $DistroName -StreamPort $streamPort
+    Install-K3sInitScript -Distro $DistroName
+    Configure-K3sEnv -Distro $DistroName -ApiPort $ApiPort -NodePortSpan $NodePortSpan -StreamPort $streamPort -LocalPorts $localPorts
+    Configure-K3sAutostart -Distro $DistroName
     Clear-K3sLocks -Distro $DistroName
     Invoke-K3sBootstrap -Distro $DistroName
 

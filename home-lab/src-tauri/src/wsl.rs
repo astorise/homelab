@@ -245,6 +245,9 @@ const ENV_API_PORT_BASE: &str = "HOME_LAB_WSL_K3S_API_PORT_BASE";
 const ENV_API_PORT_STEP: &str = "HOME_LAB_WSL_K3S_API_PORT_STEP";
 const ENV_API_PORT_MAX: &str = "HOME_LAB_WSL_K3S_API_PORT_MAX";
 const DEFAULT_K3S_NODEPORT_SPAN: u16 = 57;
+const DEFAULT_CONTAINERD_STREAM_PORT_BASE: u16 = 10010;
+const DEFAULT_K3S_LOCAL_PORT_BASE: u16 = 11040;
+const DEFAULT_K3S_LOCAL_PORT_STEP: u16 = 20;
 const SERVICE_RPC_RETRIES: usize = 8;
 const SERVICE_RPC_BASE_DELAY_MS: u64 = 750;
 const HTTP_SERVICE_NAME: &str = "HomeHttpService";
@@ -253,6 +256,7 @@ const MANAGED_KUBECONFIG_PREFIX: &str = "home-lab-wsl-";
 const K3S_BOOTSTRAP_TIMEOUT_SECONDS: u64 = 180;
 const KUBECTL_CONFIG_VIEW_RETRY_ATTEMPTS_AFTER_BOOTSTRAP: usize = 12;
 const KUBECTL_CONFIG_VIEW_RETRY_DELAY_MS: u64 = 1000;
+const K3S_INIT_SCRIPT_RESOURCE: &str = include_str!("../resources/wsl/k3s-init.sh");
 const KUBECTL_EXEC_TIMEOUT_SECONDS: u64 = 25;
 const KUBECTL_PREPARE_TIMEOUT_SECONDS: u64 = 20;
 const KUBE_CONNECT_TIMEOUT_SECONDS: u64 = 5;
@@ -457,13 +461,25 @@ fn home_lab_instance_slot(instance: &str) -> Option<u32> {
     Some(parsed.saturating_sub(1))
 }
 
-fn fallback_instance_slot(instance: &str) -> u32 {
+fn fallback_instance_hash(instance: &str) -> u32 {
     let mut hash: u32 = 0x811C_9DC5;
     for byte in instance.trim().to_ascii_lowercase().bytes() {
         hash ^= u32::from(byte);
         hash = hash.wrapping_mul(0x0100_0193);
     }
     hash
+}
+
+fn bounded_instance_slot(instance: &str, slots: u32) -> u32 {
+    if slots <= 1 {
+        return 0;
+    }
+
+    if let Some(slot) = home_lab_instance_slot(instance) {
+        return slot % slots;
+    }
+
+    fallback_instance_hash(instance) % slots
 }
 
 fn k3s_api_port_for_instance(instance: &str) -> u16 {
@@ -479,7 +495,7 @@ fn k3s_api_port_for_instance(instance: &str) -> u16 {
         return base;
     }
 
-    let slot = home_lab_instance_slot(instance).unwrap_or_else(|| fallback_instance_slot(instance));
+    let slot = bounded_instance_slot(instance, slots);
     let offset = slot % slots;
     let computed = u32::from(base) + offset * u32::from(step);
     u16::try_from(computed).unwrap_or(base)
@@ -489,6 +505,60 @@ fn k3s_port_range_for_instance(instance: &str) -> (u16, u16) {
     let api_port = k3s_api_port_for_instance(instance);
     let range_end = api_port.saturating_add(DEFAULT_K3S_NODEPORT_SPAN);
     (api_port, range_end)
+}
+
+fn containerd_stream_port_for_instance(instance: &str) -> Result<u16> {
+    let capacity = u32::from(u16::MAX) - u32::from(DEFAULT_CONTAINERD_STREAM_PORT_BASE) + 1;
+    let slot = bounded_instance_slot(instance, capacity);
+    let port = u32::from(DEFAULT_CONTAINERD_STREAM_PORT_BASE) + slot;
+    u16::try_from(port).map_err(|_| {
+        anyhow!(
+            "Port stream containerd invalide ({port}) pour l'instance '{}'.",
+            instance
+        )
+    })
+}
+
+#[derive(Clone, Copy, Debug)]
+struct K3sLocalPortLayout {
+    lb_server_port: u16,
+    kubelet_port: u16,
+    kubelet_healthz_port: u16,
+    kube_proxy_healthz_port: u16,
+    kube_proxy_metrics_port: u16,
+    kube_controller_manager_secure_port: u16,
+    kube_cloud_controller_manager_secure_port: u16,
+    kube_scheduler_secure_port: u16,
+}
+
+fn k3s_local_port_layout_for_instance(instance: &str) -> Result<K3sLocalPortLayout> {
+    let base = u32::from(DEFAULT_K3S_LOCAL_PORT_BASE);
+    let step = u32::from(DEFAULT_K3S_LOCAL_PORT_STEP);
+    let max_offset = 7u32;
+    let capacity = ((u32::from(u16::MAX) - base - max_offset) / step).saturating_add(1);
+    let slot = bounded_instance_slot(instance, capacity);
+    let block_base = base + slot * step;
+
+    let port_at = |offset: u32| -> Result<u16> {
+        u16::try_from(block_base + offset).map_err(|_| {
+            anyhow!(
+                "Port local k3s invalide ({}) pour l'instance '{}'.",
+                block_base + offset,
+                instance
+            )
+        })
+    };
+
+    Ok(K3sLocalPortLayout {
+        lb_server_port: port_at(0)?,
+        kubelet_port: port_at(1)?,
+        kubelet_healthz_port: port_at(2)?,
+        kube_proxy_healthz_port: port_at(3)?,
+        kube_proxy_metrics_port: port_at(4)?,
+        kube_controller_manager_secure_port: port_at(5)?,
+        kube_cloud_controller_manager_secure_port: port_at(6)?,
+        kube_scheduler_secure_port: port_at(7)?,
+    })
 }
 
 fn pick_http_port(used_ports: &HashSet<u16>) -> Result<u16> {
@@ -1215,9 +1285,196 @@ fn kubectl_view_has_required_entries(view: &KubectlConfigView) -> bool {
     !view.contexts.is_empty() && !view.clusters.is_empty() && !view.users.is_empty()
 }
 
+fn run_wsl_shell_script_via_stdin(
+    instance: &str,
+    script: &str,
+    description: &str,
+) -> Result<(String, String)> {
+    let command_line = format_cli_command("wsl.exe", &["-d", instance, "--", "sh", "-s"]);
+    let mut child = Command::new("wsl.exe")
+        .creation_flags(CREATE_NO_WINDOW)
+        .args(["-d", instance, "--", "sh", "-s"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| {
+            format!(
+                "Impossible d'executer le script WSL pour {} ({})",
+                instance, description
+            )
+        })?;
+
+    {
+        let stdin = child.stdin.as_mut().ok_or_else(|| {
+            anyhow!(
+                "Impossible d'ouvrir stdin pour le script WSL {} ({})",
+                instance,
+                description
+            )
+        })?;
+        stdin
+            .write_all(script.as_bytes())
+            .with_context(|| format!("Ecriture stdin WSL impossible pour {} ({})", instance, description))?;
+        if !script.ends_with('\n') {
+            stdin
+                .write_all(b"\n")
+                .with_context(|| format!("Finalisation stdin WSL impossible pour {} ({})", instance, description))?;
+        }
+    }
+
+    let output = child.wait_with_output().with_context(|| {
+        format!(
+            "Impossible d'attendre le script WSL pour {} ({})",
+            instance, description
+        )
+    })?;
+
+    let stdout = decode_cli_output(&output.stdout);
+    let stderr = decode_cli_output(&output.stderr);
+    let stdout_trim = stdout.trim();
+    let stderr_trim = stderr.trim();
+
+    if !output.status.success() {
+        anyhow::bail!(
+            "Script WSL a echoue pour {} ({}, cmd={}): {}",
+            instance,
+            description,
+            command_line,
+            if !stderr_trim.is_empty() {
+                stderr_trim
+            } else if !stdout_trim.is_empty() {
+                stdout_trim
+            } else {
+                "erreur inconnue"
+            }
+        );
+    }
+
+    Ok((stdout, stderr))
+}
+
+fn render_k3s_env_file_for_instance(instance: &str) -> Result<String> {
+    let (api_port, range_end) = k3s_port_range_for_instance(instance);
+    let stream_port = containerd_stream_port_for_instance(instance)?;
+    let local_ports = k3s_local_port_layout_for_instance(instance)?;
+
+    Ok(format!(
+        "WSL_ROLE=server\nPORT_RANGE={api_port}-{range_end}\nCONTAINERD_STREAM_PORT={stream_port}\nK3S_LB_SERVER_PORT={lb_server_port}\nK3S_KUBELET_PORT={kubelet_port}\nK3S_KUBELET_HEALTHZ_PORT={kubelet_healthz_port}\nK3S_KUBE_PROXY_HEALTHZ_PORT={kube_proxy_healthz_port}\nK3S_KUBE_PROXY_METRICS_PORT={kube_proxy_metrics_port}\nK3S_KUBE_CONTROLLER_MANAGER_SECURE_PORT={kube_controller_manager_secure_port}\nK3S_KUBE_CLOUD_CONTROLLER_MANAGER_SECURE_PORT={kube_cloud_controller_manager_secure_port}\nK3S_KUBE_SCHEDULER_SECURE_PORT={kube_scheduler_secure_port}\n",
+        lb_server_port = local_ports.lb_server_port,
+        kubelet_port = local_ports.kubelet_port,
+        kubelet_healthz_port = local_ports.kubelet_healthz_port,
+        kube_proxy_healthz_port = local_ports.kube_proxy_healthz_port,
+        kube_proxy_metrics_port = local_ports.kube_proxy_metrics_port,
+        kube_controller_manager_secure_port = local_ports.kube_controller_manager_secure_port,
+        kube_cloud_controller_manager_secure_port =
+            local_ports.kube_cloud_controller_manager_secure_port,
+        kube_scheduler_secure_port = local_ports.kube_scheduler_secure_port,
+    ))
+}
+
+fn repair_k3s_runtime_for_instance(instance: &str) -> Result<()> {
+    let (api_port, range_end) = k3s_port_range_for_instance(instance);
+    let k3s_init_script = K3S_INIT_SCRIPT_RESOURCE
+        .replace("\r\n", "\n")
+        .replace('\r', "\n");
+    let env_file = render_k3s_env_file_for_instance(instance)?;
+    let script = format!(
+        r#"set -eu
+detect_node_ip() {{
+    line=$(ip -4 addr show dev eth0 2>/dev/null | grep 'inet ' | head -n1 || true)
+    if [ -n "$line" ]; then
+        candidate=$(echo "$line" | tr -s ' ' | cut -d' ' -f3 | cut -d/ -f1)
+        case "$candidate" in
+            127.*|169.254.*|'')
+                ;;
+            *)
+                echo "$candidate"
+                return 0
+                ;;
+        esac
+    fi
+
+    ip -4 addr show 2>/dev/null \
+        | grep 'inet ' \
+        | tr -s ' ' \
+        | cut -d' ' -f3 \
+        | cut -d/ -f1 \
+        | while IFS= read -r candidate; do
+            case "$candidate" in
+                127.*|169.254.*|'')
+                    ;;
+                *)
+                    echo "$candidate"
+                    break
+                    ;;
+            esac
+        done
+}}
+
+NODE_IP=$(detect_node_ip)
+if [ -z "$NODE_IP" ]; then
+    echo "Unable to determine a non-loopback IPv4 address for node-ip." >&2
+    exit 1
+fi
+
+mkdir -p /usr/local/bin /etc/rancher/k3s /var/lib/rancher/k3s/agent/etc/containerd /root/.kube
+cat > /usr/local/bin/k3s-init.sh <<'__HOME_LAB_K3S_INIT_EOF__'
+{k3s_init_script}
+__HOME_LAB_K3S_INIT_EOF__
+chmod +x /usr/local/bin/k3s-init.sh
+cat > /etc/k3s-env <<'EOF'
+{env_file}EOF
+mkdir -p /etc/local.d
+cat > /etc/wsl.conf <<'EOF'
+[boot]
+command="sh /usr/local/bin/k3s-init.sh"
+EOF
+cat > /etc/local.d/k3s.start <<'EOF'
+#!/bin/sh
+exec sh /usr/local/bin/k3s-init.sh
+EOF
+chmod +x /etc/local.d/k3s.start
+cat > /etc/rancher/k3s/config.yaml <<EOF
+write-kubeconfig-mode: "0644"
+node-ip: $NODE_IP
+https-listen-port: {api_port}
+service-node-port-range: {api_port}-{range_end}
+EOF
+rm -f /var/lib/rancher/k3s/agent/etc/containerd/config-v3.toml.tmpl
+rm -f /var/lib/rancher/k3s/agent/etc/containerd/config.toml.tmpl
+rm -rf /var/lib/rancher/k3s/agent/etc/containerd/config-v3.toml.d
+rm -rf /var/lib/rancher/k3s/agent/etc/containerd/config.toml.d
+rm -f /var/lib/rancher/k3s/data/.lock || true
+rm -rf /run/k3s-init.lock || true
+find /var/lib/rancher/k3s/agent -maxdepth 1 -type f \( -name '*.crt' -o -name '*.key' -o -name '*.kubeconfig' \) -delete 2>/dev/null || true
+pkill k3s || true
+rm -f /etc/rancher/k3s/k3s.yaml /root/.kube/config || true
+"#
+    );
+
+    let (stdout, stderr) =
+        run_wsl_shell_script_via_stdin(instance, &script, "reparation du runtime k3s")?;
+
+    info!(
+        target: "wsl",
+        instance = %instance,
+        stdout = %escape_for_log(stdout.trim()),
+        stderr = %escape_for_log(stderr.trim()),
+        "Reparation runtime k3s terminee"
+    );
+    log_wsl_event(format!(
+        "Reparation runtime k3s pour {} terminee: stdout={} stderr={}",
+        escape_for_log(instance),
+        escape_for_log(stdout.trim()),
+        escape_for_log(stderr.trim())
+    ));
+    Ok(())
+}
+
 fn bootstrap_k3s_for_instance_if_available(instance: &str) -> Result<()> {
     let script = format!(
-        "set -eu; if [ ! -x /usr/local/bin/k3s-init.sh ]; then exit 0; fi; BOOTSTRAP_ONLY=1 BOOTSTRAP_TIMEOUT={} /usr/local/bin/k3s-init.sh",
+        "set -eu; if [ ! -x /usr/local/bin/k3s-init.sh ]; then exit 0; fi; BOOTSTRAP_ONLY=1 BOOTSTRAP_TIMEOUT={} sh /usr/local/bin/k3s-init.sh",
         K3S_BOOTSTRAP_TIMEOUT_SECONDS
     );
     let command_line = format_cli_command("wsl.exe", &["-d", instance, "--", "sh", "-lc", &script]);
@@ -1267,12 +1524,10 @@ fn bootstrap_k3s_for_instance_if_available(instance: &str) -> Result<()> {
     Ok(())
 }
 
-async fn enforce_instance_api_port_range(instance: &str, api_port: u16) -> Result<()> {
+async fn enforce_instance_api_port_range(instance: &str, _api_port: u16) -> Result<()> {
     let instance_owned = instance.to_string();
-    let range_end = api_port.saturating_add(DEFAULT_K3S_NODEPORT_SPAN);
-    let script = format!(
-        "set -eu; cat > /etc/k3s-env <<'EOF'\nWSL_ROLE=server\nPORT_RANGE={api_port}-{range_end}\nEOF"
-    );
+    let env_file = render_k3s_env_file_for_instance(instance)?;
+    let script = format!("set -eu; cat > /etc/k3s-env <<'EOF'\n{env_file}EOF");
     let command_line = format_cli_command("wsl.exe", &["-d", instance, "--", "sh", "-c", &script]);
 
     let output = tauri::async_runtime::spawn_blocking(move || {
@@ -1353,6 +1608,12 @@ fn read_instance_kubectl_config_view(instance: &str) -> Result<KubectlConfigView
         }
     };
 
+    repair_k3s_runtime_for_instance(instance).with_context(|| {
+        format!(
+            "Reparation k3s impossible pour {} avant tentative de bootstrap",
+            instance
+        )
+    })?;
     bootstrap_k3s_for_instance_if_available(instance)?;
 
     for attempt in 1..=KUBECTL_CONFIG_VIEW_RETRY_ATTEMPTS_AFTER_BOOTSTRAP {
@@ -3935,41 +4196,7 @@ async fn resolve_kube_api_port_for_instance(instance: &str, trace_id: &str) -> u
             .find_map(|line| line.parse::<u16>().ok())
     });
 
-    let mut candidates = Vec::new();
-    if let Some(port) = detected {
-        candidates.push(port);
-    }
-    candidates.push(expected_port);
-    candidates.push(6443);
-    candidates.push(6444);
-    candidates.sort_unstable();
-    candidates.dedup();
-
-    let mut reachable_port = None;
-    let mut resolved_ip: Option<String> = None;
-    for candidate in &candidates {
-        if tcp_connect_once("127.0.0.1", *candidate, Duration::from_millis(350))
-            .await
-            .is_ok()
-        {
-            reachable_port = Some(*candidate);
-            break;
-        }
-        if resolved_ip.is_none() {
-            resolved_ip = resolve_wsl_instance_ipv4(instance).await.ok();
-        }
-        if let Some(ip) = resolved_ip.as_deref() {
-            if tcp_connect_once(ip, *candidate, Duration::from_millis(350))
-                .await
-                .is_ok()
-            {
-                reachable_port = Some(*candidate);
-                break;
-            }
-        }
-    }
-
-    let api_port = reachable_port.or(detected).unwrap_or(expected_port);
+    let api_port = detected.unwrap_or(expected_port);
     if api_port != expected_port {
         warn!(
             target: "wsl",
@@ -3977,7 +4204,7 @@ async fn resolve_kube_api_port_for_instance(instance: &str, trace_id: &str) -> u
             instance = %instance,
             expected_api_port = expected_port,
             detected_api_port = api_port,
-            "Port API Kubernetes detecte differe du port attendu; utilisation du port detecte"
+            "Port API Kubernetes detecte differe du port attendu; utilisation du port detecte depuis les fichiers d'instance"
         );
         log_wsl_event(format!(
             "[{trace_id}] Port API Kubernetes detecte pour {}: {} (attendu={})",
@@ -3986,14 +4213,13 @@ async fn resolve_kube_api_port_for_instance(instance: &str, trace_id: &str) -> u
             expected_port
         ));
     }
-    if reachable_port.is_none() {
+    if detected.is_none() {
         warn!(
             target: "wsl",
             trace_id = %trace_id,
             instance = %instance,
             selected_api_port = api_port,
-            candidates = %candidates.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(","),
-            "Aucun port API Kubernetes joignable pendant la detection; utilisation d'un fallback"
+            "Port API Kubernetes introuvable dans les fichiers d'instance; utilisation du port attendu"
         );
     }
     api_port
@@ -4010,6 +4236,25 @@ async fn resolve_kube_api_endpoint_for_instance(
     trace_id: &str,
 ) -> Result<KubeApiEndpoint> {
     let api_port = resolve_kube_api_port_for_instance(instance, trace_id).await;
+    let wsl_ip = resolve_wsl_instance_ipv4(instance).await?;
+    if tcp_connect_once(&wsl_ip, api_port, Duration::from_millis(700))
+        .await
+        .is_ok()
+    {
+        info!(
+            target: "wsl",
+            trace_id = %trace_id,
+            instance = %instance,
+            api_host = %wsl_ip,
+            api_port = api_port,
+            "Endpoint API Kubernetes retenu (IP WSL)"
+        );
+        return Ok(KubeApiEndpoint {
+            host: wsl_ip,
+            port: api_port,
+        });
+    }
+
     if tcp_connect_once("127.0.0.1", api_port, Duration::from_millis(700))
         .await
         .is_ok()
@@ -4022,20 +4267,24 @@ async fn resolve_kube_api_endpoint_for_instance(
             api_port = api_port,
             "Endpoint API Kubernetes retenu (forward localhost)"
         );
+        log_wsl_event(format!(
+            "[{trace_id}] Endpoint API Kubernetes pour {}: 127.0.0.1:{}",
+            escape_for_log(instance),
+            api_port
+        ));
         return Ok(KubeApiEndpoint {
             host: "127.0.0.1".to_string(),
             port: api_port,
         });
     }
 
-    let wsl_ip = resolve_wsl_instance_ipv4(instance).await?;
     info!(
         target: "wsl",
         trace_id = %trace_id,
         instance = %instance,
         api_host = %wsl_ip,
         api_port = api_port,
-        "Endpoint API Kubernetes retenu (IP WSL)"
+        "Endpoint API Kubernetes retenu (IP WSL, en attente d'ouverture du port)"
     );
     log_wsl_event(format!(
         "[{trace_id}] Endpoint API Kubernetes pour {}: {}:{}",
