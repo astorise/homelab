@@ -4352,11 +4352,22 @@ async fn wait_for_kube_api_port(
     instance: &str,
     endpoint: &KubeApiEndpoint,
     trace_id: &str,
-) -> Result<()> {
+) -> Result<KubeApiEndpoint> {
     let started_at = Instant::now();
     let timeout = Duration::from_secs(KUBE_API_READY_TIMEOUT_SECONDS);
     let mut attempt: u32 = 0;
     let mut last_error = String::new();
+    let mut candidate_hosts = vec![endpoint.host.clone()];
+    let fallback_host = if is_loopback_host(&endpoint.host) {
+        resolve_wsl_instance_ipv4(instance).await.ok()
+    } else {
+        Some("127.0.0.1".to_string())
+    };
+    if let Some(host) = fallback_host {
+        if !candidate_hosts.iter().any(|candidate| candidate == &host) {
+            candidate_hosts.push(host);
+        }
+    }
 
     loop {
         if started_at.elapsed() >= timeout {
@@ -4375,21 +4386,26 @@ async fn wait_for_kube_api_port(
         }
 
         attempt += 1;
-        match tcp_connect_once(&endpoint.host, endpoint.port, Duration::from_millis(900)).await {
-            Ok(()) => {
-                info!(
-                    target: "wsl",
-                    trace_id = %trace_id,
-                    instance = %instance,
-                    api_host = %endpoint.host,
-                    api_port = endpoint.port,
-                    attempts = attempt,
-                    "Port API Kubernetes joignable"
-                );
-                return Ok(());
-            }
-            Err(err) => {
-                last_error = err.to_string();
+        for candidate_host in &candidate_hosts {
+            match tcp_connect_once(candidate_host, endpoint.port, Duration::from_millis(900)).await {
+                Ok(()) => {
+                    info!(
+                        target: "wsl",
+                        trace_id = %trace_id,
+                        instance = %instance,
+                        api_host = %candidate_host,
+                        api_port = endpoint.port,
+                        attempts = attempt,
+                        "Port API Kubernetes joignable"
+                    );
+                    return Ok(KubeApiEndpoint {
+                        host: candidate_host.clone(),
+                        port: endpoint.port,
+                    });
+                }
+                Err(err) => {
+                    last_error = format!("{candidate_host}: {err}");
+                }
             }
         }
 
@@ -5878,7 +5894,7 @@ async fn run_wsl_kubectl_exec(instance: &str, args: &[String]) -> Result<WslKube
         async {
             ensure_wsl_instance_running(instance, &trace_id).await?;
             let endpoint = resolve_kube_api_endpoint_for_instance(instance, &trace_id).await?;
-            wait_for_kube_api_port(instance, &endpoint, &trace_id).await?;
+            let endpoint = wait_for_kube_api_port(instance, &endpoint, &trace_id).await?;
             Ok::<KubeApiEndpoint, anyhow::Error>(endpoint)
         },
     )
@@ -6151,7 +6167,7 @@ async fn run_wsl_kubectl_apply_yaml(
         async {
             ensure_wsl_instance_running(instance, &trace_id).await?;
             let endpoint = resolve_kube_api_endpoint_for_instance(instance, &trace_id).await?;
-            wait_for_kube_api_port(instance, &endpoint, &trace_id).await?;
+            let endpoint = wait_for_kube_api_port(instance, &endpoint, &trace_id).await?;
             Ok::<KubeApiEndpoint, anyhow::Error>(endpoint)
         },
     )
