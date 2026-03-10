@@ -4185,6 +4185,21 @@ async fn ensure_home_lab_k3s_runtime_started(
 if [ ! -x /usr/local/bin/k3s-init.sh ]; then
     exit 0
 fi
+if [ -f /run/k3s-init.lock/pid ]; then
+    lock_pid=$(cat /run/k3s-init.lock/pid 2>/dev/null || true)
+    lock_cmdline=''
+    if [ -n "$lock_pid" ] && [ -r "/proc/$lock_pid/cmdline" ]; then
+        lock_cmdline=$(tr '\000' ' ' < "/proc/$lock_pid/cmdline" 2>/dev/null || true)
+    fi
+    case "$lock_cmdline" in
+        "sh /usr/local/bin/k3s-init.sh"*|"/bin/sh /usr/local/bin/k3s-init.sh"*)
+            ;;
+        *)
+            rm -rf /run/k3s-init.lock || true
+            printf '%s\n' 'stale-k3s-init-lock-cleared'
+            ;;
+    esac
+fi
 if pgrep -f '^/usr/local/bin/k3s server( |$)' >/dev/null 2>&1; then
     printf '%s\n' 'k3s-server-present'
     exit 0
