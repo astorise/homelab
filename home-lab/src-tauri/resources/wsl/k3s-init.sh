@@ -53,6 +53,23 @@ cleanup_lock() {
     fi
 }
 
+lock_pid_is_k3s_init() {
+    candidate_pid="$1"
+    if [ -z "$candidate_pid" ] || [ ! -r "/proc/$candidate_pid/cmdline" ]; then
+        return 1
+    fi
+
+    candidate_cmdline=$(tr '\000' ' ' < "/proc/$candidate_pid/cmdline" 2>/dev/null || true)
+    case "$candidate_cmdline" in
+        "sh /usr/local/bin/k3s-init.sh"*|"/bin/sh /usr/local/bin/k3s-init.sh"*)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
 acquire_lock_or_exit() {
     if mkdir "$K3S_LOCK_DIR" 2>/dev/null; then
         LOCK_HELD=1
@@ -63,7 +80,7 @@ acquire_lock_or_exit() {
 
     if [ -f "$K3S_LOCK_DIR/pid" ]; then
         lock_pid=$(cat "$K3S_LOCK_DIR/pid" 2>/dev/null || true)
-        if [ -n "$lock_pid" ] && kill -0 "$lock_pid" 2>/dev/null; then
+        if [ -n "$lock_pid" ] && kill -0 "$lock_pid" 2>/dev/null && lock_pid_is_k3s_init "$lock_pid"; then
             log_info "Another k3s-init instance is already running (pid=$lock_pid), exiting."
             exit 0
         fi

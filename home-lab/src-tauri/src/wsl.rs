@@ -4106,6 +4106,66 @@ async fn ensure_wsl_instance_running(instance: &str, trace_id: &str) -> Result<(
     Ok(())
 }
 
+async fn sync_home_lab_k3s_runtime_files(instance: &str, trace_id: &str) -> Result<()> {
+    if !is_home_lab_wsl_instance(instance) {
+        return Ok(());
+    }
+
+    let k3s_init_script = K3S_INIT_SCRIPT_RESOURCE
+        .replace("\r\n", "\n")
+        .replace('\r', "\n");
+    let env_file = render_k3s_env_file_for_instance(instance)?;
+    let script = format!(
+        r#"set -eu
+mkdir -p /usr/local/bin /etc/local.d
+cat > /usr/local/bin/k3s-init.sh <<'__HOME_LAB_K3S_INIT_EOF__'
+{k3s_init_script}
+__HOME_LAB_K3S_INIT_EOF__
+chmod +x /usr/local/bin/k3s-init.sh
+cat > /etc/k3s-env <<'EOF'
+{env_file}EOF
+cat > /etc/wsl.conf <<'EOF'
+[boot]
+command="sh /usr/local/bin/k3s-init.sh"
+EOF
+cat > /etc/local.d/k3s.start <<'EOF'
+#!/bin/sh
+exec sh /usr/local/bin/k3s-init.sh
+EOF
+chmod +x /etc/local.d/k3s.start
+"#
+    );
+
+    let instance_owned = instance.to_string();
+    let script_owned = script.clone();
+    let (stdout, stderr) = tauri::async_runtime::spawn_blocking(move || {
+        run_wsl_shell_script_via_stdin(
+            &instance_owned,
+            &script_owned,
+            "synchronisation des scripts k3s",
+        )
+    })
+    .await
+    .map_err(|e| anyhow!("Erreur JoinHandle lors de la synchronisation k3s-init: {e}"))??;
+
+    info!(
+        target: "wsl",
+        trace_id = %trace_id,
+        instance = %instance,
+        stdout = %escape_for_log(stdout.trim()),
+        stderr = %escape_for_log(stderr.trim()),
+        "Scripts k3s synchronises dans l'instance WSL"
+    );
+    log_wsl_event(format!(
+        "[{trace_id}] Synchronisation scripts k3s pour {}: stdout={} stderr={}",
+        escape_for_log(instance),
+        escape_for_log(stdout.trim()),
+        escape_for_log(stderr.trim())
+    ));
+
+    Ok(())
+}
+
 async fn ensure_home_lab_k3s_runtime_started(
     instance: &str,
     trace_id: &str,
@@ -4115,6 +4175,8 @@ async fn ensure_home_lab_k3s_runtime_started(
         return Ok(());
     }
 
+    sync_home_lab_k3s_runtime_files(instance, trace_id).await?;
+
     let api_port = resolve_kube_api_port_for_instance(instance, trace_id).await;
     let instance_owned = instance.to_string();
     let repair_flag = if allow_stale_repair { "1" } else { "0" };
@@ -4123,18 +4185,19 @@ async fn ensure_home_lab_k3s_runtime_started(
 if [ ! -x /usr/local/bin/k3s-init.sh ]; then
     exit 0
 fi
-if pgrep -f '/usr/local/bin/k3s server' >/dev/null 2>&1; then
+if pgrep -f '^/usr/local/bin/k3s server( |$)' >/dev/null 2>&1; then
     printf '%s\n' 'k3s-server-present'
     exit 0
 fi
-if pgrep -f 'sh /usr/local/bin/k3s-init.sh' >/dev/null 2>&1; then
+if pgrep -f '^sh /usr/local/bin/k3s-init.sh( |$)' >/dev/null 2>&1 || pgrep -f '^/bin/sh /usr/local/bin/k3s-init.sh( |$)' >/dev/null 2>&1; then
     if [ "{repair_flag}" != "1" ]; then
         printf '%s\n' 'k3s-init-present'
         exit 0
     fi
     printf '%s\n' 'restart-stale-k3s-init'
-    pkill -f 'sh /usr/local/bin/k3s-init.sh' >/dev/null 2>&1 || true
-    pkill -f '/usr/local/bin/k3s server' >/dev/null 2>&1 || true
+    pkill -f '^sh /usr/local/bin/k3s-init.sh( |$)' >/dev/null 2>&1 || true
+    pkill -f '^/bin/sh /usr/local/bin/k3s-init.sh( |$)' >/dev/null 2>&1 || true
+    pkill -f '^/usr/local/bin/k3s server( |$)' >/dev/null 2>&1 || true
     rm -rf /run/k3s-init.lock || true
     sleep 1
 fi
