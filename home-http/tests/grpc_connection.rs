@@ -1,6 +1,7 @@
 #![cfg(test)]
 
 use anyhow::Result;
+use hyper_util::rt::TokioIo;
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -65,12 +66,14 @@ impl AsyncWrite for SendablePipeClient {
 }
 
 #[tokio::test]
+#[ignore = "requires a running home-http service on the named pipe"]
 async fn test_grpc_connection() -> Result<()> {
     let channel = Endpoint::try_from("http://[::]:50051")?
         .connect_with_connector(service_fn(|_uri| async {
             ClientOptions::new()
                 .open(PIPE_DEV)
                 .map(SendablePipeClient::new)
+                .map(TokioIo::new)
         }))
         .await?;
 

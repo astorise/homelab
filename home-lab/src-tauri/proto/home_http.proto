@@ -27,6 +27,41 @@ message ListRoutesResponse {
   repeated Route routes = 1;
 }
 
+enum TcpListenScope {
+  TCP_LISTEN_SCOPE_LOOPBACK = 0;
+  TCP_LISTEN_SCOPE_ANY = 1;
+}
+
+enum TcpTargetKind {
+  TCP_TARGET_KIND_WSL = 0;
+  TCP_TARGET_KIND_ADDRESS = 1;
+}
+
+message AddTcpRouteRequest {
+  string name = 1;
+  uint32 listen_port = 2;
+  uint32 target_port = 3;
+  TcpListenScope listen_scope = 4;
+  TcpTargetKind target_kind = 5;
+  string target_host = 6;
+}
+
+message RemoveTcpRouteRequest {
+  string name = 1;
+}
+
+message ListTcpRoutesResponse {
+  message Route {
+    string name = 1;
+    uint32 listen_port = 2;
+    uint32 target_port = 3;
+    TcpListenScope listen_scope = 4;
+    TcpTargetKind target_kind = 5;
+    string target_host = 6;
+  }
+  repeated Route routes = 1;
+}
+
 service HomeHttp {
   rpc StopService(Empty) returns (Acknowledge);
   rpc ReloadConfig(Empty) returns (Acknowledge);
@@ -34,4 +69,7 @@ service HomeHttp {
   rpc AddRoute(AddRouteRequest) returns (Acknowledge);
   rpc RemoveRoute(RemoveRouteRequest) returns (Acknowledge);
   rpc ListRoutes(Empty) returns (ListRoutesResponse);
+  rpc AddTcpRoute(AddTcpRouteRequest) returns (Acknowledge);
+  rpc RemoveTcpRoute(RemoveTcpRouteRequest) returns (Acknowledge);
+  rpc ListTcpRoutes(Empty) returns (ListTcpRoutesResponse);
 }

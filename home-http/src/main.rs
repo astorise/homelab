@@ -40,6 +40,7 @@ use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tonic::transport::{server::Connected, Server};
 use windows_service::service::*;
@@ -110,15 +111,16 @@ mod proto {
 
 use proto::homehttp::v1::home_http_server::{HomeHttp, HomeHttpServer};
 use proto::homehttp::v1::{
-    list_routes_response, Acknowledge, AddRouteRequest, Empty, ListRoutesResponse,
-    RemoveRouteRequest, StatusResponse,
+    list_routes_response, list_tcp_routes_response, Acknowledge, AddRouteRequest,
+    AddTcpRouteRequest, Empty, ListRoutesResponse, ListTcpRoutesResponse, RemoveRouteRequest,
+    RemoveTcpRouteRequest, StatusResponse, TcpListenScope, TcpTargetKind,
 };
 
 // Harmonized naming with DNS service
 const SERVICE_NAME: &str = "HomeHttpService";
 const SERVICE_DISPLAY_NAME: &str = "Home HTTP Service";
 const SERVICE_DESCRIPTION: &str =
-    r"HTTP + TLS SNI pass-through to WSL with Windows RPC IPC on ncalrpc endpoint home-http";
+    r"HTTP, TLS SNI and TCP L4 proxy to WSL/Windows targets with Windows RPC IPC on endpoint home-http";
 #[cfg(debug_assertions)]
 const NAMED_PIPE_NAME: &str = r"\\.\pipe\home-http-dev";
 #[cfg(not(debug_assertions))]
@@ -182,7 +184,101 @@ struct HttpConfig {
     #[serde(default)]
     routes: HashMap<String, u16>, // host -> port (u16)
     #[serde(default)]
+    tcp_routes: Vec<TcpRouteConfig>,
+    #[serde(default)]
     log_level: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+enum TcpListenScopeConfig {
+    #[default]
+    Loopback,
+    Any,
+}
+
+impl TcpListenScopeConfig {
+    fn bind_ip(self) -> IpAddr {
+        match self {
+            Self::Loopback => IpAddr::V4(Ipv4Addr::LOCALHOST),
+            Self::Any => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        }
+    }
+
+    fn to_proto(self) -> i32 {
+        match self {
+            Self::Loopback => TcpListenScope::Loopback as i32,
+            Self::Any => TcpListenScope::Any as i32,
+        }
+    }
+
+    fn from_proto(value: i32) -> Result<Self> {
+        match TcpListenScope::try_from(value).unwrap_or(TcpListenScope::Loopback) {
+            TcpListenScope::Loopback => Ok(Self::Loopback),
+            TcpListenScope::Any => Ok(Self::Any),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+enum TcpTargetKindConfig {
+    #[default]
+    Wsl,
+    Address,
+}
+
+impl TcpTargetKindConfig {
+    fn to_proto(self) -> i32 {
+        match self {
+            Self::Wsl => TcpTargetKind::Wsl as i32,
+            Self::Address => TcpTargetKind::Address as i32,
+        }
+    }
+
+    fn from_proto(value: i32) -> Result<Self> {
+        match TcpTargetKind::try_from(value).unwrap_or(TcpTargetKind::Wsl) {
+            TcpTargetKind::Wsl => Ok(Self::Wsl),
+            TcpTargetKind::Address => Ok(Self::Address),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+struct TcpRouteConfig {
+    name: String,
+    listen_port: u16,
+    target_port: u16,
+    #[serde(default)]
+    listen_scope: TcpListenScopeConfig,
+    #[serde(default)]
+    target_kind: TcpTargetKindConfig,
+    #[serde(default)]
+    target_host: Option<String>,
+}
+
+impl TcpRouteConfig {
+    fn key(&self) -> String {
+        format!("{}:{}", self.listen_scope.bind_ip(), self.listen_port)
+    }
+
+    fn bind_addr(&self) -> SocketAddr {
+        SocketAddr::new(self.listen_scope.bind_ip(), self.listen_port)
+    }
+
+    fn resolve_target_host(&self, shared: &Shared) -> String {
+        match self.target_kind {
+            TcpTargetKindConfig::Wsl => {
+                let cfg = shared.cfg.lock().clone();
+                wsl_ip(&cfg, &shared.cache)
+            }
+            TcpTargetKindConfig::Address => self
+                .target_host
+                .clone()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| Ipv4Addr::LOCALHOST.to_string()),
+        }
+    }
 }
 fn default_http_port() -> u16 {
     80
@@ -258,6 +354,7 @@ fn load_config_or_init() -> Result<HttpConfig> {
             wsl_ip: None,
             wsl_refresh_secs: 30,
             routes: HashMap::new(),
+            tcp_routes: Vec::new(),
             log_level: Some(default_level_str().into()),
         };
         save_config(&cfg)?;
@@ -333,12 +430,193 @@ fn wsl_ip(cfg: &HttpConfig, cache: &Arc<Mutex<(u64, Option<String>)>>) -> String
     }
 }
 
+fn normalize_tcp_route_name(name: &str) -> Result<String> {
+    let normalized = name.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        anyhow::bail!("tcp route name is required");
+    }
+    if normalized
+        .chars()
+        .any(|ch| !(ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.')))
+    {
+        anyhow::bail!("tcp route name contains unsupported characters");
+    }
+    Ok(normalized)
+}
+
+fn tcp_route_from_request(req: AddTcpRouteRequest) -> Result<TcpRouteConfig> {
+    let listen_port = u16::try_from(req.listen_port).context("listen_port out of range")?;
+    let target_port = u16::try_from(req.target_port).context("target_port out of range")?;
+    if listen_port == 0 {
+        anyhow::bail!("listen_port must be greater than zero");
+    }
+    if target_port == 0 {
+        anyhow::bail!("target_port must be greater than zero");
+    }
+
+    let target_kind = TcpTargetKindConfig::from_proto(req.target_kind)?;
+    let target_host = match target_kind {
+        TcpTargetKindConfig::Wsl => None,
+        TcpTargetKindConfig::Address => Some(
+            req.target_host
+                .trim()
+                .to_string()
+                .chars()
+                .collect::<String>(),
+        )
+        .filter(|value| !value.is_empty()),
+    };
+
+    Ok(TcpRouteConfig {
+        name: normalize_tcp_route_name(&req.name)?,
+        listen_port,
+        target_port,
+        listen_scope: TcpListenScopeConfig::from_proto(req.listen_scope)?,
+        target_kind,
+        target_host,
+    })
+}
+
+async fn proxy_tcp_connection(
+    mut inbound: TcpStream,
+    route: TcpRouteConfig,
+    shared: Shared,
+) -> Result<()> {
+    let target_host = route.resolve_target_host(&shared);
+    let target = format!("{}:{}", target_host, route.target_port);
+    let mut outbound = TcpStream::connect((target_host.as_str(), route.target_port))
+        .await
+        .with_context(|| format!("connect tcp upstream {}", target))?;
+    inbound.set_nodelay(true)?;
+    outbound.set_nodelay(true)?;
+    let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound)
+        .await
+        .with_context(|| format!("tcp proxy copy for route {}", route.name))?;
+    Ok(())
+}
+
+async fn run_tcp_route_listener(route: TcpRouteConfig, shared: Shared) {
+    let bind_addr = route.bind_addr();
+    let listener = match TcpListener::bind(bind_addr).await {
+        Ok(listener) => listener,
+        Err(err) => {
+            error!(
+                "tcp route '{}' failed to bind on {}: {}",
+                route.name, bind_addr, err
+            );
+            return;
+        }
+    };
+
+    info!(
+        "TCP L4 listener '{}' on {} -> target_kind={:?} target_port={}",
+        route.name, bind_addr, route.target_kind, route.target_port
+    );
+
+    loop {
+        if shared.stopping.load(Ordering::SeqCst) || STOP_REQUESTED.load(Ordering::SeqCst) {
+            break;
+        }
+
+        let accepted = tokio::time::timeout(Duration::from_millis(500), listener.accept()).await;
+        let (inbound, peer) = match accepted {
+            Ok(Ok(value)) => value,
+            Ok(Err(err)) => {
+                warn!("tcp accept failed for '{}' on {}: {}", route.name, bind_addr, err);
+                continue;
+            }
+            Err(_) => continue,
+        };
+
+        let route_for_conn = route.clone();
+        let shared_for_conn = shared.clone();
+        tokio::spawn(async move {
+            if let Err(err) =
+                proxy_tcp_connection(inbound, route_for_conn.clone(), shared_for_conn).await
+            {
+                warn!(
+                    "tcp proxy error for route '{}' from {}: {:#}",
+                    route_for_conn.name, peer, err
+                );
+            }
+        });
+    }
+
+    info!("TCP L4 listener '{}' stopped on {}", route.name, bind_addr);
+}
+
+async fn sync_tcp_listeners(shared: &Shared) -> Result<()> {
+    let desired_routes = shared.cfg.lock().tcp_routes.clone();
+    let desired_by_key: HashMap<String, TcpRouteConfig> = desired_routes
+        .into_iter()
+        .map(|route| (route.key(), route))
+        .collect();
+
+    let mut listeners = shared.tcp_listeners.lock();
+    let existing_keys: Vec<String> = listeners.keys().cloned().collect();
+
+    for key in existing_keys {
+        let restart = match listeners.get(&key) {
+            Some(runtime) => runtime.handle.is_finished(),
+            None => false,
+        };
+        let keep = match (listeners.get(&key), desired_by_key.get(&key)) {
+            (Some(runtime), Some(desired)) if !restart && runtime.route == *desired => true,
+            _ => false,
+        };
+        if keep {
+            continue;
+        }
+        if let Some(runtime) = listeners.remove(&key) {
+            runtime.handle.abort();
+            info!(
+                "TCP L4 listener '{}' removed/restarted for key {}",
+                runtime.route.name, key
+            );
+        }
+    }
+
+    for (key, route) in desired_by_key {
+        if listeners.contains_key(&key) {
+            continue;
+        }
+        let route_for_task = route.clone();
+        let shared_for_task = shared.clone();
+        let handle = tokio::spawn(async move {
+            run_tcp_route_listener(route_for_task, shared_for_task).await;
+        });
+        listeners.insert(key, TcpListenerRuntime { route, handle });
+    }
+
+    Ok(())
+}
+
+async fn tcp_route_reconciler(shared: Shared) {
+    while !shared.stopping.load(Ordering::SeqCst) && !STOP_REQUESTED.load(Ordering::SeqCst) {
+        if let Err(err) = sync_tcp_listeners(&shared).await {
+            error!("tcp route reconciliation failed: {:#}", err);
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+
+    let mut listeners = shared.tcp_listeners.lock();
+    for (_, runtime) in listeners.drain() {
+        runtime.handle.abort();
+    }
+}
+
 // ---- gRPC service ----
 #[derive(Clone)]
 struct Shared {
     cfg: Arc<Mutex<HttpConfig>>,
     cache: Arc<Mutex<(u64, Option<String>)>>,
     stopping: Arc<AtomicBool>,
+    tcp_listeners: Arc<Mutex<HashMap<String, TcpListenerRuntime>>>,
+}
+
+struct TcpListenerRuntime {
+    route: TcpRouteConfig,
+    handle: JoinHandle<()>,
 }
 
 struct MyHttpService {
@@ -365,6 +643,10 @@ impl HomeHttp for MyHttpService {
         match load_config_or_init() {
             Ok(new_cfg) => {
                 *self.shared.cfg.lock() = new_cfg;
+                if let Err(err) = sync_tcp_listeners(&self.shared).await {
+                    error!("reload_config failed to sync tcp listeners: {err:#}");
+                    return Err(tonic::Status::internal(err.to_string()));
+                }
                 Ok(tonic::Response::new(Acknowledge {
                     ok: true,
                     message: "reloaded".into(),
@@ -445,6 +727,78 @@ impl HomeHttp for MyHttpService {
             })
             .collect();
         Ok(tonic::Response::new(ListRoutesResponse { routes }))
+    }
+
+    async fn add_tcp_route(
+        &self,
+        request: tonic::Request<AddTcpRouteRequest>,
+    ) -> Result<tonic::Response<Acknowledge>, tonic::Status> {
+        let route = tcp_route_from_request(request.into_inner())
+            .map_err(|err| tonic::Status::invalid_argument(err.to_string()))?;
+        let route_key = route.key();
+        let mut cfg = self.shared.cfg.lock().clone();
+        cfg.tcp_routes
+            .retain(|existing| existing.name != route.name && existing.key() != route_key);
+        cfg.tcp_routes.push(route);
+        cfg.tcp_routes
+            .sort_by(|left, right| left.listen_port.cmp(&right.listen_port));
+        if let Err(err) = save_config(&cfg) {
+            error!("add_tcp_route failed to save config: {err:#}");
+            return Err(tonic::Status::internal(err.to_string()));
+        }
+        *self.shared.cfg.lock() = cfg;
+        if let Err(err) = sync_tcp_listeners(&self.shared).await {
+            error!("add_tcp_route failed to sync listeners: {err:#}");
+            return Err(tonic::Status::internal(err.to_string()));
+        }
+        Ok(tonic::Response::new(Acknowledge {
+            ok: true,
+            message: "added".into(),
+        }))
+    }
+
+    async fn remove_tcp_route(
+        &self,
+        request: tonic::Request<RemoveTcpRouteRequest>,
+    ) -> Result<tonic::Response<Acknowledge>, tonic::Status> {
+        let req = request.into_inner();
+        let name = normalize_tcp_route_name(&req.name)
+            .map_err(|err| tonic::Status::invalid_argument(err.to_string()))?;
+        let mut cfg = self.shared.cfg.lock().clone();
+        cfg.tcp_routes.retain(|route| route.name != name);
+        if let Err(err) = save_config(&cfg) {
+            error!("remove_tcp_route failed to save config: {err:#}");
+            return Err(tonic::Status::internal(err.to_string()));
+        }
+        *self.shared.cfg.lock() = cfg;
+        if let Err(err) = sync_tcp_listeners(&self.shared).await {
+            error!("remove_tcp_route failed to sync listeners: {err:#}");
+            return Err(tonic::Status::internal(err.to_string()));
+        }
+        Ok(tonic::Response::new(Acknowledge {
+            ok: true,
+            message: "removed".into(),
+        }))
+    }
+
+    async fn list_tcp_routes(
+        &self,
+        _request: tonic::Request<Empty>,
+    ) -> Result<tonic::Response<ListTcpRoutesResponse>, tonic::Status> {
+        let cfg = self.shared.cfg.lock().clone();
+        let routes = cfg
+            .tcp_routes
+            .into_iter()
+            .map(|route| list_tcp_routes_response::Route {
+                name: route.name,
+                listen_port: route.listen_port as u32,
+                target_port: route.target_port as u32,
+                listen_scope: route.listen_scope.to_proto(),
+                target_kind: route.target_kind.to_proto(),
+                target_host: route.target_host.unwrap_or_default(),
+            })
+            .collect();
+        Ok(tonic::Response::new(ListTcpRoutesResponse { routes }))
     }
 }
 
@@ -714,10 +1068,12 @@ fn run_service() -> Result<()> {
         cfg: Arc::new(Mutex::new(cfg)),
         cache: Arc::new(Mutex::new((0, None))),
         stopping: Arc::new(AtomicBool::new(false)),
+        tcp_listeners: Arc::new(Mutex::new(HashMap::new())),
     };
 
     eprintln!("[home-http] creating tokio runtime");
     let rt = Runtime::new()?;
+    rt.block_on(sync_tcp_listeners(&shared))?;
 
     // gRPC server over named pipe
     let grpc_service = MyHttpService {
@@ -737,6 +1093,13 @@ fn run_service() -> Result<()> {
             error!("gRPC server error: {}", e);
         }
     });
+
+    {
+        let tcp_shared = shared.clone();
+        rt.spawn(async move {
+            tcp_route_reconciler(tcp_shared).await;
+        });
+    }
 
     // HTTP/HTTPS servers
     let http_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), shared.cfg.lock().http);
@@ -880,7 +1243,12 @@ fn main() -> Result<()> {
                     cfg: Arc::new(Mutex::new(cfg)),
                     cache: Arc::new(Mutex::new((0, None))),
                     stopping: Arc::new(AtomicBool::new(false)),
+                    tcp_listeners: Arc::new(Mutex::new(HashMap::new())),
                 };
+                if let Err(err) = sync_tcp_listeners(&shared).await {
+                    error!("initial tcp listener sync failed: {err:#}");
+                    return;
+                }
 
                 // gRPC server
                 let grpc_service = MyHttpService {
@@ -900,6 +1268,13 @@ fn main() -> Result<()> {
                         error!("gRPC server error: {}", e);
                     }
                 });
+
+                {
+                    let tcp_shared = shared.clone();
+                    tokio::spawn(async move {
+                        tcp_route_reconciler(tcp_shared).await;
+                    });
+                }
 
                 // HTTP/HTTPS servers
                 let http_addr =

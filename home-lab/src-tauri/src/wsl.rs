@@ -244,6 +244,8 @@ const DEFAULT_API_PORT_MAX: u16 = 60000;
 const ENV_API_PORT_BASE: &str = "HOME_LAB_WSL_K3S_API_PORT_BASE";
 const ENV_API_PORT_STEP: &str = "HOME_LAB_WSL_K3S_API_PORT_STEP";
 const ENV_API_PORT_MAX: &str = "HOME_LAB_WSL_K3S_API_PORT_MAX";
+const DEFAULT_API_PROXY_SCOPE: &str = "loopback";
+const ENV_API_PROXY_SCOPE: &str = "HOME_LAB_WSL_K3S_API_PROXY_SCOPE";
 const DEFAULT_K3S_NODEPORT_SPAN: u16 = 57;
 const DEFAULT_CONTAINERD_STREAM_PORT_BASE: u16 = 10010;
 const DEFAULT_K3S_LOCAL_PORT_BASE: u16 = 11040;
@@ -393,6 +395,19 @@ fn cluster_domains(instance: &str) -> Vec<String> {
     result
 }
 
+fn primary_cluster_domain(instance: &str) -> Option<String> {
+    cluster_domains(instance).into_iter().next()
+}
+
+fn kube_api_proxy_route_name(instance: &str) -> String {
+    let slug = cluster_domain_slug(instance);
+    if slug.is_empty() {
+        "kube-api".to_string()
+    } else {
+        format!("{slug}-kube-api")
+    }
+}
+
 fn dns_target_ipv4() -> String {
     std::env::var(ENV_DNS_TARGET)
         .ok()
@@ -429,6 +444,20 @@ fn inbound_http_port() -> u16 {
 
 fn inbound_https_port() -> u16 {
     env_or_default_u16(ENV_HTTPS_INBOUND, DEFAULT_HTTPS_INBOUND)
+}
+
+fn kube_api_proxy_scope() -> http::TcpListenScopeIn {
+    match std::env::var(ENV_API_PROXY_SCOPE)
+        .ok()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("any") | Some("host") | Some("lan") => http::TcpListenScopeIn::Any,
+        _ => match DEFAULT_API_PROXY_SCOPE {
+            "any" => http::TcpListenScopeIn::Any,
+            _ => http::TcpListenScopeIn::Loopback,
+        },
+    }
 }
 
 fn k3s_api_port_base() -> u16 {
@@ -640,28 +669,47 @@ async fn configure_cluster_networking(instance: &str) -> Result<String> {
         .map_err(|e| anyhow!("dns_add_record({host}): {e}"))?;
     }
 
+    let api_port = k3s_api_port_for_instance(instance);
+    let tcp_route_name = kube_api_proxy_route_name(instance);
+    let api_scope = kube_api_proxy_scope();
+    retry_http_rpc("add_tcp_route", || {
+        http::http_add_tcp_route(http::TcpRouteIn {
+            name: tcp_route_name.clone(),
+            listen_port: api_port as u32,
+            target_port: api_port as u32,
+            listen_scope: api_scope,
+            target_kind: http::TcpTargetKindIn::Wsl,
+            target_host: None,
+        })
+    })
+    .await
+    .map_err(|e| anyhow!("http_add_tcp_route({tcp_route_name}): {e}"))?;
+
     info!(
         target: "wsl",
         instance = %instance,
         hosts = %applied_hosts.join(","),
         http_port,
+        api_port,
         dns_ip = %dns_ip,
         ttl,
         "Configuration DNS/HTTP appliquee pour l'instance WSL"
     );
     log_wsl_event(format!(
-        "Configuration DNS/HTTP pour {}: hosts={} port={} ip={} ttl={}",
+        "Configuration DNS/HTTP/TCP pour {}: hosts={} http_port={} api_port={} ip={} ttl={}",
         escape_for_log(instance),
         escape_for_log(&applied_hosts.join(",")),
         http_port,
+        api_port,
         escape_for_log(&dns_ip),
         ttl
     ));
 
     Ok(format!(
-        "DNS/HTTP configures pour {} (port {}).",
+        "DNS/HTTP/TCP configures pour {} (http={}, api={}).",
         applied_hosts.join(", "),
-        http_port
+        http_port,
+        api_port
     ))
 }
 
@@ -1354,9 +1402,10 @@ fn render_k3s_env_file_for_instance(instance: &str) -> Result<String> {
     let (api_port, range_end) = k3s_port_range_for_instance(instance);
     let stream_port = containerd_stream_port_for_instance(instance)?;
     let local_ports = k3s_local_port_layout_for_instance(instance)?;
+    let tls_sans = cluster_domains(instance).join(",");
 
     Ok(format!(
-        "WSL_ROLE=server\nPORT_RANGE={api_port}-{range_end}\nCONTAINERD_STREAM_PORT={stream_port}\nK3S_LB_SERVER_PORT={lb_server_port}\nK3S_KUBELET_PORT={kubelet_port}\nK3S_KUBELET_HEALTHZ_PORT={kubelet_healthz_port}\nK3S_KUBE_CONTROLLER_MANAGER_SECURE_PORT={kube_controller_manager_secure_port}\nK3S_KUBE_CLOUD_CONTROLLER_MANAGER_SECURE_PORT={kube_cloud_controller_manager_secure_port}\nK3S_KUBE_SCHEDULER_SECURE_PORT={kube_scheduler_secure_port}\n",
+        "WSL_ROLE=server\nPORT_RANGE={api_port}-{range_end}\nCONTAINERD_STREAM_PORT={stream_port}\nK3S_LB_SERVER_PORT={lb_server_port}\nK3S_KUBELET_PORT={kubelet_port}\nK3S_KUBELET_HEALTHZ_PORT={kubelet_healthz_port}\nK3S_KUBE_CONTROLLER_MANAGER_SECURE_PORT={kube_controller_manager_secure_port}\nK3S_KUBE_CLOUD_CONTROLLER_MANAGER_SECURE_PORT={kube_cloud_controller_manager_secure_port}\nK3S_KUBE_SCHEDULER_SECURE_PORT={kube_scheduler_secure_port}\nK3S_TLS_SANS={tls_sans}\n",
         lb_server_port = local_ports.lb_server_port,
         kubelet_port = local_ports.kubelet_port,
         kubelet_healthz_port = local_ports.kubelet_healthz_port,
@@ -1367,12 +1416,29 @@ fn render_k3s_env_file_for_instance(instance: &str) -> Result<String> {
     ))
 }
 
-fn repair_k3s_runtime_for_instance(instance: &str) -> Result<()> {
+fn render_k3s_config_yaml_for_instance(instance: &str, node_ip_expression: &str) -> String {
     let (api_port, range_end) = k3s_port_range_for_instance(instance);
+    let mut config = format!(
+        "write-kubeconfig-mode: \"0644\"\nnode-ip: {node_ip_expression}\nhttps-listen-port: {api_port}\nservice-node-port-range: {api_port}-{range_end}\n"
+    );
+    let domains = cluster_domains(instance);
+    if !domains.is_empty() {
+        config.push_str("tls-san:\n");
+        for domain in domains {
+            config.push_str("  - ");
+            config.push_str(&domain);
+            config.push('\n');
+        }
+    }
+    config
+}
+
+fn repair_k3s_runtime_for_instance(instance: &str) -> Result<()> {
     let k3s_init_script = K3S_INIT_SCRIPT_RESOURCE
         .replace("\r\n", "\n")
         .replace('\r', "\n");
     let env_file = render_k3s_env_file_for_instance(instance)?;
+    let k3s_config_yaml = render_k3s_config_yaml_for_instance(instance, "$NODE_IP");
     let script = format!(
         r#"set -eu
 detect_node_ip() {{
@@ -1430,11 +1496,7 @@ exec sh /usr/local/bin/k3s-init.sh
 EOF
 chmod +x /etc/local.d/k3s.start
 cat > /etc/rancher/k3s/config.yaml <<EOF
-write-kubeconfig-mode: "0644"
-node-ip: $NODE_IP
-https-listen-port: {api_port}
-service-node-port-range: {api_port}-{range_end}
-EOF
+{k3s_config_yaml}EOF
 rm -f /var/lib/rancher/k3s/agent/etc/containerd/config-v3.toml.tmpl
 rm -f /var/lib/rancher/k3s/agent/etc/containerd/config.toml.tmpl
 rm -rf /var/lib/rancher/k3s/agent/etc/containerd/config-v3.toml.d
@@ -1673,17 +1735,15 @@ fn build_managed_kube_entry(instance: &str) -> Result<ManagedKubeEntry> {
     let user_name = format!("{base_name}-user");
     let context_name = base_name;
     let api_port = k3s_api_port_for_instance(instance);
+    let api_host = primary_cluster_domain(instance).unwrap_or_else(|| "127.0.0.1".to_string());
 
     let mut cluster_json = selected_cluster.cluster.clone();
     if let serde_json::Value::Object(map) = &mut cluster_json {
         map.insert(
             "server".to_string(),
-            serde_json::Value::String(format!("https://127.0.0.1:{api_port}")),
+            serde_json::Value::String(format!("https://{api_host}:{api_port}")),
         );
-        map.insert(
-            "tls-server-name".to_string(),
-            serde_json::Value::String("localhost".to_string()),
-        );
+        map.remove("tls-server-name");
     }
 
     let cluster_value = serde_yaml::to_value(&cluster_json).context("Conversion cluster YAML")?;
@@ -2713,6 +2773,47 @@ pub async fn wsl_remove_instance(name: String) -> Result<WslOperationResult, Str
         })
     })?;
 
+    for host in cluster_domains(&instance_name) {
+        if let Err(err) = retry_http_rpc("remove_route", || http::http_remove_route(host.clone())).await
+        {
+            warn!(
+                target: "wsl",
+                instance = %instance_name,
+                host = %host,
+                error = %err,
+                "Suppression de la route HTTP impossible apres suppression d'instance"
+            );
+        }
+        let dns_value = dns_target_ipv4();
+        if let Err(err) = retry_dns_rpc("remove_record", || {
+            dns::dns_remove_record(host.clone(), "A".into(), dns_value.clone())
+        })
+        .await
+        {
+            warn!(
+                target: "wsl",
+                instance = %instance_name,
+                host = %host,
+                error = %err,
+                "Suppression de l'enregistrement DNS impossible apres suppression d'instance"
+            );
+        }
+    }
+
+    let tcp_route_name = kube_api_proxy_route_name(&instance_name);
+    if let Err(err) =
+        retry_http_rpc("remove_tcp_route", || http::http_remove_tcp_route(tcp_route_name.clone()))
+            .await
+    {
+        warn!(
+            target: "wsl",
+            instance = %instance_name,
+            route = %tcp_route_name,
+            error = %err,
+            "Suppression de la route TCP API impossible apres suppression d'instance"
+        );
+    }
+
     match sync_windows_kubeconfig_task().await {
         Ok(sync) => {
             append_provision_message(&mut removal.message, &sync.message);
@@ -2877,141 +2978,6 @@ fn kubectl_error_result(
         duration_ms,
         stdout: String::new(),
         stderr: message,
-    }
-}
-
-fn build_wsl_k3s_kubectl_command_line(instance: &str, args: &[String]) -> String {
-    let mut command_args = vec![
-        "-d".to_string(),
-        instance.to_string(),
-        "--".to_string(),
-        "/usr/local/bin/k3s".to_string(),
-        "kubectl".to_string(),
-        "--kubeconfig".to_string(),
-        "/etc/rancher/k3s/k3s.yaml".to_string(),
-    ];
-    command_args.extend(args.iter().cloned());
-    let refs: Vec<&str> = command_args.iter().map(String::as_str).collect();
-    format_cli_command("wsl.exe", &refs)
-}
-
-#[derive(Debug)]
-struct WslKubectlProcessOutput {
-    command_line: String,
-    exit_code: i32,
-    stdout: String,
-    stderr: String,
-}
-
-async fn execute_wsl_k3s_kubectl_command(
-    instance: &str,
-    args: &[String],
-    stdin_bytes: Option<Vec<u8>>,
-) -> Result<WslKubectlProcessOutput> {
-    let mut command_args = vec![
-        "-d".to_string(),
-        instance.to_string(),
-        "--".to_string(),
-        "/usr/local/bin/k3s".to_string(),
-        "kubectl".to_string(),
-        "--kubeconfig".to_string(),
-        "/etc/rancher/k3s/k3s.yaml".to_string(),
-    ];
-    command_args.extend(args.iter().cloned());
-    let command_line = build_wsl_k3s_kubectl_command_line(instance, args);
-    let command_args_for_process = command_args.clone();
-    let output = tauri::async_runtime::spawn_blocking(move || {
-        let mut child = Command::new("wsl.exe")
-            .args(command_args_for_process.iter().map(String::as_str))
-            .stdin(if stdin_bytes.is_some() {
-                Stdio::piped()
-            } else {
-                Stdio::null()
-            })
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .context("Impossible de lancer kubectl dans la distro WSL")?;
-
-        if let Some(input) = stdin_bytes {
-            if let Some(mut stdin) = child.stdin.take() {
-                stdin
-                    .write_all(&input)
-                    .context("Impossible d'envoyer le manifeste YAML a kubectl dans WSL")?;
-            }
-        }
-
-        child
-            .wait_with_output()
-            .context("Impossible d'attendre la fin de kubectl dans WSL")
-    })
-    .await
-    .map_err(|e| anyhow!("Erreur JoinHandle lors de l'execution kubectl WSL: {e}"))??;
-
-    Ok(WslKubectlProcessOutput {
-        command_line,
-        exit_code: output.status.code().unwrap_or(1),
-        stdout: decode_cli_output(&output.stdout),
-        stderr: decode_cli_output(&output.stderr),
-    })
-}
-
-async fn wait_for_wsl_k3s_kubectl_ready(instance: &str, trace_id: &str) -> Result<()> {
-    let started_at = Instant::now();
-    let timeout = Duration::from_secs(KUBE_API_READY_TIMEOUT_SECONDS);
-
-    loop {
-        let probe_args = vec![
-            "--request-timeout=5s".to_string(),
-            "get".to_string(),
-            "--raw=/readyz".to_string(),
-        ];
-        let probe = execute_wsl_k3s_kubectl_command(instance, &probe_args, None).await;
-        let probe_error = match probe {
-            Ok(output) if output.exit_code == 0 => {
-                info!(
-                    target: "wsl",
-                    trace_id = %trace_id,
-                    instance = %instance,
-                    command = %output.command_line,
-                    "API Kubernetes prete via kubectl interne WSL"
-                );
-                log_wsl_event(format!(
-                    "[{trace_id}] API Kubernetes prete via kubectl interne pour {}",
-                    escape_for_log(instance)
-                ));
-                return Ok(());
-            }
-            Ok(output) => Some(if !output.stderr.trim().is_empty() {
-                    output.stderr.trim().to_string()
-                } else if !output.stdout.trim().is_empty() {
-                    output.stdout.trim().to_string()
-                } else {
-                    format!("kubectl WSL a echoue avec le code {}", output.exit_code)
-                }),
-            Err(err) => Some(err.to_string()),
-        };
-
-        if started_at.elapsed() >= timeout {
-            let mut message = if let Some(last_error) = probe_error.as_deref() {
-                format!(
-                    "API Kubernetes interne indisponible dans {} apres {}s (dernier essai: {}).",
-                    instance, KUBE_API_READY_TIMEOUT_SECONDS, last_error
-                )
-            } else {
-                format!(
-                    "API Kubernetes interne indisponible dans {} apres {}s.",
-                    instance, KUBE_API_READY_TIMEOUT_SECONDS
-                )
-            };
-            if let Some(hint) = collect_k3s_runtime_failure_hint(instance).await {
-                message.push_str(" Diagnostic runtime: ");
-                message.push_str(&hint);
-            }
-            return Err(anyhow!(message));
-        }
-
-        sleep(Duration::from_millis(KUBE_API_READY_POLL_INTERVAL_MS)).await;
     }
 }
 
@@ -4570,6 +4536,32 @@ async fn resolve_kube_api_endpoint_for_instance(
     trace_id: &str,
 ) -> Result<KubeApiEndpoint> {
     let api_port = resolve_kube_api_port_for_instance(instance, trace_id).await;
+    if let Some(domain) = primary_cluster_domain(instance) {
+        if tcp_connect_once(&domain, api_port, Duration::from_millis(700))
+            .await
+            .is_ok()
+        {
+            info!(
+                target: "wsl",
+                trace_id = %trace_id,
+                instance = %instance,
+                api_host = %domain,
+                api_port = api_port,
+                "Endpoint API Kubernetes retenu (proxy L4 + DNS)"
+            );
+            log_wsl_event(format!(
+                "[{trace_id}] Endpoint API Kubernetes pour {}: {}:{}",
+                escape_for_log(instance),
+                escape_for_log(&domain),
+                api_port
+            ));
+            return Ok(KubeApiEndpoint {
+                host: domain,
+                port: api_port,
+            });
+        }
+    }
+
     let wsl_ip = resolve_wsl_instance_ipv4(instance).await?;
     if tcp_connect_once("127.0.0.1", api_port, Duration::from_millis(700))
         .await
@@ -4612,6 +4604,27 @@ async fn resolve_kube_api_endpoint_for_instance(
         });
     }
 
+    if let Some(domain) = primary_cluster_domain(instance) {
+        info!(
+            target: "wsl",
+            trace_id = %trace_id,
+            instance = %instance,
+            api_host = %domain,
+            api_port = api_port,
+            "Endpoint API Kubernetes retenu (proxy L4 + DNS, en attente d'ouverture du port)"
+        );
+        log_wsl_event(format!(
+            "[{trace_id}] Endpoint API Kubernetes pour {}: {}:{}",
+            escape_for_log(instance),
+            escape_for_log(&domain),
+            api_port
+        ));
+        return Ok(KubeApiEndpoint {
+            host: domain,
+            port: api_port,
+        });
+    }
+
     info!(
         target: "wsl",
         trace_id = %trace_id,
@@ -4641,12 +4654,15 @@ async fn wait_for_kube_api_port(
     let mut attempt: u32 = 0;
     let mut last_error = String::new();
     let mut candidate_hosts = vec![endpoint.host.clone()];
-    let fallback_host = if is_loopback_host(&endpoint.host) {
-        resolve_wsl_instance_ipv4(instance).await.ok()
+    let fallback_hosts = if is_loopback_host(&endpoint.host) {
+        vec![resolve_wsl_instance_ipv4(instance).await.ok()]
     } else {
-        Some("127.0.0.1".to_string())
+        vec![
+            Some("127.0.0.1".to_string()),
+            resolve_wsl_instance_ipv4(instance).await.ok(),
+        ]
     };
-    if let Some(host) = fallback_host {
+    for host in fallback_hosts.into_iter().flatten() {
         if !candidate_hosts.iter().any(|candidate| candidate == &host) {
             candidate_hosts.push(host);
         }
@@ -4745,10 +4761,10 @@ fn apply_kube_api_endpoint_override(
         .unwrap_or_else(|| "https".to_string());
 
     cluster.server = Some(format!("{base_server}://{api_host}:{api_port}"));
-    if is_loopback_host(api_host) {
+    if is_loopback_host(api_host) || api_host.parse::<Ipv4Addr>().is_ok() {
         cluster.tls_server_name = None;
     } else {
-        cluster.tls_server_name = Some("localhost".to_string());
+        cluster.tls_server_name = Some(api_host.to_string());
     }
     cluster.proxy_url = None;
     Ok(())
@@ -6100,484 +6116,6 @@ async fn execute_kubectl_command(
     }
 }
 
-async fn run_home_lab_wsl_kubectl_exec(
-    instance: &str,
-    args: &[String],
-    trace_id: &str,
-    command_line: &str,
-    instance_log: &str,
-    started_at: &Instant,
-) -> Result<WslKubectlExecResult> {
-    info!(
-        target: "wsl",
-        trace_id = %trace_id,
-        instance = %instance,
-        command = %command_line,
-        "Execution kubectl via kubectl interne WSL"
-    );
-    log_wsl_event(format!(
-        "[{trace_id}] Execution kubectl pour {} via kubectl WSL: {}",
-        instance_log, command_line
-    ));
-
-    let prepare_outcome = tokio::time::timeout(
-        Duration::from_secs(KUBECTL_PREPARE_TIMEOUT_SECONDS),
-        async {
-            ensure_wsl_instance_running(instance, trace_id).await?;
-            wait_for_wsl_k3s_kubectl_ready(instance, trace_id).await?;
-            Ok::<(), anyhow::Error>(())
-        },
-    )
-    .await;
-
-    match prepare_outcome {
-        Ok(Ok(())) => {}
-        Ok(Err(err)) => {
-            let message = err.to_string();
-            warn!(
-                target: "wsl",
-                trace_id = %trace_id,
-                instance = %instance,
-                command = %command_line,
-                error = %message,
-                "Preparation Kubernetes en echec via kubectl WSL"
-            );
-            log_wsl_event(format!(
-                "[{trace_id}] Preparation Kubernetes en echec pour {} via kubectl WSL: {}",
-                instance_log,
-                escape_for_log(&message)
-            ));
-            return Ok(kubectl_error_result(
-                instance,
-                command_line,
-                trace_id,
-                elapsed_ms(started_at),
-                message,
-            ));
-        }
-        Err(_) => {
-            let message = format!(
-                "Timeout apres {}s lors de la preparation Kubernetes dans WSL. \
-Verifie que k3s peut demarrer dans '{}'.",
-                KUBECTL_PREPARE_TIMEOUT_SECONDS, instance
-            );
-            warn!(
-                target: "wsl",
-                trace_id = %trace_id,
-                instance = %instance,
-                command = %command_line,
-                timeout_seconds = KUBECTL_PREPARE_TIMEOUT_SECONDS,
-                "Preparation Kubernetes en timeout via kubectl WSL"
-            );
-            log_wsl_event(format!(
-                "[{trace_id}] Preparation Kubernetes en timeout pour {} via kubectl WSL: timeout={}s",
-                instance_log, KUBECTL_PREPARE_TIMEOUT_SECONDS
-            ));
-            return Ok(kubectl_error_result(
-                instance,
-                command_line,
-                trace_id,
-                elapsed_ms(started_at),
-                message,
-            ));
-        }
-    }
-
-    let instance_for_task = instance.to_string();
-    let args_for_task = args.to_vec();
-    let mut operation = tauri::async_runtime::spawn(async move {
-        execute_wsl_k3s_kubectl_command(&instance_for_task, &args_for_task, None).await
-    });
-
-    let outcome = tokio::time::timeout(
-        Duration::from_secs(KUBECTL_EXEC_TIMEOUT_SECONDS),
-        &mut operation,
-    )
-    .await;
-
-    match outcome {
-        Ok(Ok(Ok(output))) => {
-            let duration_ms = elapsed_ms(started_at);
-            if output.exit_code == 0 {
-                let stdout_log = escape_for_log(output.stdout.trim());
-                info!(
-                    target: "wsl",
-                    trace_id = %trace_id,
-                    instance = %instance,
-                    command_actual = %output.command_line,
-                    duration_ms = duration_ms,
-                    stdout = %stdout_log,
-                    "Commande kubectl terminee via kubectl interne WSL"
-                );
-                log_wsl_event(format!(
-                    "[{trace_id}] Commande kubectl terminee pour {} via kubectl WSL: status=0 duration_ms={} stdout={}",
-                    instance_log,
-                    duration_ms,
-                    stdout_log
-                ));
-                Ok(WslKubectlExecResult {
-                    ok: true,
-                    instance: instance.to_string(),
-                    exit_code: Some(0),
-                    command: command_line.to_string(),
-                    trace_id: trace_id.to_string(),
-                    duration_ms,
-                    stdout: output.stdout,
-                    stderr: String::new(),
-                })
-            } else {
-                let message = if !output.stderr.trim().is_empty() {
-                    output.stderr.trim().to_string()
-                } else if !output.stdout.trim().is_empty() {
-                    output.stdout.trim().to_string()
-                } else {
-                    format!("kubectl WSL a echoue avec le code {}", output.exit_code)
-                };
-                warn!(
-                    target: "wsl",
-                    trace_id = %trace_id,
-                    instance = %instance,
-                    command_actual = %output.command_line,
-                    error = %message,
-                    exit_code = output.exit_code,
-                    "Commande kubectl en echec via kubectl interne WSL"
-                );
-                log_wsl_event(format!(
-                    "[{trace_id}] Commande kubectl en echec pour {} via kubectl WSL: status={} stderr={}",
-                    instance_log,
-                    output.exit_code,
-                    escape_for_log(&message)
-                ));
-                Ok(kubectl_error_result(
-                    instance,
-                    command_line,
-                    trace_id,
-                    duration_ms,
-                    message,
-                ))
-            }
-        }
-        Ok(Ok(Err(err))) => {
-            let message = err.to_string();
-            warn!(
-                target: "wsl",
-                trace_id = %trace_id,
-                instance = %instance,
-                command = %command_line,
-                error = %message,
-                "Commande kubectl en echec via kubectl interne WSL"
-            );
-            log_wsl_event(format!(
-                "[{trace_id}] Commande kubectl en echec pour {} via kubectl WSL: {}",
-                instance_log,
-                escape_for_log(&message)
-            ));
-            Ok(kubectl_error_result(
-                instance,
-                command_line,
-                trace_id,
-                elapsed_ms(started_at),
-                message,
-            ))
-        }
-        Ok(Err(join_err)) => {
-            let message = format!("Execution kubectl WSL interrompue: {join_err}");
-            error!(
-                target: "wsl",
-                trace_id = %trace_id,
-                instance = %instance,
-                command = %command_line,
-                error = %message,
-                "JoinHandle kubectl WSL en echec"
-            );
-            log_wsl_event(format!(
-                "[{trace_id}] JoinHandle kubectl WSL en echec pour {}: {}",
-                instance_log,
-                escape_for_log(&message)
-            ));
-            Ok(kubectl_error_result(
-                instance,
-                command_line,
-                trace_id,
-                elapsed_ms(started_at),
-                message,
-            ))
-        }
-        Err(_) => {
-            operation.abort();
-            let message = format!(
-                "Timeout apres {}s lors de l'execution kubectl dans WSL. \
-Verifie que k3s est demarre dans '{}'.",
-                KUBECTL_EXEC_TIMEOUT_SECONDS, instance
-            );
-            warn!(
-                target: "wsl",
-                trace_id = %trace_id,
-                instance = %instance,
-                command = %command_line,
-                timeout_seconds = KUBECTL_EXEC_TIMEOUT_SECONDS,
-                "Commande kubectl en timeout via kubectl interne WSL"
-            );
-            log_wsl_event(format!(
-                "[{trace_id}] Commande kubectl en timeout pour {} via kubectl WSL: timeout={}s",
-                instance_log, KUBECTL_EXEC_TIMEOUT_SECONDS
-            ));
-            Ok(kubectl_error_result(
-                instance,
-                command_line,
-                trace_id,
-                elapsed_ms(started_at),
-                message,
-            ))
-        }
-    }
-}
-
-async fn run_home_lab_wsl_kubectl_apply_yaml(
-    instance: &str,
-    manifest_yaml: &str,
-    trace_id: &str,
-    command_line: &str,
-    instance_log: &str,
-    source_log: &str,
-    started_at: &Instant,
-) -> Result<WslKubectlExecResult> {
-    info!(
-        target: "wsl",
-        trace_id = %trace_id,
-        instance = %instance,
-        command = %command_line,
-        source = %source_log,
-        bytes = manifest_yaml.as_bytes().len(),
-        "Execution kubectl apply via kubectl interne WSL"
-    );
-    log_wsl_event(format!(
-        "[{trace_id}] Execution kubectl apply pour {} via kubectl WSL: {} (source={} bytes={})",
-        instance_log,
-        command_line,
-        escape_for_log(source_log),
-        manifest_yaml.as_bytes().len()
-    ));
-
-    let prepare_outcome = tokio::time::timeout(
-        Duration::from_secs(KUBECTL_PREPARE_TIMEOUT_SECONDS),
-        async {
-            ensure_wsl_instance_running(instance, trace_id).await?;
-            wait_for_wsl_k3s_kubectl_ready(instance, trace_id).await?;
-            Ok::<(), anyhow::Error>(())
-        },
-    )
-    .await;
-
-    match prepare_outcome {
-        Ok(Ok(())) => {}
-        Ok(Err(err)) => {
-            let message = err.to_string();
-            warn!(
-                target: "wsl",
-                trace_id = %trace_id,
-                instance = %instance,
-                command = %command_line,
-                error = %message,
-                "Preparation Kubernetes en echec pour apply via kubectl WSL"
-            );
-            log_wsl_event(format!(
-                "[{trace_id}] Preparation Kubernetes en echec pour apply sur {} via kubectl WSL: {}",
-                instance_log,
-                escape_for_log(&message)
-            ));
-            return Ok(kubectl_error_result(
-                instance,
-                command_line,
-                trace_id,
-                elapsed_ms(started_at),
-                message,
-            ));
-        }
-        Err(_) => {
-            let message = format!(
-                "Timeout apres {}s lors de la preparation Kubernetes dans WSL. \
-Verifie que k3s peut demarrer dans '{}'.",
-                KUBECTL_PREPARE_TIMEOUT_SECONDS, instance
-            );
-            warn!(
-                target: "wsl",
-                trace_id = %trace_id,
-                instance = %instance,
-                command = %command_line,
-                timeout_seconds = KUBECTL_PREPARE_TIMEOUT_SECONDS,
-                "Preparation Kubernetes en timeout pour apply via kubectl WSL"
-            );
-            log_wsl_event(format!(
-                "[{trace_id}] Preparation Kubernetes en timeout pour apply sur {} via kubectl WSL: timeout={}s",
-                instance_log, KUBECTL_PREPARE_TIMEOUT_SECONDS
-            ));
-            return Ok(kubectl_error_result(
-                instance,
-                command_line,
-                trace_id,
-                elapsed_ms(started_at),
-                message,
-            ));
-        }
-    }
-
-    let instance_for_task = instance.to_string();
-    let manifest_for_task = manifest_yaml.as_bytes().to_vec();
-    let apply_args = vec!["apply".to_string(), "-f".to_string(), "-".to_string()];
-    let mut operation = tauri::async_runtime::spawn(async move {
-        execute_wsl_k3s_kubectl_command(
-            &instance_for_task,
-            &apply_args,
-            Some(manifest_for_task),
-        )
-        .await
-    });
-
-    let outcome = tokio::time::timeout(
-        Duration::from_secs(KUBECTL_EXEC_TIMEOUT_SECONDS),
-        &mut operation,
-    )
-    .await;
-
-    match outcome {
-        Ok(Ok(Ok(output))) => {
-            let duration_ms = elapsed_ms(started_at);
-            if output.exit_code == 0 {
-                let stdout_log = escape_for_log(output.stdout.trim());
-                info!(
-                    target: "wsl",
-                    trace_id = %trace_id,
-                    instance = %instance,
-                    command_actual = %output.command_line,
-                    duration_ms = duration_ms,
-                    stdout = %stdout_log,
-                    "Kubectl apply termine via kubectl interne WSL"
-                );
-                log_wsl_event(format!(
-                    "[{trace_id}] Kubectl apply termine pour {} via kubectl WSL: status=0 duration_ms={} stdout={}",
-                    instance_log,
-                    duration_ms,
-                    stdout_log
-                ));
-                Ok(WslKubectlExecResult {
-                    ok: true,
-                    instance: instance.to_string(),
-                    exit_code: Some(0),
-                    command: command_line.to_string(),
-                    trace_id: trace_id.to_string(),
-                    duration_ms,
-                    stdout: output.stdout,
-                    stderr: String::new(),
-                })
-            } else {
-                let message = if !output.stderr.trim().is_empty() {
-                    output.stderr.trim().to_string()
-                } else if !output.stdout.trim().is_empty() {
-                    output.stdout.trim().to_string()
-                } else {
-                    format!("kubectl apply WSL a echoue avec le code {}", output.exit_code)
-                };
-                warn!(
-                    target: "wsl",
-                    trace_id = %trace_id,
-                    instance = %instance,
-                    command_actual = %output.command_line,
-                    error = %message,
-                    exit_code = output.exit_code,
-                    "Kubectl apply en echec via kubectl interne WSL"
-                );
-                log_wsl_event(format!(
-                    "[{trace_id}] Kubectl apply en echec pour {} via kubectl WSL: status={} stderr={}",
-                    instance_log,
-                    output.exit_code,
-                    escape_for_log(&message)
-                ));
-                Ok(kubectl_error_result(
-                    instance,
-                    command_line,
-                    trace_id,
-                    duration_ms,
-                    message,
-                ))
-            }
-        }
-        Ok(Ok(Err(err))) => {
-            let message = err.to_string();
-            warn!(
-                target: "wsl",
-                trace_id = %trace_id,
-                instance = %instance,
-                command = %command_line,
-                error = %message,
-                "Kubectl apply en echec via kubectl interne WSL"
-            );
-            log_wsl_event(format!(
-                "[{trace_id}] Kubectl apply en echec pour {} via kubectl WSL: {}",
-                instance_log,
-                escape_for_log(&message)
-            ));
-            Ok(kubectl_error_result(
-                instance,
-                command_line,
-                trace_id,
-                elapsed_ms(started_at),
-                message,
-            ))
-        }
-        Ok(Err(join_err)) => {
-            let message = format!("Execution kubectl apply WSL interrompue: {join_err}");
-            error!(
-                target: "wsl",
-                trace_id = %trace_id,
-                instance = %instance,
-                command = %command_line,
-                error = %message,
-                "JoinHandle kubectl apply WSL en echec"
-            );
-            log_wsl_event(format!(
-                "[{trace_id}] JoinHandle kubectl apply WSL en echec pour {}: {}",
-                instance_log,
-                escape_for_log(&message)
-            ));
-            Ok(kubectl_error_result(
-                instance,
-                command_line,
-                trace_id,
-                elapsed_ms(started_at),
-                message,
-            ))
-        }
-        Err(_) => {
-            operation.abort();
-            let message = format!(
-                "Timeout apres {}s lors de l'execution kubectl apply dans WSL. \
-Verifie que k3s est demarre dans '{}'.",
-                KUBECTL_EXEC_TIMEOUT_SECONDS, instance
-            );
-            warn!(
-                target: "wsl",
-                trace_id = %trace_id,
-                instance = %instance,
-                command = %command_line,
-                timeout_seconds = KUBECTL_EXEC_TIMEOUT_SECONDS,
-                "Kubectl apply en timeout via kubectl interne WSL"
-            );
-            log_wsl_event(format!(
-                "[{trace_id}] Kubectl apply en timeout pour {} via kubectl WSL: timeout={}s",
-                instance_log, KUBECTL_EXEC_TIMEOUT_SECONDS
-            ));
-            Ok(kubectl_error_result(
-                instance,
-                command_line,
-                trace_id,
-                elapsed_ms(started_at),
-                message,
-            ))
-        }
-    }
-}
-
 async fn run_wsl_kubectl_exec(instance: &str, args: &[String]) -> Result<WslKubectlExecResult> {
     if args.is_empty() {
         return Err(anyhow!("La commande kubectl est requise."));
@@ -6588,18 +6126,6 @@ async fn run_wsl_kubectl_exec(instance: &str, args: &[String]) -> Result<WslKube
     let context_name = kube_context_for_instance(instance);
     let command_line = build_kubectl_command_line(&context_name, args);
     let instance_log = escape_for_log(instance);
-
-    if is_home_lab_wsl_instance(instance) {
-        return run_home_lab_wsl_kubectl_exec(
-            instance,
-            args,
-            &trace_id,
-            &command_line,
-            &instance_log,
-            &started_at,
-        )
-        .await;
-    }
 
     let command = match parse_kubectl_command(args) {
         Ok(command) => command,
@@ -6896,19 +6422,6 @@ async fn run_wsl_kubectl_apply_yaml(
     let command_line = build_kubectl_apply_command_line(&context_name, source_name);
     let instance_log = escape_for_log(instance);
     let source_log = source_name.unwrap_or("<uploaded-yaml>");
-
-    if is_home_lab_wsl_instance(instance) {
-        return run_home_lab_wsl_kubectl_apply_yaml(
-            instance,
-            manifest_yaml,
-            &trace_id,
-            &command_line,
-            &instance_log,
-            source_log,
-            &started_at,
-        )
-        .await;
-    }
 
     if let Err(err) = ensure_rustls_crypto_provider(&trace_id, instance) {
         let message = err.to_string();

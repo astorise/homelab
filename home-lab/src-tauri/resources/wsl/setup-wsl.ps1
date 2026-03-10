@@ -249,6 +249,7 @@ function Configure-K3sEnv {
     $rangeEnd = [Math]::Min(65535, $ApiPort + $NodePortSpan)
     $rangeText = "$ApiPort-$rangeEnd"
     Write-Info "Configuration de /etc/k3s-env avec PORT_RANGE=$rangeText"
+    $tlsSans = "$Distro.wsl"
     $content = @"
 WSL_ROLE=server
 PORT_RANGE=$rangeText
@@ -259,6 +260,7 @@ K3S_KUBELET_HEALTHZ_PORT=$($LocalPorts.KubeletHealthzPort)
 K3S_KUBE_CONTROLLER_MANAGER_SECURE_PORT=$($LocalPorts.KubeControllerManagerSecurePort)
 K3S_KUBE_CLOUD_CONTROLLER_MANAGER_SECURE_PORT=$($LocalPorts.KubeCloudControllerManagerSecurePort)
 K3S_KUBE_SCHEDULER_SECURE_PORT=$($LocalPorts.KubeSchedulerSecurePort)
+K3S_TLS_SANS=$tlsSans
 "@.Replace("`r`n", "`n").Replace("`r", "`n")
 
     $uncPath = "\\wsl$\$Distro\etc\k3s-env"

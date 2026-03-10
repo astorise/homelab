@@ -35,6 +35,7 @@ K3S_KUBELET_HEALTHZ_PORT=${K3S_KUBELET_HEALTHZ_PORT:-}
 K3S_KUBE_CONTROLLER_MANAGER_SECURE_PORT=${K3S_KUBE_CONTROLLER_MANAGER_SECURE_PORT:-}
 K3S_KUBE_CLOUD_CONTROLLER_MANAGER_SECURE_PORT=${K3S_KUBE_CLOUD_CONTROLLER_MANAGER_SECURE_PORT:-}
 K3S_KUBE_SCHEDULER_SECURE_PORT=${K3S_KUBE_SCHEDULER_SECURE_PORT:-}
+K3S_TLS_SANS=${K3S_TLS_SANS:-}
 K3S_RUNTIME_BIN_DIR=${K3S_RUNTIME_BIN_DIR:-/var/lib/rancher/k3s/data/current/bin}
 K3S_RUNTIME_AUX_BIN_DIR=${K3S_RUNTIME_AUX_BIN_DIR:-$K3S_RUNTIME_BIN_DIR/aux}
 CONTAINERD_STREAM_PATCH_PID=
@@ -140,12 +141,27 @@ ensure_server_config() {
 
     mkdir -p /etc/rancher/k3s
     desired_config=$(mktemp)
-    cat <<EOF > "$desired_config"
+    {
+    cat <<EOF
 write-kubeconfig-mode: "0644"
 node-ip: $NODE_IP
 https-listen-port: $API_PORT
 service-node-port-range: $PORT_RANGE
 EOF
+    if [ -n "$K3S_TLS_SANS" ]; then
+        printf '%s\n' "tls-san:"
+        old_ifs=$IFS
+        IFS=','
+        set -- $K3S_TLS_SANS
+        IFS=$old_ifs
+        for san in "$@"; do
+            san_trimmed=$(printf '%s' "$san" | tr -d '[:space:]')
+            if [ -n "$san_trimmed" ]; then
+                printf '  - %s\n' "$san_trimmed"
+            fi
+        done
+    fi
+    } > "$desired_config"
 
     if [ ! -f /etc/rancher/k3s/config.yaml ] || ! cmp -s "$desired_config" /etc/rancher/k3s/config.yaml; then
         log_info "Writing /etc/rancher/k3s/config.yaml with node-ip $NODE_IP and api port $API_PORT"
