@@ -4030,7 +4030,7 @@ async fn ensure_wsl_instance_running(instance: &str, trace_id: &str) -> Result<(
         );
         if is_home_lab_wsl_instance(instance) {
             ensure_wsl_keepalive(instance, "already-running").await?;
-            ensure_home_lab_k3s_runtime_started(instance, trace_id).await?;
+            ensure_home_lab_k3s_runtime_started(instance, trace_id, true).await?;
         }
         return Ok(());
     }
@@ -4101,22 +4101,51 @@ async fn ensure_wsl_instance_running(instance: &str, trace_id: &str) -> Result<(
     ));
     if is_home_lab_wsl_instance(instance) {
         ensure_wsl_keepalive(instance, trace_id).await?;
-        ensure_home_lab_k3s_runtime_started(instance, trace_id).await?;
+        ensure_home_lab_k3s_runtime_started(instance, trace_id, false).await?;
     }
     Ok(())
 }
 
-async fn ensure_home_lab_k3s_runtime_started(instance: &str, trace_id: &str) -> Result<()> {
+async fn ensure_home_lab_k3s_runtime_started(
+    instance: &str,
+    trace_id: &str,
+    allow_stale_repair: bool,
+) -> Result<()> {
     if !is_home_lab_wsl_instance(instance) {
         return Ok(());
     }
 
+    let api_port = resolve_kube_api_port_for_instance(instance, trace_id).await;
     let instance_owned = instance.to_string();
-    let script = "set -eu; if [ ! -x /usr/local/bin/k3s-init.sh ]; then exit 0; fi; nohup sh /usr/local/bin/k3s-init.sh >/tmp/k3s-init.out 2>/tmp/k3s-init.err </dev/null &";
-    let command_line = format_cli_command("wsl.exe", &["-d", instance, "--", "sh", "-lc", script]);
+    let repair_flag = if allow_stale_repair { "1" } else { "0" };
+    let script = format!(
+        r#"set -eu
+if [ ! -x /usr/local/bin/k3s-init.sh ]; then
+    exit 0
+fi
+if pgrep -f '/usr/local/bin/k3s server' >/dev/null 2>&1; then
+    printf '%s\n' 'k3s-server-present'
+    exit 0
+fi
+if pgrep -f 'sh /usr/local/bin/k3s-init.sh' >/dev/null 2>&1; then
+    if [ "{repair_flag}" != "1" ]; then
+        printf '%s\n' 'k3s-init-present'
+        exit 0
+    fi
+    printf '%s\n' 'restart-stale-k3s-init'
+    pkill -f 'sh /usr/local/bin/k3s-init.sh' >/dev/null 2>&1 || true
+    pkill -f '/usr/local/bin/k3s server' >/dev/null 2>&1 || true
+    rm -rf /run/k3s-init.lock || true
+    sleep 1
+fi
+nohup sh /usr/local/bin/k3s-init.sh >/tmp/k3s-init.out 2>/tmp/k3s-init.err </dev/null &
+printf 'k3s-init-started port=%s repair=%s\n' '{api_port}' '{repair_flag}'
+"#
+    );
+    let command_line = format_cli_command("wsl.exe", &["-d", instance, "--", "sh", "-lc", &script]);
     let output = tauri::async_runtime::spawn_blocking(move || {
         Command::new("wsl.exe")
-            .args(["-d", &instance_owned, "--", "sh", "-lc", script])
+            .args(["-d", &instance_owned, "--", "sh", "-lc", &script])
             .output()
     })
     .await
@@ -4170,6 +4199,47 @@ async fn tcp_connect_once(
         Ok(Ok(_stream)) => Ok(()),
         Ok(Err(err)) => Err(err.to_string()),
         Err(_) => Err("timeout TCP".to_string()),
+    }
+}
+
+async fn collect_k3s_runtime_failure_hint(instance: &str) -> Option<String> {
+    let instance_owned = instance.to_string();
+    let script = r#"set -eu
+for file in /tmp/k3s-init.err /tmp/k3s-init.out /tmp/k3s-init.boot.err /tmp/k3s-init.boot.out; do
+    if [ -f "$file" ]; then
+        if grep -Ei 'error|fail|already in use|another k3s-init|unable|refused' "$file" >/dev/null 2>&1; then
+            grep -Ei 'error|fail|already in use|another k3s-init|unable|refused' "$file" | tail -n 3
+            exit 0
+        fi
+    fi
+done
+ps -ef | grep -E 'k3s-init|/usr/local/bin/k3s server|containerd' | grep -v grep | tail -n 3 || true
+"#;
+    let output = tauri::async_runtime::spawn_blocking(move || {
+        Command::new("wsl.exe")
+            .args(["-d", &instance_owned, "--", "sh", "-lc", script])
+            .output()
+    })
+    .await
+    .ok()?
+    .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let summary = decode_cli_output(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .take(3)
+        .collect::<Vec<_>>()
+        .join(" | ");
+
+    if summary.is_empty() {
+        None
+    } else {
+        Some(summary)
     }
 }
 
@@ -4371,7 +4441,7 @@ async fn wait_for_kube_api_port(
 
     loop {
         if started_at.elapsed() >= timeout {
-            let message = if last_error.trim().is_empty() {
+            let mut message = if last_error.trim().is_empty() {
                 format!(
                     "API Kubernetes indisponible sur {}:{} apres {}s.",
                     endpoint.host, endpoint.port, KUBE_API_READY_TIMEOUT_SECONDS
@@ -4382,6 +4452,10 @@ async fn wait_for_kube_api_port(
                     endpoint.host, endpoint.port, KUBE_API_READY_TIMEOUT_SECONDS, last_error
                 )
             };
+            if let Some(hint) = collect_k3s_runtime_failure_hint(instance).await {
+                message.push_str(" Diagnostic runtime: ");
+                message.push_str(&hint);
+            }
             return Err(anyhow!(message));
         }
 
