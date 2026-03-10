@@ -2880,6 +2880,141 @@ fn kubectl_error_result(
     }
 }
 
+fn build_wsl_k3s_kubectl_command_line(instance: &str, args: &[String]) -> String {
+    let mut command_args = vec![
+        "-d".to_string(),
+        instance.to_string(),
+        "--".to_string(),
+        "/usr/local/bin/k3s".to_string(),
+        "kubectl".to_string(),
+        "--kubeconfig".to_string(),
+        "/etc/rancher/k3s/k3s.yaml".to_string(),
+    ];
+    command_args.extend(args.iter().cloned());
+    let refs: Vec<&str> = command_args.iter().map(String::as_str).collect();
+    format_cli_command("wsl.exe", &refs)
+}
+
+#[derive(Debug)]
+struct WslKubectlProcessOutput {
+    command_line: String,
+    exit_code: i32,
+    stdout: String,
+    stderr: String,
+}
+
+async fn execute_wsl_k3s_kubectl_command(
+    instance: &str,
+    args: &[String],
+    stdin_bytes: Option<Vec<u8>>,
+) -> Result<WslKubectlProcessOutput> {
+    let mut command_args = vec![
+        "-d".to_string(),
+        instance.to_string(),
+        "--".to_string(),
+        "/usr/local/bin/k3s".to_string(),
+        "kubectl".to_string(),
+        "--kubeconfig".to_string(),
+        "/etc/rancher/k3s/k3s.yaml".to_string(),
+    ];
+    command_args.extend(args.iter().cloned());
+    let command_line = build_wsl_k3s_kubectl_command_line(instance, args);
+    let command_args_for_process = command_args.clone();
+    let output = tauri::async_runtime::spawn_blocking(move || {
+        let mut child = Command::new("wsl.exe")
+            .args(command_args_for_process.iter().map(String::as_str))
+            .stdin(if stdin_bytes.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("Impossible de lancer kubectl dans la distro WSL")?;
+
+        if let Some(input) = stdin_bytes {
+            if let Some(mut stdin) = child.stdin.take() {
+                stdin
+                    .write_all(&input)
+                    .context("Impossible d'envoyer le manifeste YAML a kubectl dans WSL")?;
+            }
+        }
+
+        child
+            .wait_with_output()
+            .context("Impossible d'attendre la fin de kubectl dans WSL")
+    })
+    .await
+    .map_err(|e| anyhow!("Erreur JoinHandle lors de l'execution kubectl WSL: {e}"))??;
+
+    Ok(WslKubectlProcessOutput {
+        command_line,
+        exit_code: output.status.code().unwrap_or(1),
+        stdout: decode_cli_output(&output.stdout),
+        stderr: decode_cli_output(&output.stderr),
+    })
+}
+
+async fn wait_for_wsl_k3s_kubectl_ready(instance: &str, trace_id: &str) -> Result<()> {
+    let started_at = Instant::now();
+    let timeout = Duration::from_secs(KUBE_API_READY_TIMEOUT_SECONDS);
+
+    loop {
+        let probe_args = vec![
+            "--request-timeout=5s".to_string(),
+            "get".to_string(),
+            "--raw=/readyz".to_string(),
+        ];
+        let probe = execute_wsl_k3s_kubectl_command(instance, &probe_args, None).await;
+        let probe_error = match probe {
+            Ok(output) if output.exit_code == 0 => {
+                info!(
+                    target: "wsl",
+                    trace_id = %trace_id,
+                    instance = %instance,
+                    command = %output.command_line,
+                    "API Kubernetes prete via kubectl interne WSL"
+                );
+                log_wsl_event(format!(
+                    "[{trace_id}] API Kubernetes prete via kubectl interne pour {}",
+                    escape_for_log(instance)
+                ));
+                return Ok(());
+            }
+            Ok(output) => Some(if !output.stderr.trim().is_empty() {
+                    output.stderr.trim().to_string()
+                } else if !output.stdout.trim().is_empty() {
+                    output.stdout.trim().to_string()
+                } else {
+                    format!("kubectl WSL a echoue avec le code {}", output.exit_code)
+                }),
+            Err(err) => Some(err.to_string()),
+        };
+
+        if started_at.elapsed() >= timeout {
+            let mut message = if let Some(last_error) = probe_error.as_deref() {
+                format!(
+                    "API Kubernetes interne indisponible dans {} apres {}s (dernier essai: {}).",
+                    instance, KUBE_API_READY_TIMEOUT_SECONDS, last_error
+                )
+            } else {
+                format!(
+                    "API Kubernetes interne indisponible dans {} apres {}s.",
+                    instance, KUBE_API_READY_TIMEOUT_SECONDS
+                )
+            };
+            if let Some(hint) = collect_k3s_runtime_failure_hint(instance).await {
+                message.push_str(" Diagnostic runtime: ");
+                message.push_str(&hint);
+            }
+            return Err(anyhow!(message));
+        }
+
+        sleep(Duration::from_millis(KUBE_API_READY_POLL_INTERVAL_MS)).await;
+    }
+}
+
 fn parse_kubectl_get_request(args: &[String]) -> Result<KubectlGetRequest> {
     if args.is_empty() {
         return Err(anyhow!("La commande kubectl est requise."));
@@ -5965,6 +6100,484 @@ async fn execute_kubectl_command(
     }
 }
 
+async fn run_home_lab_wsl_kubectl_exec(
+    instance: &str,
+    args: &[String],
+    trace_id: &str,
+    command_line: &str,
+    instance_log: &str,
+    started_at: &Instant,
+) -> Result<WslKubectlExecResult> {
+    info!(
+        target: "wsl",
+        trace_id = %trace_id,
+        instance = %instance,
+        command = %command_line,
+        "Execution kubectl via kubectl interne WSL"
+    );
+    log_wsl_event(format!(
+        "[{trace_id}] Execution kubectl pour {} via kubectl WSL: {}",
+        instance_log, command_line
+    ));
+
+    let prepare_outcome = tokio::time::timeout(
+        Duration::from_secs(KUBECTL_PREPARE_TIMEOUT_SECONDS),
+        async {
+            ensure_wsl_instance_running(instance, trace_id).await?;
+            wait_for_wsl_k3s_kubectl_ready(instance, trace_id).await?;
+            Ok::<(), anyhow::Error>(())
+        },
+    )
+    .await;
+
+    match prepare_outcome {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+            let message = err.to_string();
+            warn!(
+                target: "wsl",
+                trace_id = %trace_id,
+                instance = %instance,
+                command = %command_line,
+                error = %message,
+                "Preparation Kubernetes en echec via kubectl WSL"
+            );
+            log_wsl_event(format!(
+                "[{trace_id}] Preparation Kubernetes en echec pour {} via kubectl WSL: {}",
+                instance_log,
+                escape_for_log(&message)
+            ));
+            return Ok(kubectl_error_result(
+                instance,
+                command_line,
+                trace_id,
+                elapsed_ms(started_at),
+                message,
+            ));
+        }
+        Err(_) => {
+            let message = format!(
+                "Timeout apres {}s lors de la preparation Kubernetes dans WSL. \
+Verifie que k3s peut demarrer dans '{}'.",
+                KUBECTL_PREPARE_TIMEOUT_SECONDS, instance
+            );
+            warn!(
+                target: "wsl",
+                trace_id = %trace_id,
+                instance = %instance,
+                command = %command_line,
+                timeout_seconds = KUBECTL_PREPARE_TIMEOUT_SECONDS,
+                "Preparation Kubernetes en timeout via kubectl WSL"
+            );
+            log_wsl_event(format!(
+                "[{trace_id}] Preparation Kubernetes en timeout pour {} via kubectl WSL: timeout={}s",
+                instance_log, KUBECTL_PREPARE_TIMEOUT_SECONDS
+            ));
+            return Ok(kubectl_error_result(
+                instance,
+                command_line,
+                trace_id,
+                elapsed_ms(started_at),
+                message,
+            ));
+        }
+    }
+
+    let instance_for_task = instance.to_string();
+    let args_for_task = args.to_vec();
+    let mut operation = tauri::async_runtime::spawn(async move {
+        execute_wsl_k3s_kubectl_command(&instance_for_task, &args_for_task, None).await
+    });
+
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(KUBECTL_EXEC_TIMEOUT_SECONDS),
+        &mut operation,
+    )
+    .await;
+
+    match outcome {
+        Ok(Ok(Ok(output))) => {
+            let duration_ms = elapsed_ms(started_at);
+            if output.exit_code == 0 {
+                let stdout_log = escape_for_log(output.stdout.trim());
+                info!(
+                    target: "wsl",
+                    trace_id = %trace_id,
+                    instance = %instance,
+                    command_actual = %output.command_line,
+                    duration_ms = duration_ms,
+                    stdout = %stdout_log,
+                    "Commande kubectl terminee via kubectl interne WSL"
+                );
+                log_wsl_event(format!(
+                    "[{trace_id}] Commande kubectl terminee pour {} via kubectl WSL: status=0 duration_ms={} stdout={}",
+                    instance_log,
+                    duration_ms,
+                    stdout_log
+                ));
+                Ok(WslKubectlExecResult {
+                    ok: true,
+                    instance: instance.to_string(),
+                    exit_code: Some(0),
+                    command: command_line.to_string(),
+                    trace_id: trace_id.to_string(),
+                    duration_ms,
+                    stdout: output.stdout,
+                    stderr: String::new(),
+                })
+            } else {
+                let message = if !output.stderr.trim().is_empty() {
+                    output.stderr.trim().to_string()
+                } else if !output.stdout.trim().is_empty() {
+                    output.stdout.trim().to_string()
+                } else {
+                    format!("kubectl WSL a echoue avec le code {}", output.exit_code)
+                };
+                warn!(
+                    target: "wsl",
+                    trace_id = %trace_id,
+                    instance = %instance,
+                    command_actual = %output.command_line,
+                    error = %message,
+                    exit_code = output.exit_code,
+                    "Commande kubectl en echec via kubectl interne WSL"
+                );
+                log_wsl_event(format!(
+                    "[{trace_id}] Commande kubectl en echec pour {} via kubectl WSL: status={} stderr={}",
+                    instance_log,
+                    output.exit_code,
+                    escape_for_log(&message)
+                ));
+                Ok(kubectl_error_result(
+                    instance,
+                    command_line,
+                    trace_id,
+                    duration_ms,
+                    message,
+                ))
+            }
+        }
+        Ok(Ok(Err(err))) => {
+            let message = err.to_string();
+            warn!(
+                target: "wsl",
+                trace_id = %trace_id,
+                instance = %instance,
+                command = %command_line,
+                error = %message,
+                "Commande kubectl en echec via kubectl interne WSL"
+            );
+            log_wsl_event(format!(
+                "[{trace_id}] Commande kubectl en echec pour {} via kubectl WSL: {}",
+                instance_log,
+                escape_for_log(&message)
+            ));
+            Ok(kubectl_error_result(
+                instance,
+                command_line,
+                trace_id,
+                elapsed_ms(started_at),
+                message,
+            ))
+        }
+        Ok(Err(join_err)) => {
+            let message = format!("Execution kubectl WSL interrompue: {join_err}");
+            error!(
+                target: "wsl",
+                trace_id = %trace_id,
+                instance = %instance,
+                command = %command_line,
+                error = %message,
+                "JoinHandle kubectl WSL en echec"
+            );
+            log_wsl_event(format!(
+                "[{trace_id}] JoinHandle kubectl WSL en echec pour {}: {}",
+                instance_log,
+                escape_for_log(&message)
+            ));
+            Ok(kubectl_error_result(
+                instance,
+                command_line,
+                trace_id,
+                elapsed_ms(started_at),
+                message,
+            ))
+        }
+        Err(_) => {
+            operation.abort();
+            let message = format!(
+                "Timeout apres {}s lors de l'execution kubectl dans WSL. \
+Verifie que k3s est demarre dans '{}'.",
+                KUBECTL_EXEC_TIMEOUT_SECONDS, instance
+            );
+            warn!(
+                target: "wsl",
+                trace_id = %trace_id,
+                instance = %instance,
+                command = %command_line,
+                timeout_seconds = KUBECTL_EXEC_TIMEOUT_SECONDS,
+                "Commande kubectl en timeout via kubectl interne WSL"
+            );
+            log_wsl_event(format!(
+                "[{trace_id}] Commande kubectl en timeout pour {} via kubectl WSL: timeout={}s",
+                instance_log, KUBECTL_EXEC_TIMEOUT_SECONDS
+            ));
+            Ok(kubectl_error_result(
+                instance,
+                command_line,
+                trace_id,
+                elapsed_ms(started_at),
+                message,
+            ))
+        }
+    }
+}
+
+async fn run_home_lab_wsl_kubectl_apply_yaml(
+    instance: &str,
+    manifest_yaml: &str,
+    trace_id: &str,
+    command_line: &str,
+    instance_log: &str,
+    source_log: &str,
+    started_at: &Instant,
+) -> Result<WslKubectlExecResult> {
+    info!(
+        target: "wsl",
+        trace_id = %trace_id,
+        instance = %instance,
+        command = %command_line,
+        source = %source_log,
+        bytes = manifest_yaml.as_bytes().len(),
+        "Execution kubectl apply via kubectl interne WSL"
+    );
+    log_wsl_event(format!(
+        "[{trace_id}] Execution kubectl apply pour {} via kubectl WSL: {} (source={} bytes={})",
+        instance_log,
+        command_line,
+        escape_for_log(source_log),
+        manifest_yaml.as_bytes().len()
+    ));
+
+    let prepare_outcome = tokio::time::timeout(
+        Duration::from_secs(KUBECTL_PREPARE_TIMEOUT_SECONDS),
+        async {
+            ensure_wsl_instance_running(instance, trace_id).await?;
+            wait_for_wsl_k3s_kubectl_ready(instance, trace_id).await?;
+            Ok::<(), anyhow::Error>(())
+        },
+    )
+    .await;
+
+    match prepare_outcome {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+            let message = err.to_string();
+            warn!(
+                target: "wsl",
+                trace_id = %trace_id,
+                instance = %instance,
+                command = %command_line,
+                error = %message,
+                "Preparation Kubernetes en echec pour apply via kubectl WSL"
+            );
+            log_wsl_event(format!(
+                "[{trace_id}] Preparation Kubernetes en echec pour apply sur {} via kubectl WSL: {}",
+                instance_log,
+                escape_for_log(&message)
+            ));
+            return Ok(kubectl_error_result(
+                instance,
+                command_line,
+                trace_id,
+                elapsed_ms(started_at),
+                message,
+            ));
+        }
+        Err(_) => {
+            let message = format!(
+                "Timeout apres {}s lors de la preparation Kubernetes dans WSL. \
+Verifie que k3s peut demarrer dans '{}'.",
+                KUBECTL_PREPARE_TIMEOUT_SECONDS, instance
+            );
+            warn!(
+                target: "wsl",
+                trace_id = %trace_id,
+                instance = %instance,
+                command = %command_line,
+                timeout_seconds = KUBECTL_PREPARE_TIMEOUT_SECONDS,
+                "Preparation Kubernetes en timeout pour apply via kubectl WSL"
+            );
+            log_wsl_event(format!(
+                "[{trace_id}] Preparation Kubernetes en timeout pour apply sur {} via kubectl WSL: timeout={}s",
+                instance_log, KUBECTL_PREPARE_TIMEOUT_SECONDS
+            ));
+            return Ok(kubectl_error_result(
+                instance,
+                command_line,
+                trace_id,
+                elapsed_ms(started_at),
+                message,
+            ));
+        }
+    }
+
+    let instance_for_task = instance.to_string();
+    let manifest_for_task = manifest_yaml.as_bytes().to_vec();
+    let apply_args = vec!["apply".to_string(), "-f".to_string(), "-".to_string()];
+    let mut operation = tauri::async_runtime::spawn(async move {
+        execute_wsl_k3s_kubectl_command(
+            &instance_for_task,
+            &apply_args,
+            Some(manifest_for_task),
+        )
+        .await
+    });
+
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(KUBECTL_EXEC_TIMEOUT_SECONDS),
+        &mut operation,
+    )
+    .await;
+
+    match outcome {
+        Ok(Ok(Ok(output))) => {
+            let duration_ms = elapsed_ms(started_at);
+            if output.exit_code == 0 {
+                let stdout_log = escape_for_log(output.stdout.trim());
+                info!(
+                    target: "wsl",
+                    trace_id = %trace_id,
+                    instance = %instance,
+                    command_actual = %output.command_line,
+                    duration_ms = duration_ms,
+                    stdout = %stdout_log,
+                    "Kubectl apply termine via kubectl interne WSL"
+                );
+                log_wsl_event(format!(
+                    "[{trace_id}] Kubectl apply termine pour {} via kubectl WSL: status=0 duration_ms={} stdout={}",
+                    instance_log,
+                    duration_ms,
+                    stdout_log
+                ));
+                Ok(WslKubectlExecResult {
+                    ok: true,
+                    instance: instance.to_string(),
+                    exit_code: Some(0),
+                    command: command_line.to_string(),
+                    trace_id: trace_id.to_string(),
+                    duration_ms,
+                    stdout: output.stdout,
+                    stderr: String::new(),
+                })
+            } else {
+                let message = if !output.stderr.trim().is_empty() {
+                    output.stderr.trim().to_string()
+                } else if !output.stdout.trim().is_empty() {
+                    output.stdout.trim().to_string()
+                } else {
+                    format!("kubectl apply WSL a echoue avec le code {}", output.exit_code)
+                };
+                warn!(
+                    target: "wsl",
+                    trace_id = %trace_id,
+                    instance = %instance,
+                    command_actual = %output.command_line,
+                    error = %message,
+                    exit_code = output.exit_code,
+                    "Kubectl apply en echec via kubectl interne WSL"
+                );
+                log_wsl_event(format!(
+                    "[{trace_id}] Kubectl apply en echec pour {} via kubectl WSL: status={} stderr={}",
+                    instance_log,
+                    output.exit_code,
+                    escape_for_log(&message)
+                ));
+                Ok(kubectl_error_result(
+                    instance,
+                    command_line,
+                    trace_id,
+                    duration_ms,
+                    message,
+                ))
+            }
+        }
+        Ok(Ok(Err(err))) => {
+            let message = err.to_string();
+            warn!(
+                target: "wsl",
+                trace_id = %trace_id,
+                instance = %instance,
+                command = %command_line,
+                error = %message,
+                "Kubectl apply en echec via kubectl interne WSL"
+            );
+            log_wsl_event(format!(
+                "[{trace_id}] Kubectl apply en echec pour {} via kubectl WSL: {}",
+                instance_log,
+                escape_for_log(&message)
+            ));
+            Ok(kubectl_error_result(
+                instance,
+                command_line,
+                trace_id,
+                elapsed_ms(started_at),
+                message,
+            ))
+        }
+        Ok(Err(join_err)) => {
+            let message = format!("Execution kubectl apply WSL interrompue: {join_err}");
+            error!(
+                target: "wsl",
+                trace_id = %trace_id,
+                instance = %instance,
+                command = %command_line,
+                error = %message,
+                "JoinHandle kubectl apply WSL en echec"
+            );
+            log_wsl_event(format!(
+                "[{trace_id}] JoinHandle kubectl apply WSL en echec pour {}: {}",
+                instance_log,
+                escape_for_log(&message)
+            ));
+            Ok(kubectl_error_result(
+                instance,
+                command_line,
+                trace_id,
+                elapsed_ms(started_at),
+                message,
+            ))
+        }
+        Err(_) => {
+            operation.abort();
+            let message = format!(
+                "Timeout apres {}s lors de l'execution kubectl apply dans WSL. \
+Verifie que k3s est demarre dans '{}'.",
+                KUBECTL_EXEC_TIMEOUT_SECONDS, instance
+            );
+            warn!(
+                target: "wsl",
+                trace_id = %trace_id,
+                instance = %instance,
+                command = %command_line,
+                timeout_seconds = KUBECTL_EXEC_TIMEOUT_SECONDS,
+                "Kubectl apply en timeout via kubectl interne WSL"
+            );
+            log_wsl_event(format!(
+                "[{trace_id}] Kubectl apply en timeout pour {} via kubectl WSL: timeout={}s",
+                instance_log, KUBECTL_EXEC_TIMEOUT_SECONDS
+            ));
+            Ok(kubectl_error_result(
+                instance,
+                command_line,
+                trace_id,
+                elapsed_ms(started_at),
+                message,
+            ))
+        }
+    }
+}
+
 async fn run_wsl_kubectl_exec(instance: &str, args: &[String]) -> Result<WslKubectlExecResult> {
     if args.is_empty() {
         return Err(anyhow!("La commande kubectl est requise."));
@@ -5975,6 +6588,18 @@ async fn run_wsl_kubectl_exec(instance: &str, args: &[String]) -> Result<WslKube
     let context_name = kube_context_for_instance(instance);
     let command_line = build_kubectl_command_line(&context_name, args);
     let instance_log = escape_for_log(instance);
+
+    if is_home_lab_wsl_instance(instance) {
+        return run_home_lab_wsl_kubectl_exec(
+            instance,
+            args,
+            &trace_id,
+            &command_line,
+            &instance_log,
+            &started_at,
+        )
+        .await;
+    }
 
     let command = match parse_kubectl_command(args) {
         Ok(command) => command,
@@ -6271,6 +6896,19 @@ async fn run_wsl_kubectl_apply_yaml(
     let command_line = build_kubectl_apply_command_line(&context_name, source_name);
     let instance_log = escape_for_log(instance);
     let source_log = source_name.unwrap_or("<uploaded-yaml>");
+
+    if is_home_lab_wsl_instance(instance) {
+        return run_home_lab_wsl_kubectl_apply_yaml(
+            instance,
+            manifest_yaml,
+            &trace_id,
+            &command_line,
+            &instance_log,
+            source_log,
+            &started_at,
+        )
+        .await;
+    }
 
     if let Err(err) = ensure_rustls_crypto_provider(&trace_id, instance) {
         let message = err.to_string();
