@@ -285,6 +285,7 @@ pub struct TcpRouteIn {
     pub listen_scope: TcpListenScopeIn,
     pub target_kind: TcpTargetKindIn,
     pub target_host: Option<String>,
+    pub server_name: Option<String>,
 }
 
 #[allow(dead_code)]
@@ -296,6 +297,7 @@ pub struct TcpRouteOut {
     pub listen_scope: String,
     pub target_kind: String,
     pub target_host: String,
+    pub server_name: String,
 }
 
 #[allow(dead_code)]
@@ -439,6 +441,7 @@ pub(crate) async fn http_list_tcp_routes() -> Result<ListTcpRoutesOut, String> {
                 TcpTargetKind::Address => "address".to_string(),
             },
             target_host: route.target_host,
+            server_name: route.server_name,
         })
         .collect();
     Ok(ListTcpRoutesOut { routes })
@@ -465,6 +468,7 @@ pub(crate) async fn http_add_tcp_route(route: TcpRouteIn) -> Result<AckOut, Stri
             TcpTargetKindIn::Address => TcpTargetKind::Address as i32,
         },
         target_host: route.target_host.unwrap_or_default(),
+        server_name: route.server_name.unwrap_or_default(),
     };
     let response = client.add_tcp_route(req).await.map_err(|e| e.to_string())?;
     let ack = response.into_inner();

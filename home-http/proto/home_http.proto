@@ -44,6 +44,7 @@ message AddTcpRouteRequest {
   TcpListenScope listen_scope = 4;
   TcpTargetKind target_kind = 5;
   string target_host = 6;
+  string server_name = 7;
 }
 
 message RemoveTcpRouteRequest {
@@ -58,6 +59,7 @@ message ListTcpRoutesResponse {
     TcpListenScope listen_scope = 4;
     TcpTargetKind target_kind = 5;
     string target_host = 6;
+    string server_name = 7;
   }
   repeated Route routes = 1;
 }
