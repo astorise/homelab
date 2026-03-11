@@ -12,7 +12,6 @@ use http_body_util::{combinators::BoxBody, BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::{Request, Response};
 use hyper_util::{
-    client::legacy::{connect::HttpConnector, Client},
     rt::{TokioExecutor, TokioIo},
     server::conn::auto::Builder as ServerBuilder,
 };
@@ -255,10 +254,12 @@ struct TcpRouteConfig {
     target_kind: TcpTargetKindConfig,
     #[serde(default)]
     target_host: Option<String>,
+    #[serde(default)]
+    server_name: Option<String>,
 }
 
 impl TcpRouteConfig {
-    fn key(&self) -> String {
+    fn listener_key(&self) -> String {
         format!("{}:{}", self.listen_scope.bind_ip(), self.listen_port)
     }
 
@@ -278,6 +279,10 @@ impl TcpRouteConfig {
                 .filter(|value| !value.trim().is_empty())
                 .unwrap_or_else(|| Ipv4Addr::LOCALHOST.to_string()),
         }
+    }
+
+    fn normalized_server_name(&self) -> Option<&str> {
+        self.server_name.as_deref()
     }
 }
 fn default_http_port() -> u16 {
@@ -411,6 +416,9 @@ fn resolve_wsl_ipv4() -> Option<String> {
 
 fn wsl_ip(cfg: &HttpConfig, cache: &Arc<Mutex<(u64, Option<String>)>>) -> String {
     if cfg.wsl_resolve == "static" {
+        if let Some(ip) = resolve_wsl_ipv4() {
+            return ip;
+        }
         return cfg.wsl_ip.clone().unwrap_or_else(|| "127.0.0.1".into());
     }
     let now = chrono::Utc::now().timestamp() as u64;
@@ -444,6 +452,15 @@ fn normalize_tcp_route_name(name: &str) -> Result<String> {
     Ok(normalized)
 }
 
+fn normalize_server_name(value: &str) -> Option<String> {
+    let normalized = value.trim().trim_end_matches('.').to_ascii_lowercase();
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(normalized)
+    }
+}
+
 fn tcp_route_from_request(req: AddTcpRouteRequest) -> Result<TcpRouteConfig> {
     let listen_port = u16::try_from(req.listen_port).context("listen_port out of range")?;
     let target_port = u16::try_from(req.target_port).context("target_port out of range")?;
@@ -474,6 +491,7 @@ fn tcp_route_from_request(req: AddTcpRouteRequest) -> Result<TcpRouteConfig> {
         listen_scope: TcpListenScopeConfig::from_proto(req.listen_scope)?,
         target_kind,
         target_host,
+        server_name: normalize_server_name(&req.server_name),
     })
 }
 
@@ -495,22 +513,51 @@ async fn proxy_tcp_connection(
     Ok(())
 }
 
-async fn run_tcp_route_listener(route: TcpRouteConfig, shared: Shared) {
-    let bind_addr = route.bind_addr();
+async fn proxy_tcp_sni_connection(
+    inbound: TcpStream,
+    routes: Vec<TcpRouteConfig>,
+    shared: Shared,
+) -> Result<()> {
+    inbound.set_nodelay(true)?;
+    let mut buf = vec![0u8; MAX_CLIENT_HELLO];
+    let n = inbound.peek(&mut buf).await?;
+    if n < 5 {
+        anyhow::bail!("client hello too short");
+    }
+
+    let server_name = normalize_server_name(&parse_sni(&buf[..n]).context("parse sni")?)
+        .ok_or_else(|| anyhow!("missing server name"))?;
+    let route = routes
+        .into_iter()
+        .find(|route| route.normalized_server_name() == Some(server_name.as_str()))
+        .with_context(|| format!("no tcp SNI route for {}", server_name))?;
+
+    proxy_tcp_connection(inbound, route, shared).await
+}
+
+async fn run_tcp_route_listener_group(routes: Vec<TcpRouteConfig>, shared: Shared) {
+    let Some(first_route) = routes.first().cloned() else {
+        return;
+    };
+    let bind_addr = first_route.bind_addr();
     let listener = match TcpListener::bind(bind_addr).await {
         Ok(listener) => listener,
         Err(err) => {
             error!(
                 "tcp route '{}' failed to bind on {}: {}",
-                route.name, bind_addr, err
+                first_route.name, bind_addr, err
             );
             return;
         }
     };
+    let sni_mode = routes.iter().all(|route| route.server_name.is_some());
 
     info!(
-        "TCP L4 listener '{}' on {} -> target_kind={:?} target_port={}",
-        route.name, bind_addr, route.target_kind, route.target_port
+        "TCP listener '{}' on {} mode={} route_count={}",
+        first_route.name,
+        bind_addr,
+        if sni_mode { "tls-sni" } else { "raw" },
+        routes.len()
     );
 
     loop {
@@ -522,35 +569,61 @@ async fn run_tcp_route_listener(route: TcpRouteConfig, shared: Shared) {
         let (inbound, peer) = match accepted {
             Ok(Ok(value)) => value,
             Ok(Err(err)) => {
-                warn!("tcp accept failed for '{}' on {}: {}", route.name, bind_addr, err);
+                warn!(
+                    "tcp accept failed for '{}' on {}: {}",
+                    first_route.name, bind_addr, err
+                );
                 continue;
             }
             Err(_) => continue,
         };
 
-        let route_for_conn = route.clone();
+        let routes_for_conn = routes.clone();
         let shared_for_conn = shared.clone();
+        let first_route_name = first_route.name.clone();
         tokio::spawn(async move {
-            if let Err(err) =
-                proxy_tcp_connection(inbound, route_for_conn.clone(), shared_for_conn).await
-            {
+            let result = if sni_mode {
+                proxy_tcp_sni_connection(inbound, routes_for_conn.clone(), shared_for_conn).await
+            } else {
+                proxy_tcp_connection(inbound, routes_for_conn[0].clone(), shared_for_conn).await
+            };
+            if let Err(err) = result {
                 warn!(
                     "tcp proxy error for route '{}' from {}: {:#}",
-                    route_for_conn.name, peer, err
+                    first_route_name, peer, err
                 );
             }
         });
     }
 
-    info!("TCP L4 listener '{}' stopped on {}", route.name, bind_addr);
+    info!("TCP listener '{}' stopped on {}", first_route.name, bind_addr);
 }
 
 async fn sync_tcp_listeners(shared: &Shared) -> Result<()> {
     let desired_routes = shared.cfg.lock().tcp_routes.clone();
-    let desired_by_key: HashMap<String, TcpRouteConfig> = desired_routes
-        .into_iter()
-        .map(|route| (route.key(), route))
-        .collect();
+    let mut desired_by_key: HashMap<String, Vec<TcpRouteConfig>> = HashMap::new();
+    for route in desired_routes {
+        desired_by_key
+            .entry(route.listener_key())
+            .or_default()
+            .push(route);
+    }
+    for routes in desired_by_key.values_mut() {
+        routes.sort_by(|left, right| left.name.cmp(&right.name));
+        let sni_count = routes.iter().filter(|route| route.server_name.is_some()).count();
+        if sni_count > 0 && sni_count != routes.len() {
+            anyhow::bail!(
+                "tcp listener {} mixes SNI and raw routes, which is unsupported",
+                routes[0].listener_key()
+            );
+        }
+        if sni_count == 0 && routes.len() > 1 {
+            anyhow::bail!(
+                "tcp listener {} has multiple raw routes, which is unsupported",
+                routes[0].listener_key()
+            );
+        }
+    }
 
     let mut listeners = shared.tcp_listeners.lock();
     let existing_keys: Vec<String> = listeners.keys().cloned().collect();
@@ -561,7 +634,7 @@ async fn sync_tcp_listeners(shared: &Shared) -> Result<()> {
             None => false,
         };
         let keep = match (listeners.get(&key), desired_by_key.get(&key)) {
-            (Some(runtime), Some(desired)) if !restart && runtime.route == *desired => true,
+            (Some(runtime), Some(desired)) if !restart && runtime.routes == *desired => true,
             _ => false,
         };
         if keep {
@@ -571,21 +644,26 @@ async fn sync_tcp_listeners(shared: &Shared) -> Result<()> {
             runtime.handle.abort();
             info!(
                 "TCP L4 listener '{}' removed/restarted for key {}",
-                runtime.route.name, key
+                runtime
+                    .routes
+                    .first()
+                    .map(|route| route.name.as_str())
+                    .unwrap_or("<unknown>"),
+                key
             );
         }
     }
 
-    for (key, route) in desired_by_key {
+    for (key, routes) in desired_by_key {
         if listeners.contains_key(&key) {
             continue;
         }
-        let route_for_task = route.clone();
+        let routes_for_task = routes.clone();
         let shared_for_task = shared.clone();
         let handle = tokio::spawn(async move {
-            run_tcp_route_listener(route_for_task, shared_for_task).await;
+            run_tcp_route_listener_group(routes_for_task, shared_for_task).await;
         });
-        listeners.insert(key, TcpListenerRuntime { route, handle });
+        listeners.insert(key, TcpListenerRuntime { routes, handle });
     }
 
     Ok(())
@@ -615,7 +693,7 @@ struct Shared {
 }
 
 struct TcpListenerRuntime {
-    route: TcpRouteConfig,
+    routes: Vec<TcpRouteConfig>,
     handle: JoinHandle<()>,
 }
 
@@ -735,13 +813,14 @@ impl HomeHttp for MyHttpService {
     ) -> Result<tonic::Response<Acknowledge>, tonic::Status> {
         let route = tcp_route_from_request(request.into_inner())
             .map_err(|err| tonic::Status::invalid_argument(err.to_string()))?;
-        let route_key = route.key();
         let mut cfg = self.shared.cfg.lock().clone();
-        cfg.tcp_routes
-            .retain(|existing| existing.name != route.name && existing.key() != route_key);
+        cfg.tcp_routes.retain(|existing| existing.name != route.name);
         cfg.tcp_routes.push(route);
-        cfg.tcp_routes
-            .sort_by(|left, right| left.listen_port.cmp(&right.listen_port));
+        cfg.tcp_routes.sort_by(|left, right| {
+            left.listen_port
+                .cmp(&right.listen_port)
+                .then_with(|| left.name.cmp(&right.name))
+        });
         if let Err(err) = save_config(&cfg) {
             error!("add_tcp_route failed to save config: {err:#}");
             return Err(tonic::Status::internal(err.to_string()));
@@ -796,6 +875,7 @@ impl HomeHttp for MyHttpService {
                 listen_scope: route.listen_scope.to_proto(),
                 target_kind: route.target_kind.to_proto(),
                 target_host: route.target_host.unwrap_or_default(),
+                server_name: route.server_name.unwrap_or_default(),
             })
             .collect();
         Ok(tonic::Response::new(ListTcpRoutesResponse { routes }))
@@ -805,13 +885,11 @@ impl HomeHttp for MyHttpService {
 // ---- HTTP http (Hyper 1.x) ----
 #[derive(Clone)]
 struct HttpHttp {
-    client: Client<HttpConnector, Full<Bytes>>,
     shared: Shared,
 }
 impl HttpHttp {
     fn new(shared: Shared) -> Self {
-        let client = Client::builder(TokioExecutor::new()).build_http();
-        Self { client, shared }
+        Self { shared }
     }
     async fn serve(self, addr: SocketAddr) -> Result<()> {
         let listener = TcpListener::bind(addr).await?;
@@ -853,42 +931,33 @@ impl HttpHttp {
             .next()
             .unwrap_or(host_hdr)
             .to_lowercase();
-        let port = self.shared.cfg.lock().routes.get(&host).copied();
-        let Some(port) = port else {
+        let https_port = self.shared.cfg.lock().https;
+        let has_route = self.shared.cfg.lock().routes.contains_key(&host);
+        let Some(_) = has_route.then_some(()) else {
             let body = Full::from(Bytes::from_static(b"bad gateway: no route"))
                 .map_err(|never| match never {})
                 .boxed(); // -> BoxBody<Bytes, hyper::Error>
             return Ok(Response::builder().status(502).body(body).unwrap());
         };
-        let ip = wsl_ip(&self.shared.cfg.lock(), &self.shared.cache);
         let path_q = req
             .uri()
             .path_and_query()
             .map(|pq| pq.as_str())
             .unwrap_or("/");
-        let new_uri: Uri = format!("http://{}:{}{}", ip, port, path_q).parse().unwrap();
-
-        // Convert server Incoming -> bytes -> Full
-        let (parts, body_in) = req.into_parts();
-        let bytes = body_in.collect().await?.to_bytes();
-        let mut out_req = Request::from_parts(parts, Full::from(bytes));
-        *out_req.uri_mut() = new_uri;
-
-        // Http avec client hyper
-        let resp = match self.client.request(out_req).await {
-            Ok(r) => r,
-            Err(e) => {
-                // Convertit l'erreur client en 502 c't' http
-                let msg = format!("upstream error: {e}");
-                let body = Full::from(Bytes::from(msg))
-                    .map_err(|never| match never {})
-                    .boxed();
-                return Ok(Response::builder().status(502).body(body).unwrap());
-            }
+        let authority = if https_port == 443 {
+            host
+        } else {
+            format!("{}:{}", host, https_port)
         };
-        let (parts, body_in) = resp.into_parts();
-        let body = body_in.boxed(); // Incoming -> BoxBody<Bytes, hyper::Error>
-        Ok(Response::from_parts(parts, body))
+        let location: Uri = format!("https://{}{}", authority, path_q).parse().unwrap();
+        let body = Full::from(Bytes::new())
+            .map_err(|never| match never {})
+            .boxed();
+        Ok(Response::builder()
+            .status(http::StatusCode::PERMANENT_REDIRECT)
+            .header(http::header::LOCATION, location.to_string())
+            .body(body)
+            .unwrap())
     }
 }
 

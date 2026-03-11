@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::net::Ipv4Addr;
@@ -226,8 +226,8 @@ const DEFAULT_DNS_TARGET: &str = "127.0.0.1";
 const ENV_DNS_TARGET: &str = "HOME_LAB_WSL_DNS_TARGET";
 const DEFAULT_DNS_TTL: u32 = 60;
 const ENV_DNS_TTL: &str = "HOME_LAB_WSL_DNS_TTL";
-const DEFAULT_HTTP_PORT_BASE: u16 = 8080;
-const DEFAULT_HTTP_PORT_STEP: u16 = 1000;
+const DEFAULT_HTTP_PORT_BASE: u16 = 2001;
+const DEFAULT_HTTP_PORT_STEP: u16 = 1;
 const DEFAULT_HTTP_PORT_MAX: u16 = 60000;
 const ENV_HTTP_PORT_BASE: &str = "HOME_LAB_WSL_HTTP_PORT_BASE";
 const ENV_HTTP_PORT_STEP: &str = "HOME_LAB_WSL_HTTP_PORT_STEP";
@@ -238,18 +238,32 @@ const ENV_HTTP_INBOUND: &str = "HOME_LAB_WSL_HTTP_INBOUND";
 const ENV_HTTPS_INBOUND: &str = "HOME_LAB_WSL_HTTPS_INBOUND";
 const DEFAULT_API_PORT: u16 = 6443;
 const ENV_API_PORT: &str = "HOME_LAB_WSL_K3S_API_PORT";
-const DEFAULT_API_PORT_BASE: u16 = 6443;
-const DEFAULT_API_PORT_STEP: u16 = 100;
+const DEFAULT_API_PORT_BASE: u16 = 1001;
+const DEFAULT_API_PORT_STEP: u16 = 1;
 const DEFAULT_API_PORT_MAX: u16 = 60000;
 const ENV_API_PORT_BASE: &str = "HOME_LAB_WSL_K3S_API_PORT_BASE";
 const ENV_API_PORT_STEP: &str = "HOME_LAB_WSL_K3S_API_PORT_STEP";
 const ENV_API_PORT_MAX: &str = "HOME_LAB_WSL_K3S_API_PORT_MAX";
+const DEFAULT_API_INBOUND_PORT: u16 = 6443;
+const ENV_API_INBOUND_PORT: &str = "HOME_LAB_WSL_K3S_API_INBOUND_PORT";
 const DEFAULT_API_PROXY_SCOPE: &str = "loopback";
 const ENV_API_PROXY_SCOPE: &str = "HOME_LAB_WSL_K3S_API_PROXY_SCOPE";
 const DEFAULT_K3S_NODEPORT_SPAN: u16 = 57;
+const DEFAULT_K3S_NODEPORT_BASE: u16 = 20000;
+const DEFAULT_K3S_NODEPORT_STEP: u16 = 100;
+const DEFAULT_K3S_NODEPORT_MAX: u16 = 60000;
+const ENV_K3S_NODEPORT_BASE: &str = "HOME_LAB_WSL_K3S_NODEPORT_BASE";
+const ENV_K3S_NODEPORT_STEP: &str = "HOME_LAB_WSL_K3S_NODEPORT_STEP";
+const ENV_K3S_NODEPORT_MAX: &str = "HOME_LAB_WSL_K3S_NODEPORT_MAX";
 const DEFAULT_CONTAINERD_STREAM_PORT_BASE: u16 = 10010;
 const DEFAULT_K3S_LOCAL_PORT_BASE: u16 = 11040;
 const DEFAULT_K3S_LOCAL_PORT_STEP: u16 = 20;
+const DEFAULT_SSH_PORT_BASE: u16 = 3001;
+const DEFAULT_SSH_PORT_STEP: u16 = 1;
+const DEFAULT_SSH_PORT_MAX: u16 = 60000;
+const ENV_SSH_PORT_BASE: &str = "HOME_LAB_WSL_SSH_PORT_BASE";
+const ENV_SSH_PORT_STEP: &str = "HOME_LAB_WSL_SSH_PORT_STEP";
+const ENV_SSH_PORT_MAX: &str = "HOME_LAB_WSL_SSH_PORT_MAX";
 const SERVICE_RPC_RETRIES: usize = 8;
 const SERVICE_RPC_BASE_DELAY_MS: u64 = 750;
 const HTTP_SERVICE_NAME: &str = "HomeHttpService";
@@ -408,6 +422,15 @@ fn kube_api_proxy_route_name(instance: &str) -> String {
     }
 }
 
+fn ssh_proxy_route_name(instance: &str) -> String {
+    let slug = cluster_domain_slug(instance);
+    if slug.is_empty() {
+        "cluster-ssh".to_string()
+    } else {
+        format!("{slug}-ssh")
+    }
+}
+
 fn dns_target_ipv4() -> String {
     std::env::var(ENV_DNS_TARGET)
         .ok()
@@ -511,14 +534,9 @@ fn bounded_instance_slot(instance: &str, slots: u32) -> u32 {
     fallback_instance_hash(instance) % slots
 }
 
-fn k3s_api_port_for_instance(instance: &str) -> u16 {
-    if std::env::var(ENV_API_PORT).is_ok() {
-        return env_or_default_u16(ENV_API_PORT, DEFAULT_API_PORT);
-    }
-
-    let base = k3s_api_port_base();
-    let step = k3s_api_port_step();
-    let max = k3s_api_port_max();
+fn deterministic_port_for_instance(instance: &str, base: u16, step: u16, max: u16) -> u16 {
+    let step = step.max(1);
+    let max = max.max(base);
     let slots = ((u32::from(max) - u32::from(base)) / u32::from(step)).saturating_add(1);
     if slots == 0 {
         return base;
@@ -530,10 +548,63 @@ fn k3s_api_port_for_instance(instance: &str) -> u16 {
     u16::try_from(computed).unwrap_or(base)
 }
 
-fn k3s_port_range_for_instance(instance: &str) -> (u16, u16) {
-    let api_port = k3s_api_port_for_instance(instance);
-    let range_end = api_port.saturating_add(DEFAULT_K3S_NODEPORT_SPAN);
-    (api_port, range_end)
+fn k3s_api_port_for_instance(instance: &str) -> u16 {
+    if std::env::var(ENV_API_PORT).is_ok() {
+        return env_or_default_u16(ENV_API_PORT, DEFAULT_API_PORT);
+    }
+
+    deterministic_port_for_instance(
+        instance,
+        k3s_api_port_base(),
+        k3s_api_port_step(),
+        k3s_api_port_max(),
+    )
+}
+
+fn public_k3s_api_port() -> u16 {
+    env_or_default_u16(ENV_API_INBOUND_PORT, DEFAULT_API_INBOUND_PORT)
+}
+
+fn k3s_nodeport_base() -> u16 {
+    env_or_default_u16(ENV_K3S_NODEPORT_BASE, DEFAULT_K3S_NODEPORT_BASE)
+}
+
+fn k3s_nodeport_step() -> u16 {
+    let step = env_or_default_u16(ENV_K3S_NODEPORT_STEP, DEFAULT_K3S_NODEPORT_STEP);
+    if step == 0 {
+        DEFAULT_K3S_NODEPORT_STEP
+    } else {
+        step
+    }
+}
+
+fn k3s_nodeport_max() -> u16 {
+    let max = env_or_default_u16(ENV_K3S_NODEPORT_MAX, DEFAULT_K3S_NODEPORT_MAX);
+    max.max(k3s_nodeport_base())
+}
+
+fn k3s_nodeport_range_for_instance(instance: &str) -> (u16, u16) {
+    let base = deterministic_port_for_instance(
+        instance,
+        k3s_nodeport_base(),
+        k3s_nodeport_step(),
+        k3s_nodeport_max(),
+    );
+    let range_end = base.saturating_add(DEFAULT_K3S_NODEPORT_SPAN);
+    (base, range_end)
+}
+
+fn https_backend_port_for_instance(instance: &str) -> u16 {
+    deterministic_port_for_instance(instance, http_port_base(), http_port_step(), http_port_max())
+}
+
+fn ssh_port_for_instance(instance: &str) -> u16 {
+    deterministic_port_for_instance(
+        instance,
+        env_or_default_u16(ENV_SSH_PORT_BASE, DEFAULT_SSH_PORT_BASE),
+        env_or_default_u16(ENV_SSH_PORT_STEP, DEFAULT_SSH_PORT_STEP).max(1),
+        env_or_default_u16(ENV_SSH_PORT_MAX, DEFAULT_SSH_PORT_MAX),
+    )
 }
 
 fn containerd_stream_port_for_instance(instance: &str) -> Result<u16> {
@@ -586,73 +657,18 @@ fn k3s_local_port_layout_for_instance(instance: &str) -> Result<K3sLocalPortLayo
     })
 }
 
-fn pick_http_port(used_ports: &HashSet<u16>) -> Result<u16> {
-    let base = http_port_base();
-    let step = http_port_step();
-    let max = http_port_max();
-    let mut candidate = base;
-    while candidate <= max {
-        if !used_ports.contains(&candidate) {
-            return Ok(candidate);
-        }
-        match candidate.checked_add(step) {
-            Some(next) if next > candidate => {
-                candidate = next;
-            }
-            _ => break,
-        }
-    }
-    Err(anyhow!(
-        "Aucun port HTTP disponible dans la plage configuree ({base}-{max})."
-    ))
-}
-
 async fn configure_cluster_networking(instance: &str) -> Result<String> {
     let hosts = cluster_domains(instance);
     if hosts.is_empty() {
         anyhow::bail!("Aucun nom de domaine valide pour l'instance {instance}");
     }
 
-    let routes = retry_http_rpc("list_routes", || http::http_list_routes())
-        .await?
-        .routes;
-
-    let mut used_ports: HashSet<u16> = HashSet::new();
-    for route in &routes {
-        if let Ok(port) = u16::try_from(route.port) {
-            used_ports.insert(port);
-        } else {
-            warn!(
-                target: "wsl",
-                host = %route.host,
-                port = route.port,
-                "Port HTTP invalide (hors plage u16) ignore pour la selection"
-            );
-        }
-    }
-
-    let mut selected_port = None;
-    for route in &routes {
-        if hosts
-            .iter()
-            .any(|host| host.eq_ignore_ascii_case(&route.host))
-        {
-            if let Ok(existing) = u16::try_from(route.port) {
-                selected_port = Some(existing);
-                break;
-            }
-        }
-    }
-
-    let http_port = match selected_port {
-        Some(port) => port,
-        None => pick_http_port(&used_ports)?,
-    };
+    let https_backend_port = https_backend_port_for_instance(instance);
 
     let mut applied_hosts = Vec::new();
     for host in &hosts {
         retry_http_rpc("add_route", || {
-            http::http_add_route(host.clone(), http_port as u32)
+            http::http_add_route(host.clone(), https_backend_port as u32)
         })
         .await
         .map_err(|e| anyhow!("http_add_route({host}): {e}"))?;
@@ -669,47 +685,72 @@ async fn configure_cluster_networking(instance: &str) -> Result<String> {
         .map_err(|e| anyhow!("dns_add_record({host}): {e}"))?;
     }
 
-    let api_port = k3s_api_port_for_instance(instance);
+    let api_public_port = public_k3s_api_port();
+    let api_backend_port = k3s_api_port_for_instance(instance);
     let tcp_route_name = kube_api_proxy_route_name(instance);
     let api_scope = kube_api_proxy_scope();
+    let api_server_name = primary_cluster_domain(instance)
+        .ok_or_else(|| anyhow!("Aucun domaine principal pour l'instance {instance}"))?;
     retry_http_rpc("add_tcp_route", || {
         http::http_add_tcp_route(http::TcpRouteIn {
             name: tcp_route_name.clone(),
-            listen_port: api_port as u32,
-            target_port: api_port as u32,
+            listen_port: api_public_port as u32,
+            target_port: api_backend_port as u32,
             listen_scope: api_scope,
             target_kind: http::TcpTargetKindIn::Wsl,
             target_host: None,
+            server_name: Some(api_server_name.clone()),
         })
     })
     .await
     .map_err(|e| anyhow!("http_add_tcp_route({tcp_route_name}): {e}"))?;
 
+    let ssh_public_port = ssh_port_for_instance(instance);
+    let ssh_route_name = ssh_proxy_route_name(instance);
+    retry_http_rpc("add_tcp_route", || {
+        http::http_add_tcp_route(http::TcpRouteIn {
+            name: ssh_route_name.clone(),
+            listen_port: ssh_public_port as u32,
+            target_port: ssh_public_port as u32,
+            listen_scope: api_scope,
+            target_kind: http::TcpTargetKindIn::Wsl,
+            target_host: None,
+            server_name: None,
+        })
+    })
+    .await
+    .map_err(|e| anyhow!("http_add_tcp_route({ssh_route_name}): {e}"))?;
+
     info!(
         target: "wsl",
         instance = %instance,
         hosts = %applied_hosts.join(","),
-        http_port,
-        api_port,
+        https_backend_port,
+        api_public_port,
+        api_backend_port,
+        ssh_public_port,
         dns_ip = %dns_ip,
         ttl,
-        "Configuration DNS/HTTP appliquee pour l'instance WSL"
+        "Configuration DNS/HTTP/TCP appliquee pour l'instance WSL"
     );
     log_wsl_event(format!(
-        "Configuration DNS/HTTP/TCP pour {}: hosts={} http_port={} api_port={} ip={} ttl={}",
+        "Configuration DNS/HTTP/TCP pour {}: hosts={} https_backend_port={} api_public_port={} api_backend_port={} ssh_public_port={} ip={} ttl={}",
         escape_for_log(instance),
         escape_for_log(&applied_hosts.join(",")),
-        http_port,
-        api_port,
+        https_backend_port,
+        api_public_port,
+        api_backend_port,
+        ssh_public_port,
         escape_for_log(&dns_ip),
         ttl
     ));
 
     Ok(format!(
-        "DNS/HTTP/TCP configures pour {} (http={}, api={}).",
+        "DNS/HTTP/TCP configures pour {} (https-backend={}, api-public={}, ssh-public={}).",
         applied_hosts.join(", "),
-        http_port,
-        api_port
+        https_backend_port,
+        api_public_port,
+        ssh_public_port
     ))
 }
 
@@ -978,7 +1019,7 @@ async fn attach_cluster_details(instances: &mut [WslInstance]) {
                 inbound_https,
                 routes,
             },
-            api_port: k3s_api_port_for_instance(&instance.name),
+            api_port: public_k3s_api_port(),
             dns_records: dns_entries,
             oidc: oidc_info,
         });
@@ -1399,13 +1440,17 @@ fn run_wsl_shell_script_via_stdin(
 }
 
 fn render_k3s_env_file_for_instance(instance: &str) -> Result<String> {
-    let (api_port, range_end) = k3s_port_range_for_instance(instance);
+    let api_port = k3s_api_port_for_instance(instance);
+    let (nodeport_start, nodeport_end) = k3s_nodeport_range_for_instance(instance);
     let stream_port = containerd_stream_port_for_instance(instance)?;
     let local_ports = k3s_local_port_layout_for_instance(instance)?;
     let tls_sans = cluster_domains(instance).join(",");
+    let ingress_https_port = https_backend_port_for_instance(instance);
+    let ingress_http_port = ingress_https_port.saturating_sub(1);
+    let ssh_port = ssh_port_for_instance(instance);
 
     Ok(format!(
-        "WSL_ROLE=server\nPORT_RANGE={api_port}-{range_end}\nCONTAINERD_STREAM_PORT={stream_port}\nK3S_LB_SERVER_PORT={lb_server_port}\nK3S_KUBELET_PORT={kubelet_port}\nK3S_KUBELET_HEALTHZ_PORT={kubelet_healthz_port}\nK3S_KUBE_CONTROLLER_MANAGER_SECURE_PORT={kube_controller_manager_secure_port}\nK3S_KUBE_CLOUD_CONTROLLER_MANAGER_SECURE_PORT={kube_cloud_controller_manager_secure_port}\nK3S_KUBE_SCHEDULER_SECURE_PORT={kube_scheduler_secure_port}\nK3S_TLS_SANS={tls_sans}\n",
+        "WSL_ROLE=server\nK3S_API_PORT={api_port}\nPORT_RANGE={nodeport_start}-{nodeport_end}\nCONTAINERD_STREAM_PORT={stream_port}\nK3S_LB_SERVER_PORT={lb_server_port}\nK3S_KUBELET_PORT={kubelet_port}\nK3S_KUBELET_HEALTHZ_PORT={kubelet_healthz_port}\nK3S_KUBE_CONTROLLER_MANAGER_SECURE_PORT={kube_controller_manager_secure_port}\nK3S_KUBE_CLOUD_CONTROLLER_MANAGER_SECURE_PORT={kube_cloud_controller_manager_secure_port}\nK3S_KUBE_SCHEDULER_SECURE_PORT={kube_scheduler_secure_port}\nK3S_INGRESS_HTTP_PORT={ingress_http_port}\nK3S_INGRESS_HTTPS_PORT={ingress_https_port}\nK3S_GIT_SSH_PORT={ssh_port}\nK3S_TLS_SANS={tls_sans}\n",
         lb_server_port = local_ports.lb_server_port,
         kubelet_port = local_ports.kubelet_port,
         kubelet_healthz_port = local_ports.kubelet_healthz_port,
@@ -1417,9 +1462,10 @@ fn render_k3s_env_file_for_instance(instance: &str) -> Result<String> {
 }
 
 fn render_k3s_config_yaml_for_instance(instance: &str, node_ip_expression: &str) -> String {
-    let (api_port, range_end) = k3s_port_range_for_instance(instance);
+    let api_port = k3s_api_port_for_instance(instance);
+    let (nodeport_start, nodeport_end) = k3s_nodeport_range_for_instance(instance);
     let mut config = format!(
-        "write-kubeconfig-mode: \"0644\"\nnode-ip: {node_ip_expression}\nhttps-listen-port: {api_port}\nservice-node-port-range: {api_port}-{range_end}\n"
+        "write-kubeconfig-mode: \"0644\"\nnode-ip: {node_ip_expression}\nhttps-listen-port: {api_port}\nservice-node-port-range: {nodeport_start}-{nodeport_end}\n"
     );
     let domains = cluster_domains(instance);
     if !domains.is_empty() {
@@ -1802,7 +1848,11 @@ fn build_managed_kube_entry(instance: &str) -> Result<ManagedKubeEntry> {
     let cluster_name = format!("{base_name}-cluster");
     let user_name = format!("{base_name}-user");
     let context_name = base_name;
-    let api_port = k3s_api_port_for_instance(instance);
+    let api_port = if is_home_lab_wsl_instance(instance) {
+        public_k3s_api_port()
+    } else {
+        k3s_api_port_for_instance(instance)
+    };
     let api_host = primary_cluster_domain(instance).unwrap_or_else(|| "127.0.0.1".to_string());
 
     let mut cluster_json = selected_cluster.cluster.clone();
@@ -2050,7 +2100,7 @@ pub async fn wsl_import_instance(
     };
 
     let mut allow_post_config = provision.ok;
-    let (expected_api_port, _) = k3s_port_range_for_instance(&sanitized_name);
+    let expected_api_port = k3s_api_port_for_instance(&sanitized_name);
     if !allow_post_config {
         match is_wsl_instance_present(&sanitized_name).await {
             Ok(true) => {
@@ -2278,7 +2328,8 @@ fn run_wsl_setup(
 
     let install_dir = (resolve_install_dir(app)?).join(instance_name);
     let instance_debug = escape_for_log(instance_name);
-    let (api_port, api_range_end) = k3s_port_range_for_instance(instance_name);
+    let api_port = k3s_api_port_for_instance(instance_name);
+    let (_, nodeport_range_end) = k3s_nodeport_range_for_instance(instance_name);
 
     info!(
         target: "wsl",
@@ -2289,18 +2340,18 @@ fn run_wsl_setup(
         instance = %instance_name,
         instance_debug = %instance_debug,
         api_port,
-        api_range_end,
+        nodeport_range_end,
         "Lancement de setup-wsl.ps1"
     );
     log_wsl_event(format!(
-        "Lancement de setup-wsl.ps1 (force={}, instance={}, script={}, rootfs={}, install={}, api_port={} range_end={})",
+        "Lancement de setup-wsl.ps1 (force={}, instance={}, script={}, rootfs={}, install={}, api_port={} nodeport_end={})",
         force_import,
         instance_debug,
         script_path.display(),
         rootfs_path.display(),
         install_dir.display(),
         api_port,
-        api_range_end
+        nodeport_range_end
     ));
 
     let mut command = Command::new("powershell.exe");
@@ -2879,6 +2930,20 @@ pub async fn wsl_remove_instance(name: String) -> Result<WslOperationResult, Str
             route = %tcp_route_name,
             error = %err,
             "Suppression de la route TCP API impossible apres suppression d'instance"
+        );
+    }
+
+    let ssh_route_name = ssh_proxy_route_name(&instance_name);
+    if let Err(err) =
+        retry_http_rpc("remove_tcp_route", || http::http_remove_tcp_route(ssh_route_name.clone()))
+            .await
+    {
+        warn!(
+            target: "wsl",
+            instance = %instance_name,
+            route = %ssh_route_name,
+            error = %err,
+            "Suppression de la route TCP SSH impossible apres suppression d'instance"
         );
     }
 
@@ -4345,8 +4410,22 @@ async fn ensure_home_lab_k3s_runtime_started(
     }
 
     sync_home_lab_k3s_runtime_files(instance, trace_id).await?;
+    if let Err(err) = configure_cluster_networking(instance).await {
+        warn!(
+            target: "wsl",
+            trace_id = %trace_id,
+            instance = %instance,
+            error = %err,
+            "Reconciliation reseau/proxy impossible avant demarrage k3s"
+        );
+        log_wsl_event(format!(
+            "[{trace_id}] Reconciliation reseau/proxy impossible pour {}: {}",
+            escape_for_log(instance),
+            escape_for_log(&err.to_string())
+        ));
+    }
 
-    let api_port = resolve_kube_api_port_for_instance(instance, trace_id).await;
+    let api_port = k3s_api_port_for_instance(instance);
     let instance_owned = instance.to_string();
     let repair_flag = if allow_stale_repair { "1" } else { "0" };
     let script = format!(
@@ -4543,53 +4622,50 @@ async fn resolve_wsl_instance_ipv4(instance: &str) -> Result<String> {
 }
 
 async fn resolve_kube_api_port_for_instance(instance: &str, trace_id: &str) -> u16 {
-    let expected_port = k3s_api_port_for_instance(instance);
-    let instance_owned = instance.to_string();
-    let script = "set -eu; if [ -f /etc/k3s-env ]; then line=$(grep '^PORT_RANGE=' /etc/k3s-env | head -n1 || true); if [ -n \"$line\" ]; then range=${line#PORT_RANGE=}; port=${range%%-*}; printf '%s\\n' \"$port\"; exit 0; fi; fi; if [ -f /etc/rancher/k3s/k3s.yaml ]; then line=$(grep -E '^[[:space:]]*server:[[:space:]]*https?://' /etc/rancher/k3s/k3s.yaml | head -n1 || true); if [ -n \"$line\" ]; then port=$(printf '%s\\n' \"$line\" | sed -n 's#.*://[^:]*:\\([0-9][0-9]*\\).*#\\1#p' | head -n1); if [ -n \"$port\" ]; then printf '%s\\n' \"$port\"; exit 0; fi; fi; fi; exit 0";
-    let detected = tauri::async_runtime::spawn_blocking(move || {
-        Command::new("wsl.exe")
-            .args(["-d", &instance_owned, "--", "sh", "-lc", script])
-            .output()
-    })
-    .await
-    .ok()
-    .and_then(|result| result.ok())
-    .and_then(|output| {
-        if !output.status.success() {
-            return None;
-        }
-        decode_cli_output(&output.stdout)
-            .lines()
-            .map(|line| line.trim())
-            .find_map(|line| line.parse::<u16>().ok())
-    });
+    if !is_home_lab_wsl_instance(instance) {
+        let expected_port = k3s_api_port_for_instance(instance);
+        let instance_owned = instance.to_string();
+        let script = "set -eu; if [ -f /etc/k3s-env ]; then line=$(grep '^K3S_API_PORT=' /etc/k3s-env | head -n1 || true); if [ -n \"$line\" ]; then port=${line#K3S_API_PORT=}; printf '%s\\n' \"$port\"; exit 0; fi; line=$(grep '^PORT_RANGE=' /etc/k3s-env | head -n1 || true); if [ -n \"$line\" ]; then range=${line#PORT_RANGE=}; port=${range%%-*}; printf '%s\\n' \"$port\"; exit 0; fi; fi; if [ -f /etc/rancher/k3s/k3s.yaml ]; then line=$(grep -E '^[[:space:]]*server:[[:space:]]*https?://' /etc/rancher/k3s/k3s.yaml | head -n1 || true); if [ -n \"$line\" ]; then port=$(printf '%s\\n' \"$line\" | sed -n 's#.*://[^:]*:\\([0-9][0-9]*\\).*#\\1#p' | head -n1); if [ -n \"$port\" ]; then printf '%s\\n' \"$port\"; exit 0; fi; fi; fi; exit 0";
+        let detected = tauri::async_runtime::spawn_blocking(move || {
+            Command::new("wsl.exe")
+                .args(["-d", &instance_owned, "--", "sh", "-lc", script])
+                .output()
+        })
+        .await
+        .ok()
+        .and_then(|result| result.ok())
+        .and_then(|output| {
+            if !output.status.success() {
+                return None;
+            }
+            decode_cli_output(&output.stdout)
+                .lines()
+                .map(|line| line.trim())
+                .find_map(|line| line.parse::<u16>().ok())
+        });
 
-    let api_port = detected.unwrap_or(expected_port);
-    if api_port != expected_port {
-        warn!(
-            target: "wsl",
-            trace_id = %trace_id,
-            instance = %instance,
-            expected_api_port = expected_port,
-            detected_api_port = api_port,
-            "Port API Kubernetes detecte differe du port attendu; utilisation du port detecte depuis les fichiers d'instance"
-        );
-        log_wsl_event(format!(
-            "[{trace_id}] Port API Kubernetes detecte pour {}: {} (attendu={})",
-            escape_for_log(instance),
-            api_port,
-            expected_port
-        ));
+        let api_port = detected.unwrap_or(expected_port);
+        if api_port != expected_port {
+            warn!(
+                target: "wsl",
+                trace_id = %trace_id,
+                instance = %instance,
+                expected_api_port = expected_port,
+                detected_api_port = api_port,
+                "Port API Kubernetes detecte differe du port attendu; utilisation du port detecte depuis les fichiers d'instance"
+            );
+        }
+        return api_port;
     }
-    if detected.is_none() {
-        warn!(
-            target: "wsl",
-            trace_id = %trace_id,
-            instance = %instance,
-            selected_api_port = api_port,
-            "Port API Kubernetes introuvable dans les fichiers d'instance; utilisation du port attendu"
-        );
-    }
+
+    let api_port = public_k3s_api_port();
+    info!(
+        target: "wsl",
+        trace_id = %trace_id,
+        instance = %instance,
+        selected_api_port = api_port,
+        "Port API Kubernetes public retenu via proxy SNI"
+    );
     api_port
 }
 
@@ -4604,72 +4680,39 @@ async fn resolve_kube_api_endpoint_for_instance(
     trace_id: &str,
 ) -> Result<KubeApiEndpoint> {
     let api_port = resolve_kube_api_port_for_instance(instance, trace_id).await;
-    if let Some(domain) = primary_cluster_domain(instance) {
-        if tcp_connect_once(&domain, api_port, Duration::from_millis(700))
+    if !is_home_lab_wsl_instance(instance) {
+        if let Some(domain) = primary_cluster_domain(instance) {
+            if tcp_connect_once(&domain, api_port, Duration::from_millis(700))
+                .await
+                .is_ok()
+            {
+                return Ok(KubeApiEndpoint {
+                    host: domain,
+                    port: api_port,
+                });
+            }
+        }
+
+        let wsl_ip = resolve_wsl_instance_ipv4(instance).await?;
+        if tcp_connect_once("127.0.0.1", api_port, Duration::from_millis(700))
             .await
             .is_ok()
         {
-            info!(
-                target: "wsl",
-                trace_id = %trace_id,
-                instance = %instance,
-                api_host = %domain,
-                api_port = api_port,
-                "Endpoint API Kubernetes retenu (proxy L4 + DNS)"
-            );
-            log_wsl_event(format!(
-                "[{trace_id}] Endpoint API Kubernetes pour {}: {}:{}",
-                escape_for_log(instance),
-                escape_for_log(&domain),
-                api_port
-            ));
             return Ok(KubeApiEndpoint {
-                host: domain,
+                host: "127.0.0.1".to_string(),
                 port: api_port,
             });
         }
-    }
 
-    let wsl_ip = resolve_wsl_instance_ipv4(instance).await?;
-    if tcp_connect_once("127.0.0.1", api_port, Duration::from_millis(700))
-        .await
-        .is_ok()
-    {
-        info!(
-            target: "wsl",
-            trace_id = %trace_id,
-            instance = %instance,
-            api_host = "127.0.0.1",
-            api_port = api_port,
-            "Endpoint API Kubernetes retenu (forward localhost)"
-        );
-        return Ok(KubeApiEndpoint {
-            host: "127.0.0.1".to_string(),
-            port: api_port,
-        });
-    }
-
-    if tcp_connect_once(&wsl_ip, api_port, Duration::from_millis(700))
-        .await
-        .is_ok()
-    {
-        info!(
-            target: "wsl",
-            trace_id = %trace_id,
-            instance = %instance,
-            api_host = "127.0.0.1",
-            api_port = api_port,
-            "Endpoint API Kubernetes retenu (forward localhost)"
-        );
-        log_wsl_event(format!(
-            "[{trace_id}] Endpoint API Kubernetes pour {}: 127.0.0.1:{}",
-            escape_for_log(instance),
-            api_port
-        ));
-        return Ok(KubeApiEndpoint {
-            host: "127.0.0.1".to_string(),
-            port: api_port,
-        });
+        if tcp_connect_once(&wsl_ip, api_port, Duration::from_millis(700))
+            .await
+            .is_ok()
+        {
+            return Ok(KubeApiEndpoint {
+                host: wsl_ip,
+                port: api_port,
+            });
+        }
     }
 
     if let Some(domain) = primary_cluster_domain(instance) {
@@ -4679,7 +4722,7 @@ async fn resolve_kube_api_endpoint_for_instance(
             instance = %instance,
             api_host = %domain,
             api_port = api_port,
-            "Endpoint API Kubernetes retenu (proxy L4 + DNS, en attente d'ouverture du port)"
+            "Endpoint API Kubernetes retenu (proxy SNI public)"
         );
         log_wsl_event(format!(
             "[{trace_id}] Endpoint API Kubernetes pour {}: {}:{}",
@@ -4693,23 +4736,10 @@ async fn resolve_kube_api_endpoint_for_instance(
         });
     }
 
-    info!(
-        target: "wsl",
-        trace_id = %trace_id,
-        instance = %instance,
-        api_host = "127.0.0.1",
-        api_port = api_port,
-        "Endpoint API Kubernetes retenu (forward localhost, en attente d'ouverture du port)"
-    );
-    log_wsl_event(format!(
-        "[{trace_id}] Endpoint API Kubernetes pour {}: 127.0.0.1:{}",
-        escape_for_log(instance),
-        api_port
-    ));
-    Ok(KubeApiEndpoint {
-        host: "127.0.0.1".to_string(),
-        port: api_port,
-    })
+    anyhow::bail!(
+        "Aucun domaine principal disponible pour l'endpoint API Kubernetes de '{}'.",
+        instance
+    )
 }
 
 async fn wait_for_kube_api_port(
@@ -4721,20 +4751,7 @@ async fn wait_for_kube_api_port(
     let timeout = Duration::from_secs(KUBE_API_READY_TIMEOUT_SECONDS);
     let mut attempt: u32 = 0;
     let mut last_error = String::new();
-    let mut candidate_hosts = vec![endpoint.host.clone()];
-    let fallback_hosts = if is_loopback_host(&endpoint.host) {
-        vec![resolve_wsl_instance_ipv4(instance).await.ok()]
-    } else {
-        vec![
-            Some("127.0.0.1".to_string()),
-            resolve_wsl_instance_ipv4(instance).await.ok(),
-        ]
-    };
-    for host in fallback_hosts.into_iter().flatten() {
-        if !candidate_hosts.iter().any(|candidate| candidate == &host) {
-            candidate_hosts.push(host);
-        }
-    }
+    let candidate_hosts = vec![endpoint.host.clone()];
 
     loop {
         if started_at.elapsed() >= timeout {
@@ -4769,10 +4786,7 @@ async fn wait_for_kube_api_port(
                         attempts = attempt,
                         "Port API Kubernetes joignable"
                     );
-                    return Ok(KubeApiEndpoint {
-                        host: candidate_host.clone(),
-                        port: endpoint.port,
-                    });
+                    return Ok(endpoint.clone());
                 }
                 Err(err) => {
                     last_error = format!("{candidate_host}: {err}");
