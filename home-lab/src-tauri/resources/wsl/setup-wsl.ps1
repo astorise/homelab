@@ -3,7 +3,7 @@ param(
     [string]$DistroName = 'home-lab-k3s',
     [string]$InstallDir = (Join-Path ${env:ProgramData} 'home-lab\\wsl'),
     [string]$Rootfs     = '',
-    [int]$ApiPort       = 6443,
+    [int]$ApiPort       = 0,
     [int]$NodePortSpan  = 57,
     [switch]$ForceImport
 )
@@ -246,11 +246,15 @@ function Configure-K3sEnv {
         throw "NodePortSpan invalide ($NodePortSpan). Valeur attendue >= 0."
     }
 
-    $rangeEnd = [Math]::Min(65535, $ApiPort + $NodePortSpan)
-    $rangeText = "$ApiPort-$rangeEnd"
-    Write-Info "Configuration de /etc/k3s-env avec PORT_RANGE=$rangeText"
+    $nodePortRange = Get-K3sNodePortRangeForInstance -Name $Distro -NodePortSpan $NodePortSpan
+    $rangeText = "$($nodePortRange.Start)-$($nodePortRange.End)"
+    $ingressPorts = Get-IngressPortLayoutForInstance -Name $Distro
+    $sshPort = Get-SshPortForInstance -Name $Distro
+    Write-Info "Configuration de /etc/k3s-env avec K3S_API_PORT=$ApiPort PORT_RANGE=$rangeText"
+    $tlsSans = "$Distro.wsl"
     $content = @"
 WSL_ROLE=server
+K3S_API_PORT=$ApiPort
 PORT_RANGE=$rangeText
 CONTAINERD_STREAM_PORT=$StreamPort
 K3S_LB_SERVER_PORT=$($LocalPorts.LbServerPort)
@@ -259,6 +263,10 @@ K3S_KUBELET_HEALTHZ_PORT=$($LocalPorts.KubeletHealthzPort)
 K3S_KUBE_CONTROLLER_MANAGER_SECURE_PORT=$($LocalPorts.KubeControllerManagerSecurePort)
 K3S_KUBE_CLOUD_CONTROLLER_MANAGER_SECURE_PORT=$($LocalPorts.KubeCloudControllerManagerSecurePort)
 K3S_KUBE_SCHEDULER_SECURE_PORT=$($LocalPorts.KubeSchedulerSecurePort)
+K3S_INGRESS_HTTP_PORT=$($ingressPorts.HttpPort)
+K3S_INGRESS_HTTPS_PORT=$($ingressPorts.HttpsPort)
+K3S_GIT_SSH_PORT=$sshPort
+K3S_TLS_SANS=$tlsSans
 "@.Replace("`r`n", "`n").Replace("`r", "`n")
 
     $uncPath = "\\wsl$\$Distro\etc\k3s-env"
@@ -341,6 +349,56 @@ function Get-BoundedInstanceSlot {
     return [int]($slot % $Capacity)
 }
 
+function Get-DeterministicPortForInstance {
+    param(
+        [string]$Name,
+        [int]$BasePort,
+        [int]$Step = 1,
+        [int]$MaxPort = 60000
+    )
+
+    if ($Step -le 0) {
+        $Step = 1
+    }
+    if ($MaxPort -lt $BasePort) {
+        $MaxPort = $BasePort
+    }
+
+    $capacity = [int]([Math]::Floor((($MaxPort - $BasePort) / $Step) + 1))
+    $slot = Get-BoundedInstanceSlot -Name $Name -Capacity $capacity
+    return [int]($BasePort + ($slot * $Step))
+}
+
+function Get-K3sNodePortRangeForInstance {
+    param(
+        [string]$Name,
+        [int]$NodePortSpan
+    )
+
+    $start = Get-DeterministicPortForInstance -Name $Name -BasePort 20000 -Step 100 -MaxPort 60000
+    $end = [Math]::Min(65535, $start + $NodePortSpan)
+    [pscustomobject]@{
+        Start = [int]$start
+        End   = [int]$end
+    }
+}
+
+function Get-IngressPortLayoutForInstance {
+    param([string]$Name)
+
+    $httpsPort = Get-DeterministicPortForInstance -Name $Name -BasePort 2001 -Step 1 -MaxPort 60000
+    [pscustomobject]@{
+        HttpPort  = [int]($httpsPort - 1)
+        HttpsPort = [int]$httpsPort
+    }
+}
+
+function Get-SshPortForInstance {
+    param([string]$Name)
+
+    return Get-DeterministicPortForInstance -Name $Name -BasePort 3001 -Step 1 -MaxPort 60000
+}
+
 function Get-ContainerdStreamPortForInstance {
     param([string]$Name)
 
@@ -406,6 +464,9 @@ try {
     Ensure-WslBinary
     if ([string]::IsNullOrWhiteSpace($Rootfs)) {
         $Rootfs = [System.IO.Path]::Combine((Get-ScriptDirectory), 'wsl-rootfs.tar')
+    }
+    if ($ApiPort -le 0) {
+        $ApiPort = Get-DeterministicPortForInstance -Name $DistroName -BasePort 1001 -Step 1 -MaxPort 60000
     }
 
     Write-Info "Parametres d'execution :"

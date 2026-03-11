@@ -16,8 +16,13 @@ log_error() {
 /usr/local/bin/mount_all.sh
 
 ROLE=${WSL_ROLE:-server}
-PORT_RANGE=${PORT_RANGE:-6443-6550}
-API_PORT=$(echo "$PORT_RANGE" | cut -d"-" -f1)
+PORT_RANGE=${PORT_RANGE:-20000-20057}
+K3S_API_PORT=${K3S_API_PORT:-}
+if [ -n "$K3S_API_PORT" ]; then
+    API_PORT=$K3S_API_PORT
+else
+    API_PORT=$(echo "$PORT_RANGE" | cut -d"-" -f1)
+fi
 ENABLE_TRAEFIK=${ENABLE_TRAEFIK:-1}
 BOOTSTRAP_ONLY=${BOOTSTRAP_ONLY:-0}
 BOOTSTRAP_TIMEOUT=${BOOTSTRAP_TIMEOUT:-180}
@@ -35,15 +40,23 @@ K3S_KUBELET_HEALTHZ_PORT=${K3S_KUBELET_HEALTHZ_PORT:-}
 K3S_KUBE_CONTROLLER_MANAGER_SECURE_PORT=${K3S_KUBE_CONTROLLER_MANAGER_SECURE_PORT:-}
 K3S_KUBE_CLOUD_CONTROLLER_MANAGER_SECURE_PORT=${K3S_KUBE_CLOUD_CONTROLLER_MANAGER_SECURE_PORT:-}
 K3S_KUBE_SCHEDULER_SECURE_PORT=${K3S_KUBE_SCHEDULER_SECURE_PORT:-}
+K3S_INGRESS_HTTP_PORT=${K3S_INGRESS_HTTP_PORT:-}
+K3S_INGRESS_HTTPS_PORT=${K3S_INGRESS_HTTPS_PORT:-}
+K3S_GIT_SSH_PORT=${K3S_GIT_SSH_PORT:-}
+K3S_TLS_SANS=${K3S_TLS_SANS:-}
 K3S_RUNTIME_BIN_DIR=${K3S_RUNTIME_BIN_DIR:-/var/lib/rancher/k3s/data/current/bin}
 K3S_RUNTIME_AUX_BIN_DIR=${K3S_RUNTIME_AUX_BIN_DIR:-$K3S_RUNTIME_BIN_DIR/aux}
 CONTAINERD_STREAM_PATCH_PID=
 
 log_info "Role: $ROLE"
-log_info "Port range: $PORT_RANGE"
+log_info "API port: $API_PORT"
+log_info "NodePort range: $PORT_RANGE"
 log_info "Traefik enabled: $ENABLE_TRAEFIK"
 if [ -n "$K3S_LB_SERVER_PORT" ]; then
     log_info "Local k3s port plan: lb=$K3S_LB_SERVER_PORT kubelet=$K3S_KUBELET_PORT kubelet-healthz=$K3S_KUBELET_HEALTHZ_PORT controller-manager=$K3S_KUBE_CONTROLLER_MANAGER_SECURE_PORT cloud-controller-manager=$K3S_KUBE_CLOUD_CONTROLLER_MANAGER_SECURE_PORT scheduler=$K3S_KUBE_SCHEDULER_SECURE_PORT"
+fi
+if [ -n "$K3S_INGRESS_HTTP_PORT" ] || [ -n "$K3S_INGRESS_HTTPS_PORT" ] || [ -n "$K3S_GIT_SSH_PORT" ]; then
+    log_info "Ingress port plan: http=$K3S_INGRESS_HTTP_PORT https=$K3S_INGRESS_HTTPS_PORT git-ssh=$K3S_GIT_SSH_PORT"
 fi
 
 LOCK_HELD=0
@@ -51,6 +64,23 @@ cleanup_lock() {
     if [ "$LOCK_HELD" = "1" ] && [ -d "$K3S_LOCK_DIR" ]; then
         rm -rf "$K3S_LOCK_DIR"
     fi
+}
+
+lock_pid_is_k3s_init() {
+    candidate_pid="$1"
+    if [ -z "$candidate_pid" ] || [ ! -r "/proc/$candidate_pid/cmdline" ]; then
+        return 1
+    fi
+
+    candidate_cmdline=$(tr '\000' ' ' < "/proc/$candidate_pid/cmdline" 2>/dev/null || true)
+    case "$candidate_cmdline" in
+        "sh /usr/local/bin/k3s-init.sh"*|"/bin/sh /usr/local/bin/k3s-init.sh"*)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
 }
 
 acquire_lock_or_exit() {
@@ -63,7 +93,7 @@ acquire_lock_or_exit() {
 
     if [ -f "$K3S_LOCK_DIR/pid" ]; then
         lock_pid=$(cat "$K3S_LOCK_DIR/pid" 2>/dev/null || true)
-        if [ -n "$lock_pid" ] && kill -0 "$lock_pid" 2>/dev/null; then
+        if [ -n "$lock_pid" ] && kill -0 "$lock_pid" 2>/dev/null && lock_pid_is_k3s_init "$lock_pid"; then
             log_info "Another k3s-init instance is already running (pid=$lock_pid), exiting."
             exit 0
         fi
@@ -123,16 +153,74 @@ ensure_server_config() {
 
     mkdir -p /etc/rancher/k3s
     desired_config=$(mktemp)
-    cat <<EOF > "$desired_config"
+    {
+    cat <<EOF
 write-kubeconfig-mode: "0644"
 node-ip: $NODE_IP
 https-listen-port: $API_PORT
 service-node-port-range: $PORT_RANGE
 EOF
+    if [ -n "$K3S_TLS_SANS" ]; then
+        printf '%s\n' "tls-san:"
+        old_ifs=$IFS
+        IFS=','
+        set -- $K3S_TLS_SANS
+        IFS=$old_ifs
+        for san in "$@"; do
+            san_trimmed=$(printf '%s' "$san" | tr -d '[:space:]')
+            if [ -n "$san_trimmed" ]; then
+                printf '  - %s\n' "$san_trimmed"
+            fi
+        done
+    fi
+    } > "$desired_config"
 
     if [ ! -f /etc/rancher/k3s/config.yaml ] || ! cmp -s "$desired_config" /etc/rancher/k3s/config.yaml; then
         log_info "Writing /etc/rancher/k3s/config.yaml with node-ip $NODE_IP and api port $API_PORT"
         mv "$desired_config" /etc/rancher/k3s/config.yaml
+    else
+        rm -f "$desired_config"
+    fi
+}
+
+ensure_traefik_config() {
+    if [ "$ENABLE_TRAEFIK" != "1" ]; then
+        return 0
+    fi
+    if [ -z "$K3S_INGRESS_HTTP_PORT" ] || [ -z "$K3S_INGRESS_HTTPS_PORT" ]; then
+        return 0
+    fi
+
+    mkdir -p /var/lib/rancher/k3s/server/manifests
+    desired_config=$(mktemp)
+    cat <<EOF > "$desired_config"
+apiVersion: helm.cattle.io/v1
+kind: HelmChartConfig
+metadata:
+  name: traefik
+  namespace: kube-system
+spec:
+  valuesContent: |-
+    ports:
+      web:
+        expose:
+          default: true
+        exposedPort: $K3S_INGRESS_HTTP_PORT
+      websecure:
+        expose:
+          default: true
+        exposedPort: $K3S_INGRESS_HTTPS_PORT
+        tls:
+          enabled: true
+    additionalArguments:
+      - --entryPoints.web.http.redirections.entryPoint.to=websecure
+      - --entryPoints.web.http.redirections.entryPoint.scheme=https
+      - --entryPoints.web.http.redirections.entryPoint.permanent=true
+EOF
+
+    if [ ! -f /var/lib/rancher/k3s/server/manifests/traefik-config.yaml ] || ! cmp -s "$desired_config" /var/lib/rancher/k3s/server/manifests/traefik-config.yaml; then
+        log_info "Writing Traefik HelmChartConfig with http=$K3S_INGRESS_HTTP_PORT https=$K3S_INGRESS_HTTPS_PORT"
+        mv "$desired_config" /var/lib/rancher/k3s/server/manifests/traefik-config.yaml
     else
         rm -f "$desired_config"
     fi
@@ -147,6 +235,20 @@ sync_kubeconfig() {
     install -m 0600 /etc/rancher/k3s/k3s.yaml /root/.kube/config
     log_info "kubeconfig synced to /root/.kube/config"
     return 0
+}
+
+wait_for_kubeconfig_sync() {
+    elapsed=0
+    while [ "$elapsed" -lt "$BOOTSTRAP_TIMEOUT" ]; do
+        if sync_kubeconfig; then
+            return 0
+        fi
+
+        sleep "$BOOTSTRAP_INTERVAL"
+        elapsed=$((elapsed + BOOTSTRAP_INTERVAL))
+    done
+
+    return 1
 }
 
 rewrite_internal_server_kubeconfigs() {
@@ -281,10 +383,22 @@ run_k3s_server_supervised() {
 if [ "$ROLE" = "server" ]; then
     acquire_lock_or_exit
     ensure_server_config
+    ensure_traefik_config
     rewrite_internal_server_kubeconfigs
     sync_kubeconfig || true
 
     if [ "$BOOTSTRAP_ONLY" = "1" ]; then
+        if pgrep -f '^/usr/local/bin/k3s server( |$)' >/dev/null 2>&1; then
+            log_info "Bootstrap mode enabled, reusing existing k3s server to sync kubeconfig"
+            if wait_for_kubeconfig_sync; then
+                log_info "kubeconfig generated successfully from existing k3s server"
+                exit 0
+            fi
+
+            log_error "kubeconfig not generated after ${BOOTSTRAP_TIMEOUT}s while reusing existing k3s server"
+            exit 1
+        fi
+
         log_info "Bootstrap mode enabled, starting k3s server to generate kubeconfig"
         run_k3s_server &
         K3S_PID=$!

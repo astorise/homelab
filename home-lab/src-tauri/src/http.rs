@@ -24,7 +24,10 @@ mod proto {
 }
 
 use proto::homehttp::v1::home_http_client::HomeHttpClient;
-use proto::homehttp::v1::{AddRouteRequest, Empty, RemoveRouteRequest};
+use proto::homehttp::v1::{
+    AddRouteRequest, AddTcpRouteRequest, Empty, RemoveRouteRequest, RemoveTcpRouteRequest,
+    TcpListenScope, TcpTargetKind,
+};
 
 // The name of the named pipe the gRPC server is listening on.
 const PIPE_RELEASE: &str = r"\\.\pipe\home-http";
@@ -261,6 +264,48 @@ pub struct ListRoutesOut {
     pub routes: Vec<RouteOut>,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub enum TcpListenScopeIn {
+    Loopback,
+    Any,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum TcpTargetKindIn {
+    Wsl,
+    #[allow(dead_code)]
+    Address,
+}
+
+#[derive(Clone, Debug)]
+pub struct TcpRouteIn {
+    pub name: String,
+    pub listen_port: u32,
+    pub target_port: u32,
+    pub listen_scope: TcpListenScopeIn,
+    pub target_kind: TcpTargetKindIn,
+    pub target_host: Option<String>,
+    pub server_name: Option<String>,
+}
+
+#[allow(dead_code)]
+#[derive(Serialize, Clone, Debug)]
+pub struct TcpRouteOut {
+    pub name: String,
+    pub listen_port: u32,
+    pub target_port: u32,
+    pub listen_scope: String,
+    pub target_kind: String,
+    pub target_host: String,
+    pub server_name: String,
+}
+
+#[allow(dead_code)]
+#[derive(Serialize, Clone, Debug)]
+pub struct ListTcpRoutesOut {
+    pub routes: Vec<TcpRouteOut>,
+}
+
 // Tauri command implementations
 
 #[tauri::command]
@@ -361,6 +406,87 @@ pub async fn http_remove_route(host: String) -> Result<AckOut, String> {
     let response = client.remove_route(req).await.map_err(|e| e.to_string())?;
     let ack = response.into_inner();
     info!(ok = ack.ok, message = %ack.message, "HTTP remove route acknowledged");
+    Ok(AckOut {
+        ok: ack.ok,
+        message: ack.message,
+    })
+}
+
+#[allow(dead_code)]
+pub(crate) async fn http_list_tcp_routes() -> Result<ListTcpRoutesOut, String> {
+    debug!("Requesting HTTP TCP route list");
+    let mut client = connect_client().await?;
+    let response = client
+        .list_tcp_routes(Empty {})
+        .await
+        .map_err(|e| e.to_string())?;
+    let list = response.into_inner();
+    let routes = list
+        .routes
+        .into_iter()
+        .map(|route| TcpRouteOut {
+            name: route.name,
+            listen_port: route.listen_port,
+            target_port: route.target_port,
+            listen_scope: match TcpListenScope::try_from(route.listen_scope)
+                .unwrap_or(TcpListenScope::Loopback)
+            {
+                TcpListenScope::Loopback => "loopback".to_string(),
+                TcpListenScope::Any => "any".to_string(),
+            },
+            target_kind: match TcpTargetKind::try_from(route.target_kind)
+                .unwrap_or(TcpTargetKind::Wsl)
+            {
+                TcpTargetKind::Wsl => "wsl".to_string(),
+                TcpTargetKind::Address => "address".to_string(),
+            },
+            target_host: route.target_host,
+            server_name: route.server_name,
+        })
+        .collect();
+    Ok(ListTcpRoutesOut { routes })
+}
+
+pub(crate) async fn http_add_tcp_route(route: TcpRouteIn) -> Result<AckOut, String> {
+    debug!(
+        name = %route.name,
+        listen_port = route.listen_port,
+        target_port = route.target_port,
+        "Adding TCP route via RPC"
+    );
+    let mut client = connect_client().await?;
+    let req = AddTcpRouteRequest {
+        name: route.name,
+        listen_port: route.listen_port,
+        target_port: route.target_port,
+        listen_scope: match route.listen_scope {
+            TcpListenScopeIn::Loopback => TcpListenScope::Loopback as i32,
+            TcpListenScopeIn::Any => TcpListenScope::Any as i32,
+        },
+        target_kind: match route.target_kind {
+            TcpTargetKindIn::Wsl => TcpTargetKind::Wsl as i32,
+            TcpTargetKindIn::Address => TcpTargetKind::Address as i32,
+        },
+        target_host: route.target_host.unwrap_or_default(),
+        server_name: route.server_name.unwrap_or_default(),
+    };
+    let response = client.add_tcp_route(req).await.map_err(|e| e.to_string())?;
+    let ack = response.into_inner();
+    Ok(AckOut {
+        ok: ack.ok,
+        message: ack.message,
+    })
+}
+
+pub(crate) async fn http_remove_tcp_route(name: String) -> Result<AckOut, String> {
+    debug!(name = %name, "Removing TCP route via RPC");
+    let mut client = connect_client().await?;
+    let req = RemoveTcpRouteRequest { name };
+    let response = client
+        .remove_tcp_route(req)
+        .await
+        .map_err(|e| e.to_string())?;
+    let ack = response.into_inner();
     Ok(AckOut {
         ok: ack.ok,
         message: ack.message,
