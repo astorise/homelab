@@ -269,10 +269,12 @@ impl TcpRouteConfig {
 
     fn resolve_target_host(&self, shared: &Shared) -> String {
         match self.target_kind {
-            TcpTargetKindConfig::Wsl => {
-                let cfg = shared.cfg.lock().clone();
-                wsl_ip(&cfg, &shared.cache)
-            }
+            TcpTargetKindConfig::Wsl => select_wsl_target_host(
+                self.listen_port,
+                self.target_port,
+                &shared.cfg.lock(),
+                &shared.cache,
+            ),
             TcpTargetKindConfig::Address => self
                 .target_host
                 .clone()
@@ -285,6 +287,19 @@ impl TcpRouteConfig {
         self.server_name.as_deref()
     }
 }
+
+fn select_wsl_target_host(
+    listen_port: u16,
+    target_port: u16,
+    cfg: &HttpConfig,
+    cache: &Arc<Mutex<(u64, Option<String>)>>,
+) -> String {
+    if listen_port != target_port {
+        return Ipv4Addr::LOCALHOST.to_string();
+    }
+    wsl_ip(cfg, cache)
+}
+
 fn default_http_port() -> u16 {
     80
 }
@@ -1001,8 +1016,9 @@ async fn handle_tls_conn(inb: &mut TcpStream, _peer: SocketAddr, shared: Shared)
         .get(&host)
         .copied()
         .context("no route for host")?;
-    let ip = wsl_ip(&shared.cfg.lock(), &shared.cache);
-    let mut outb = TcpStream::connect((ip.as_str(), port)).await?;
+    let cfg = shared.cfg.lock().clone();
+    let target_host = select_wsl_target_host(cfg.https, port, &cfg, &shared.cache);
+    let mut outb = TcpStream::connect((target_host.as_str(), port)).await?;
     outb.set_nodelay(true)?;
     let (mut ri, mut wi) = inb.split();
     let (mut ro, mut wo) = outb.split();

@@ -4165,6 +4165,11 @@ fn keepalive_children() -> &'static Mutex<BTreeMap<String, Child>> {
     KEEPALIVE.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
+fn k3s_runtime_children() -> &'static Mutex<BTreeMap<String, Child>> {
+    static K3S_RUNTIME: OnceLock<Mutex<BTreeMap<String, Child>>> = OnceLock::new();
+    K3S_RUNTIME.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
 fn run_keepalive_launcher(instance: &str) -> Result<()> {
     let instance_trimmed = instance.trim();
     if instance_trimmed.is_empty() {
@@ -4210,6 +4215,50 @@ fn run_keepalive_launcher(instance: &str) -> Result<()> {
     let mut guard = keepalive_children()
         .lock()
         .map_err(|e| anyhow!("Mutex keepalive WSL empoisonne: {e}"))?;
+    guard.insert(instance_trimmed.to_string(), child);
+    Ok(())
+}
+
+fn run_k3s_runtime_launcher(instance: &str) -> Result<()> {
+    let instance_trimmed = instance.trim();
+    {
+        let mut guard = k3s_runtime_children()
+            .lock()
+            .map_err(|e| anyhow!("Mutex runtime k3s empoisonne: {e}"))?;
+        if let Some(existing) = guard.get_mut(instance_trimmed) {
+            match existing.try_wait() {
+                Ok(None) => return Ok(()),
+                Ok(Some(_)) | Err(_) => {
+                    guard.remove(instance_trimmed);
+                }
+            }
+        }
+    }
+
+    let child = Command::new("wsl.exe")
+        .args([
+            "-d",
+            instance_trimmed,
+            "--",
+            "sh",
+            "-lc",
+            "exec sh /usr/local/bin/k3s-init.sh >/tmp/k3s-init.out 2>/tmp/k3s-init.err",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()
+        .with_context(|| {
+            format!(
+                "Impossible de demarrer le process runtime k3s pour {}",
+                instance_trimmed
+            )
+        })?;
+
+    let mut guard = k3s_runtime_children()
+        .lock()
+        .map_err(|e| anyhow!("Mutex runtime k3s empoisonne: {e}"))?;
     guard.insert(instance_trimmed.to_string(), child);
     Ok(())
 }
@@ -4434,9 +4483,9 @@ if [ ! -x /usr/local/bin/k3s-init.sh ]; then
     exit 0
 fi
 if [ -f /run/k3s-init.lock/pid ]; then
-    lock_pid=$(cat /run/k3s-init.lock/pid 2>/dev/null || true)
+    lock_pid=$(cat /run/k3s-init.lock/pid 2>/dev/null | tr -dc '0-9' || true)
     lock_cmdline=''
-    if [ -n "$lock_pid" ] && [ -r "/proc/$lock_pid/cmdline" ]; then
+    if [ -n "$lock_pid" ] && [ -r /proc/"$lock_pid"/cmdline ]; then
         lock_cmdline=$(tr '\000' ' ' < "/proc/$lock_pid/cmdline" 2>/dev/null || true)
     fi
     case "$lock_cmdline" in
@@ -4464,8 +4513,7 @@ if pgrep -f '^sh /usr/local/bin/k3s-init.sh( |$)' >/dev/null 2>&1 || pgrep -f '^
     rm -rf /run/k3s-init.lock || true
     sleep 1
 fi
-nohup sh /usr/local/bin/k3s-init.sh >/tmp/k3s-init.out 2>/tmp/k3s-init.err </dev/null &
-printf 'k3s-init-started port=%s repair=%s\n' '{api_port}' '{repair_flag}'
+printf 'launch-k3s-init port=%s repair=%s\n' '{api_port}' '{repair_flag}'
 "#
     );
     let command_line = format_cli_command("wsl.exe", &["-d", instance, "--", "sh", "-lc", &script]);
@@ -4511,6 +4559,13 @@ printf 'k3s-init-started port=%s repair=%s\n' '{api_port}' '{repair_flag}'
         escape_for_log(stdout.trim()),
         escape_for_log(stderr.trim())
     ));
+
+    if stdout.contains("launch-k3s-init") {
+        let instance_for_launcher = instance.to_string();
+        tauri::async_runtime::spawn_blocking(move || run_k3s_runtime_launcher(&instance_for_launcher))
+            .await
+            .map_err(|e| anyhow!("Erreur JoinHandle lors du demarrage runtime k3s: {e}"))??;
+    }
 
     sleep(Duration::from_millis(350)).await;
     Ok(())
@@ -4673,6 +4728,7 @@ async fn resolve_kube_api_port_for_instance(instance: &str, trace_id: &str) -> u
 struct KubeApiEndpoint {
     host: String,
     port: u16,
+    tls_server_name: Option<String>,
 }
 
 async fn resolve_kube_api_endpoint_for_instance(
@@ -4689,6 +4745,7 @@ async fn resolve_kube_api_endpoint_for_instance(
                 return Ok(KubeApiEndpoint {
                     host: domain,
                     port: api_port,
+                    tls_server_name: None,
                 });
             }
         }
@@ -4701,6 +4758,7 @@ async fn resolve_kube_api_endpoint_for_instance(
             return Ok(KubeApiEndpoint {
                 host: "127.0.0.1".to_string(),
                 port: api_port,
+                tls_server_name: None,
             });
         }
 
@@ -4711,11 +4769,35 @@ async fn resolve_kube_api_endpoint_for_instance(
             return Ok(KubeApiEndpoint {
                 host: wsl_ip,
                 port: api_port,
+                tls_server_name: None,
             });
         }
     }
 
     if let Some(domain) = primary_cluster_domain(instance) {
+        if is_home_lab_wsl_instance(instance) {
+            info!(
+                target: "wsl",
+                trace_id = %trace_id,
+                instance = %instance,
+                api_host = "127.0.0.1",
+                api_port = api_port,
+                tls_server_name = %domain,
+                "Endpoint API Kubernetes retenu (proxy SNI public via loopback)"
+            );
+            log_wsl_event(format!(
+                "[{trace_id}] Endpoint API Kubernetes pour {}: 127.0.0.1:{} (tls_server_name={})",
+                escape_for_log(instance),
+                api_port,
+                escape_for_log(&domain)
+            ));
+            return Ok(KubeApiEndpoint {
+                host: "127.0.0.1".to_string(),
+                port: api_port,
+                tls_server_name: Some(domain),
+            });
+        }
+
         info!(
             target: "wsl",
             trace_id = %trace_id,
@@ -4733,6 +4815,7 @@ async fn resolve_kube_api_endpoint_for_instance(
         return Ok(KubeApiEndpoint {
             host: domain,
             port: api_port,
+            tls_server_name: None,
         });
     }
 
@@ -4751,7 +4834,11 @@ async fn wait_for_kube_api_port(
     let timeout = Duration::from_secs(KUBE_API_READY_TIMEOUT_SECONDS);
     let mut attempt: u32 = 0;
     let mut last_error = String::new();
-    let candidate_hosts = vec![endpoint.host.clone()];
+    let probe_targets = if is_home_lab_wsl_instance(instance) {
+        vec![("127.0.0.1".to_string(), k3s_api_port_for_instance(instance))]
+    } else {
+        vec![(endpoint.host.clone(), endpoint.port)]
+    };
 
     loop {
         if started_at.elapsed() >= timeout {
@@ -4774,22 +4861,22 @@ async fn wait_for_kube_api_port(
         }
 
         attempt += 1;
-        for candidate_host in &candidate_hosts {
-            match tcp_connect_once(candidate_host, endpoint.port, Duration::from_millis(900)).await {
+        for (probe_host, probe_port) in &probe_targets {
+            match tcp_connect_once(probe_host, *probe_port, Duration::from_millis(900)).await {
                 Ok(()) => {
                     info!(
                         target: "wsl",
                         trace_id = %trace_id,
                         instance = %instance,
-                        api_host = %candidate_host,
-                        api_port = endpoint.port,
+                        api_host = %probe_host,
+                        api_port = %probe_port,
                         attempts = attempt,
                         "Port API Kubernetes joignable"
                     );
                     return Ok(endpoint.clone());
                 }
                 Err(err) => {
-                    last_error = format!("{candidate_host}: {err}");
+                    last_error = format!("{probe_host}:{probe_port}: {err}");
                 }
             }
         }
@@ -4821,6 +4908,7 @@ fn apply_kube_api_endpoint_override(
     context_name: &str,
     api_host: &str,
     api_port: u16,
+    tls_server_name: Option<&str>,
 ) -> Result<()> {
     let Some(cluster) = kubeconfig_cluster_for_context_mut(kubeconfig, context_name) else {
         anyhow::bail!(
@@ -4843,7 +4931,9 @@ fn apply_kube_api_endpoint_override(
         .unwrap_or_else(|| "https".to_string());
 
     cluster.server = Some(format!("{base_server}://{api_host}:{api_port}"));
-    if is_loopback_host(api_host) || api_host.parse::<Ipv4Addr>().is_ok() {
+    if let Some(server_name) = tls_server_name.filter(|value| !value.trim().is_empty()) {
+        cluster.tls_server_name = Some(server_name.to_string());
+    } else if is_loopback_host(api_host) || api_host.parse::<Ipv4Addr>().is_ok() {
         cluster.tls_server_name = None;
     } else {
         cluster.tls_server_name = Some(api_host.to_string());
@@ -4958,6 +5048,7 @@ async fn build_kube_client_for_instance(
             &context_name,
             &endpoint.host,
             endpoint.port,
+            endpoint.tls_server_name.as_deref(),
         )
         .with_context(|| {
             format!(

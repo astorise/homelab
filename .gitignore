@@ -1,5 +1,5 @@
 target/*
-_artifacts/
+*artifacts/
 home-lab/src-tauri/resources/home-dns.exe
 home-lab/src-tauri/resources/home-http.exe
 home-lab/src-tauri/resources/bin/home-dns.exe
