@@ -182,6 +182,20 @@ sync_kubeconfig() {
     return 0
 }
 
+wait_for_kubeconfig_sync() {
+    elapsed=0
+    while [ "$elapsed" -lt "$BOOTSTRAP_TIMEOUT" ]; do
+        if sync_kubeconfig; then
+            return 0
+        fi
+
+        sleep "$BOOTSTRAP_INTERVAL"
+        elapsed=$((elapsed + BOOTSTRAP_INTERVAL))
+    done
+
+    return 1
+}
+
 rewrite_internal_server_kubeconfigs() {
     if [ -z "$API_PORT" ]; then
         return 0
@@ -318,6 +332,17 @@ if [ "$ROLE" = "server" ]; then
     sync_kubeconfig || true
 
     if [ "$BOOTSTRAP_ONLY" = "1" ]; then
+        if pgrep -f '^/usr/local/bin/k3s server( |$)' >/dev/null 2>&1; then
+            log_info "Bootstrap mode enabled, reusing existing k3s server to sync kubeconfig"
+            if wait_for_kubeconfig_sync; then
+                log_info "kubeconfig generated successfully from existing k3s server"
+                exit 0
+            fi
+
+            log_error "kubeconfig not generated after ${BOOTSTRAP_TIMEOUT}s while reusing existing k3s server"
+            exit 1
+        fi
+
         log_info "Bootstrap mode enabled, starting k3s server to generate kubeconfig"
         run_k3s_server &
         K3S_PID=$!

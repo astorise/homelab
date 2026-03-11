@@ -1580,6 +1580,38 @@ fn bootstrap_k3s_for_instance_if_available(instance: &str) -> Result<()> {
     Ok(())
 }
 
+fn instance_has_running_k3s_server(instance: &str) -> Result<bool> {
+    let script = "set -eu; if pgrep -f '^/usr/local/bin/k3s server( |$)' >/dev/null 2>&1; then printf '%s\\n' yes; fi";
+    let command_line = format_cli_command("wsl.exe", &["-d", instance, "--", "sh", "-lc", script]);
+
+    let output = Command::new("wsl.exe")
+        .args(["-d", instance, "--", "sh", "-lc", script])
+        .output()
+        .with_context(|| format!("Impossible de verifier le runtime k3s pour {}", instance))?;
+
+    let stdout = decode_cli_output(&output.stdout);
+    let stderr = decode_cli_output(&output.stderr);
+    let stdout_trim = stdout.trim();
+    let stderr_trim = stderr.trim();
+
+    if !output.status.success() {
+        anyhow::bail!(
+            "Verification du runtime k3s impossible pour {} (cmd={}): {}",
+            instance,
+            command_line,
+            if !stderr_trim.is_empty() {
+                stderr_trim
+            } else if !stdout_trim.is_empty() {
+                stdout_trim
+            } else {
+                "erreur inconnue"
+            }
+        );
+    }
+
+    Ok(stdout_trim.eq_ignore_ascii_case("yes"))
+}
+
 async fn enforce_instance_api_port_range(instance: &str, _api_port: u16) -> Result<()> {
     let instance_owned = instance.to_string();
     let env_file = render_k3s_env_file_for_instance(instance)?;
@@ -1663,6 +1695,42 @@ fn read_instance_kubectl_config_view(instance: &str) -> Result<KubectlConfigView
             Some(issue)
         }
     };
+
+    if instance_has_running_k3s_server(instance)? {
+        warn!(
+            target: "wsl",
+            instance = %instance,
+            "k3s server deja actif; attente du kubeconfig sans bootstrap destructif"
+        );
+        log_wsl_event(format!(
+            "k3s server deja actif pour {}; attente du kubeconfig avant reparation/bootstrap",
+            escape_for_log(instance)
+        ));
+
+        for attempt in 1..=KUBECTL_CONFIG_VIEW_RETRY_ATTEMPTS_AFTER_BOOTSTRAP {
+            match read_instance_kubectl_config_view_once(instance) {
+                Ok(view) if kubectl_view_has_required_entries(&view) => return Ok(view),
+                Ok(view) => {
+                    last_issue = Some(format!(
+                        "config toujours incomplet avec k3s deja actif (tentative {attempt}/{}) (contexts={}, clusters={}, users={})",
+                        KUBECTL_CONFIG_VIEW_RETRY_ATTEMPTS_AFTER_BOOTSTRAP,
+                        view.contexts.len(),
+                        view.clusters.len(),
+                        view.users.len()
+                    ));
+                }
+                Err(err) => {
+                    last_issue = Some(format!(
+                        "lecture kubectl impossible avec k3s deja actif (tentative {attempt}/{}): {}",
+                        KUBECTL_CONFIG_VIEW_RETRY_ATTEMPTS_AFTER_BOOTSTRAP,
+                        err
+                    ));
+                }
+            }
+
+            std::thread::sleep(Duration::from_millis(KUBECTL_CONFIG_VIEW_RETRY_DELAY_MS));
+        }
+    }
 
     repair_k3s_runtime_for_instance(instance).with_context(|| {
         format!(
