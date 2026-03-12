@@ -221,6 +221,57 @@ EOF
     fi
 }
 
+write_traefik_loopback_forwarder() {
+    listen_port="$1"
+    target_port="$2"
+    wrapper="/usr/local/bin/traefik-loopback-$listen_port.sh"
+    cat <<EOF > "$wrapper"
+#!/bin/sh
+set -eu
+endpoint_ip=\$(KUBECONFIG=/etc/rancher/k3s/k3s.yaml /usr/local/bin/k3s kubectl get endpoints -n kube-system traefik -o jsonpath='{.subsets[0].addresses[0].ip}' 2>/dev/null || true)
+if [ -z "\$endpoint_ip" ]; then
+    exit 1
+fi
+exec nc "\$endpoint_ip" $target_port
+EOF
+    chmod 0755 "$wrapper"
+    echo "$wrapper"
+}
+
+start_traefik_loopback_listener() {
+    listen_port="$1"
+    target_port="$2"
+
+    if [ -z "$listen_port" ]; then
+        return 0
+    fi
+
+    wrapper=$(write_traefik_loopback_forwarder "$listen_port" "$target_port")
+    log_file="/var/log/traefik-loopback-$listen_port.log"
+    cmd="nc -lk -s 127.0.0.1 -p $listen_port -e $wrapper"
+
+    if pgrep -f "$cmd" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    pkill -f "nc -lk -s 127.0.0.1 -p $listen_port " 2>/dev/null || true
+    nohup sh -c "exec $cmd" >> "$log_file" 2>&1 &
+}
+
+ensure_traefik_loopback_proxy() {
+    if [ "$ENABLE_TRAEFIK" != "1" ]; then
+        return 0
+    fi
+
+    mkdir -p /var/log
+    if [ -n "$K3S_INGRESS_HTTP_PORT" ]; then
+        start_traefik_loopback_listener "$K3S_INGRESS_HTTP_PORT" 8000
+    fi
+    if [ -n "$K3S_INGRESS_HTTPS_PORT" ]; then
+        start_traefik_loopback_listener "$K3S_INGRESS_HTTPS_PORT" 8443
+    fi
+}
+
 sync_kubeconfig() {
     if [ ! -f /etc/rancher/k3s/k3s.yaml ]; then
         return 1
@@ -379,6 +430,7 @@ if [ "$ROLE" = "server" ]; then
     acquire_lock_or_exit
     ensure_server_config
     ensure_traefik_config
+    ensure_traefik_loopback_proxy
     rewrite_internal_server_kubeconfigs
     sync_kubeconfig || true
 

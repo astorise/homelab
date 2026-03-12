@@ -35,6 +35,9 @@ K3S_KUBELET_HEALTHZ_PORT=${K3S_KUBELET_HEALTHZ_PORT:-}
 K3S_KUBE_CONTROLLER_MANAGER_SECURE_PORT=${K3S_KUBE_CONTROLLER_MANAGER_SECURE_PORT:-}
 K3S_KUBE_CLOUD_CONTROLLER_MANAGER_SECURE_PORT=${K3S_KUBE_CLOUD_CONTROLLER_MANAGER_SECURE_PORT:-}
 K3S_KUBE_SCHEDULER_SECURE_PORT=${K3S_KUBE_SCHEDULER_SECURE_PORT:-}
+K3S_INGRESS_HTTP_PORT=${K3S_INGRESS_HTTP_PORT:-}
+K3S_INGRESS_HTTPS_PORT=${K3S_INGRESS_HTTPS_PORT:-}
+K3S_GIT_SSH_PORT=${K3S_GIT_SSH_PORT:-}
 K3S_RUNTIME_BIN_DIR=${K3S_RUNTIME_BIN_DIR:-/var/lib/rancher/k3s/data/current/bin}
 K3S_RUNTIME_AUX_BIN_DIR=${K3S_RUNTIME_AUX_BIN_DIR:-$K3S_RUNTIME_BIN_DIR/aux}
 CONTAINERD_STREAM_PATCH_PID=
@@ -44,6 +47,9 @@ log_info "Port range: $PORT_RANGE"
 log_info "Traefik enabled: $ENABLE_TRAEFIK"
 if [ -n "$K3S_LB_SERVER_PORT" ]; then
     log_info "Local k3s port plan: lb=$K3S_LB_SERVER_PORT kubelet=$K3S_KUBELET_PORT kubelet-healthz=$K3S_KUBELET_HEALTHZ_PORT controller-manager=$K3S_KUBE_CONTROLLER_MANAGER_SECURE_PORT cloud-controller-manager=$K3S_KUBE_CLOUD_CONTROLLER_MANAGER_SECURE_PORT scheduler=$K3S_KUBE_SCHEDULER_SECURE_PORT"
+fi
+if [ -n "$K3S_INGRESS_HTTP_PORT" ] || [ -n "$K3S_INGRESS_HTTPS_PORT" ] || [ -n "$K3S_GIT_SSH_PORT" ]; then
+    log_info "Ingress port plan: http=$K3S_INGRESS_HTTP_PORT https=$K3S_INGRESS_HTTPS_PORT git-ssh=$K3S_GIT_SSH_PORT"
 fi
 
 LOCK_HELD=0
@@ -130,6 +136,100 @@ EOF
         mv "$desired_config" /etc/rancher/k3s/config.yaml
     else
         rm -f "$desired_config"
+    fi
+}
+
+ensure_traefik_config() {
+    if [ "$ENABLE_TRAEFIK" != "1" ]; then
+        return 0
+    fi
+    if [ -z "$K3S_INGRESS_HTTP_PORT" ] || [ -z "$K3S_INGRESS_HTTPS_PORT" ]; then
+        return 0
+    fi
+
+    mkdir -p /var/lib/rancher/k3s/server/manifests
+    desired_config=$(mktemp)
+    cat <<EOF > "$desired_config"
+apiVersion: helm.cattle.io/v1
+kind: HelmChartConfig
+metadata:
+  name: traefik
+  namespace: kube-system
+spec:
+  valuesContent: |-
+    ports:
+      web:
+        expose:
+          default: true
+        exposedPort: $K3S_INGRESS_HTTP_PORT
+      websecure:
+        expose:
+          default: true
+        exposedPort: $K3S_INGRESS_HTTPS_PORT
+        tls:
+          enabled: true
+    additionalArguments:
+      - --entryPoints.web.http.redirections.entryPoint.to=websecure
+      - --entryPoints.web.http.redirections.entryPoint.scheme=https
+      - --entryPoints.web.http.redirections.entryPoint.permanent=true
+EOF
+
+    if [ ! -f /var/lib/rancher/k3s/server/manifests/traefik-config.yaml ] || ! cmp -s "$desired_config" /var/lib/rancher/k3s/server/manifests/traefik-config.yaml; then
+        log_info "Writing Traefik HelmChartConfig with http=$K3S_INGRESS_HTTP_PORT https=$K3S_INGRESS_HTTPS_PORT"
+        mv "$desired_config" /var/lib/rancher/k3s/server/manifests/traefik-config.yaml
+    else
+        rm -f "$desired_config"
+    fi
+}
+
+write_traefik_loopback_forwarder() {
+    listen_port="$1"
+    target_port="$2"
+    wrapper="/usr/local/bin/traefik-loopback-$listen_port.sh"
+    cat <<EOF > "$wrapper"
+#!/bin/sh
+set -eu
+endpoint_ip=\$(KUBECONFIG=/etc/rancher/k3s/k3s.yaml /usr/local/bin/k3s kubectl get endpoints -n kube-system traefik -o jsonpath='{.subsets[0].addresses[0].ip}' 2>/dev/null || true)
+if [ -z "\$endpoint_ip" ]; then
+    exit 1
+fi
+exec nc "\$endpoint_ip" $target_port
+EOF
+    chmod 0755 "$wrapper"
+    echo "$wrapper"
+}
+
+start_traefik_loopback_listener() {
+    listen_port="$1"
+    target_port="$2"
+
+    if [ -z "$listen_port" ]; then
+        return 0
+    fi
+
+    wrapper=$(write_traefik_loopback_forwarder "$listen_port" "$target_port")
+    log_file="/var/log/traefik-loopback-$listen_port.log"
+    cmd="nc -lk -s 127.0.0.1 -p $listen_port -e $wrapper"
+
+    if pgrep -f "$cmd" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    pkill -f "nc -lk -s 127.0.0.1 -p $listen_port " 2>/dev/null || true
+    nohup sh -c "exec $cmd" >> "$log_file" 2>&1 &
+}
+
+ensure_traefik_loopback_proxy() {
+    if [ "$ENABLE_TRAEFIK" != "1" ]; then
+        return 0
+    fi
+
+    mkdir -p /var/log
+    if [ -n "$K3S_INGRESS_HTTP_PORT" ]; then
+        start_traefik_loopback_listener "$K3S_INGRESS_HTTP_PORT" 8000
+    fi
+    if [ -n "$K3S_INGRESS_HTTPS_PORT" ]; then
+        start_traefik_loopback_listener "$K3S_INGRESS_HTTPS_PORT" 8443
     fi
 }
 
@@ -276,6 +376,8 @@ run_k3s_server_supervised() {
 if [ "$ROLE" = "server" ]; then
     acquire_lock_or_exit
     ensure_server_config
+    ensure_traefik_config
+    ensure_traefik_loopback_proxy
     rewrite_internal_server_kubeconfigs
     sync_kubeconfig || true
 

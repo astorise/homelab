@@ -270,6 +270,7 @@ impl TcpRouteConfig {
     fn resolve_target_hosts(&self, shared: &Shared) -> Vec<String> {
         match self.target_kind {
             TcpTargetKindConfig::Wsl => select_wsl_target_hosts(
+                self.server_name.as_deref(),
                 self.listen_port,
                 self.target_port,
                 &shared.cfg.lock(),
@@ -290,6 +291,7 @@ impl TcpRouteConfig {
 }
 
 fn select_wsl_target_hosts(
+    server_name: Option<&str>,
     listen_port: u16,
     target_port: u16,
     cfg: &HttpConfig,
@@ -298,6 +300,13 @@ fn select_wsl_target_hosts(
     let mut hosts = Vec::new();
     if listen_port != target_port {
         hosts.push(Ipv4Addr::LOCALHOST.to_string());
+    }
+    if let Some(instance) = wsl_instance_name_from_host(server_name) {
+        if let Some(ip) = resolve_wsl_ipv4_for_instance(&instance) {
+            if !hosts.iter().any(|host| host == &ip) {
+                hosts.push(ip);
+            }
+        }
     }
     let resolved = wsl_ip(cfg, cache);
     if !hosts.iter().any(|host| host == &resolved) {
@@ -420,31 +429,70 @@ fn parse_first_ipv4_token(output: &[u8]) -> Option<String> {
         .find_map(|token| {
             let candidate = token.split('/').next().unwrap_or(token);
             let ip = candidate.parse::<Ipv4Addr>().ok()?;
-            if ip.is_loopback() || ip.is_unspecified() || ip.is_link_local() {
+            if !is_usable_ipv4(ip) {
                 return None;
             }
             Some(ip.to_string())
         })
 }
 
-fn resolve_wsl_ipv4() -> Option<String> {
-    // BusyBox images do not support `hostname -I`, so prefer parsing `ip -4`.
-    let probes = ["ip -4 -o addr show", "hostname -I", "hostname -i"];
-    for probe in probes {
-        let out = match std::process::Command::new("wsl.exe")
-            .args(["-e", "sh", "-lc", probe])
-            .output()
-        {
-            Ok(output) => output,
-            Err(_) => continue,
-        };
-        if out.status.success() {
-            if let Some(ip) = parse_first_ipv4_token(&out.stdout) {
-                return Some(ip);
-            }
+fn is_usable_ipv4(ip: Ipv4Addr) -> bool {
+    !(ip.is_loopback() || ip.is_unspecified() || ip.is_link_local())
+}
+
+fn parse_src_ipv4_token(output: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(output);
+    let mut tokens = text.split_whitespace();
+    while let Some(token) = tokens.next() {
+        if token != "src" {
+            continue;
         }
+        let candidate = tokens.next()?;
+        let ip = candidate.parse::<Ipv4Addr>().ok()?;
+        if !is_usable_ipv4(ip) {
+            return None;
+        }
+        return Some(ip.to_string());
     }
     None
+}
+
+fn resolve_wsl_ipv4_with_args(args: &[&str]) -> Option<String> {
+    let out = std::process::Command::new("wsl.exe")
+        .args(args)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_src_ipv4_token(&out.stdout).or_else(|| parse_first_ipv4_token(&out.stdout))
+}
+
+fn resolve_wsl_ipv4_for_instance(instance: &str) -> Option<String> {
+    resolve_wsl_ipv4_with_args(&["-d", instance, "--", "sh", "-lc", "ip route get 1"])
+}
+
+fn resolve_wsl_ipv4() -> Option<String> {
+    // BusyBox images do not support `hostname -I`, so prefer the route source IP.
+    let probes = [
+        vec!["-e", "sh", "-lc", "ip route get 1"],
+        vec!["-e", "sh", "-lc", "ip -4 -o addr show"],
+        vec!["-e", "sh", "-lc", "hostname -I"],
+        vec!["-e", "sh", "-lc", "hostname -i"],
+    ];
+    probes
+        .iter()
+        .find_map(|probe| resolve_wsl_ipv4_with_args(probe))
+}
+
+fn wsl_instance_name_from_host(host: Option<&str>) -> Option<String> {
+    host?
+        .trim()
+        .trim_end_matches('.')
+        .to_ascii_lowercase()
+        .strip_suffix(".wsl")
+        .and_then(|value| (!value.is_empty()).then_some(value))
+        .map(|value| value.to_string())
 }
 
 fn wsl_ip(cfg: &HttpConfig, cache: &Arc<Mutex<(u64, Option<String>)>>) -> String {
@@ -1038,7 +1086,7 @@ async fn handle_tls_conn(inb: &mut TcpStream, _peer: SocketAddr, shared: Shared)
         .context("no route for host")?;
     let cfg = shared.cfg.lock().clone();
     let (mut outb, _) = connect_target_hosts(
-        select_wsl_target_hosts(cfg.https, port, &cfg, &shared.cache),
+        select_wsl_target_hosts(Some(&host), cfg.https, port, &cfg, &shared.cache),
         port,
     )
     .await?;
