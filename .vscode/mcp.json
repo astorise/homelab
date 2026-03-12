@@ -1,0 +1,8 @@
+{
+  "servers": {
+    "homeLab": {
+      "type": "stdio",
+      "command": "${env:ProgramFiles}\\home-lab\\home-lab-mcp.exe"
+    }
+  }
+}
