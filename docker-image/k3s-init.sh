@@ -83,10 +83,11 @@ acquire_lock_or_exit() {
 }
 
 detect_node_ip() {
-    # Prefer the primary WSL interface and always ignore loopback/link-local.
-    line=$(ip -4 addr show dev eth0 2>/dev/null | grep 'inet ' | head -n1 || true)
-    if [ -n "$line" ]; then
-        candidate=$(echo "$line" | tr -s ' ' | cut -d' ' -f3 | cut -d/ -f1)
+    # Prefer the source IP of the default route so mirrored networking keeps
+    # the real adapter address instead of the WSL loopback helper address.
+    route_line=$(ip -4 route get 1.1.1.1 2>/dev/null | head -n1 || true)
+    if [ -n "$route_line" ]; then
+        candidate=$(printf '%s\n' "$route_line" | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -n1)
         case "$candidate" in
             127.*|169.254.*|'')
                 ;;
@@ -97,21 +98,15 @@ detect_node_ip() {
         esac
     fi
 
-    ip -4 addr show 2>/dev/null \
-        | grep 'inet ' \
-        | tr -s ' ' \
-        | cut -d' ' -f3 \
-        | cut -d/ -f1 \
-        | while IFS= read -r candidate; do
-            case "$candidate" in
-                127.*|169.254.*|'')
-                    ;;
-                *)
-                    echo "$candidate"
-                    break
-                    ;;
-            esac
-        done
+    ip -4 -o addr show 2>/dev/null \
+        | awk '$2 != "lo" {
+            split($4, parts, "/");
+            ip = parts[1];
+            if (ip !~ /^127\./ && ip !~ /^169\.254\./) {
+                print ip;
+                exit;
+            }
+        }'
 }
 
 ensure_server_config() {

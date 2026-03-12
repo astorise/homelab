@@ -267,19 +267,20 @@ impl TcpRouteConfig {
         SocketAddr::new(self.listen_scope.bind_ip(), self.listen_port)
     }
 
-    fn resolve_target_host(&self, shared: &Shared) -> String {
+    fn resolve_target_hosts(&self, shared: &Shared) -> Vec<String> {
         match self.target_kind {
-            TcpTargetKindConfig::Wsl => select_wsl_target_host(
+            TcpTargetKindConfig::Wsl => select_wsl_target_hosts(
                 self.listen_port,
                 self.target_port,
                 &shared.cfg.lock(),
                 &shared.cache,
             ),
-            TcpTargetKindConfig::Address => self
-                .target_host
-                .clone()
-                .filter(|value| !value.trim().is_empty())
-                .unwrap_or_else(|| Ipv4Addr::LOCALHOST.to_string()),
+            TcpTargetKindConfig::Address => vec![
+                self.target_host
+                    .clone()
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or_else(|| Ipv4Addr::LOCALHOST.to_string()),
+            ],
         }
     }
 
@@ -288,16 +289,33 @@ impl TcpRouteConfig {
     }
 }
 
-fn select_wsl_target_host(
+fn select_wsl_target_hosts(
     listen_port: u16,
     target_port: u16,
     cfg: &HttpConfig,
     cache: &Arc<Mutex<(u64, Option<String>)>>,
-) -> String {
+) -> Vec<String> {
+    let mut hosts = Vec::new();
     if listen_port != target_port {
-        return Ipv4Addr::LOCALHOST.to_string();
+        hosts.push(Ipv4Addr::LOCALHOST.to_string());
     }
-    wsl_ip(cfg, cache)
+    let resolved = wsl_ip(cfg, cache);
+    if !hosts.iter().any(|host| host == &resolved) {
+        hosts.push(resolved);
+    }
+    hosts
+}
+
+async fn connect_target_hosts(hosts: Vec<String>, port: u16) -> Result<(TcpStream, String)> {
+    let mut errors = Vec::new();
+    for host in hosts {
+        match TcpStream::connect((host.as_str(), port)).await {
+            Ok(stream) => return Ok((stream, host)),
+            Err(err) => errors.push(format!("{}:{} ({})", host, port, err)),
+        }
+    }
+
+    anyhow::bail!("connect tcp upstream failed: {}", errors.join(", "))
 }
 
 fn default_http_port() -> u16 {
@@ -515,16 +533,18 @@ async fn proxy_tcp_connection(
     route: TcpRouteConfig,
     shared: Shared,
 ) -> Result<()> {
-    let target_host = route.resolve_target_host(&shared);
-    let target = format!("{}:{}", target_host, route.target_port);
-    let mut outbound = TcpStream::connect((target_host.as_str(), route.target_port))
-        .await
-        .with_context(|| format!("connect tcp upstream {}", target))?;
+    let (mut outbound, target_host) =
+        connect_target_hosts(route.resolve_target_hosts(&shared), route.target_port).await?;
     inbound.set_nodelay(true)?;
     outbound.set_nodelay(true)?;
     let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound)
         .await
-        .with_context(|| format!("tcp proxy copy for route {}", route.name))?;
+        .with_context(|| {
+            format!(
+                "tcp proxy copy for route {} via {}:{}",
+                route.name, target_host, route.target_port
+            )
+        })?;
     Ok(())
 }
 
@@ -1017,8 +1037,11 @@ async fn handle_tls_conn(inb: &mut TcpStream, _peer: SocketAddr, shared: Shared)
         .copied()
         .context("no route for host")?;
     let cfg = shared.cfg.lock().clone();
-    let target_host = select_wsl_target_host(cfg.https, port, &cfg, &shared.cache);
-    let mut outb = TcpStream::connect((target_host.as_str(), port)).await?;
+    let (mut outb, _) = connect_target_hosts(
+        select_wsl_target_hosts(cfg.https, port, &cfg, &shared.cache),
+        port,
+    )
+    .await?;
     outb.set_nodelay(true)?;
     let (mut ri, mut wi) = inb.split();
     let (mut ro, mut wo) = outb.split();
