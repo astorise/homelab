@@ -10,13 +10,13 @@ use tracing_subscriber::{fmt, EnvFilter};
 
 #[cfg(all(debug_assertions, target_os = "windows"))]
 mod dev_services;
-mod dns;
-mod http;
+pub mod dns;
+pub mod http;
 mod icons;
 mod menu;
-mod oidc;
+pub mod oidc;
 mod ui;
-mod wsl;
+pub mod wsl;
 
 static mut LOG_GUARD: Option<WorkerGuard> = None;
 const BUILD_GIT_SHA: &str = env!("BUILD_GIT_SHA");
