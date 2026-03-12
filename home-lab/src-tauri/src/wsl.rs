@@ -286,6 +286,13 @@ const KUBECTL_APPLY_FIELD_MANAGER: &str = "home-lab-tauri";
 const HOME_LAB_WSL_INSTANCE_PREFIX: &str = "home-lab-k3s";
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
+#[derive(Clone, Debug)]
+struct WslExecutionPaths {
+    resource_root: PathBuf,
+    install_root: PathBuf,
+    cache_root: PathBuf,
+}
+
 fn env_or_default_u16(var: &str, default: u16) -> u16 {
     match std::env::var(var) {
         Ok(value) => value
@@ -1239,6 +1246,90 @@ fn resolve_install_dir(app: &AppHandle) -> Result<PathBuf> {
         .context("Impossible de déterminer le dossier d'installation WSL")
 }
 
+fn default_home_lab_data_root() -> PathBuf {
+    if let Some(pd) = std::env::var_os("PROGRAMDATA") {
+        return PathBuf::from(pd).join("home-lab");
+    }
+
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        return PathBuf::from(local).join("home-lab");
+    }
+
+    std::env::temp_dir().join("home-lab")
+}
+
+fn default_home_lab_cache_root() -> PathBuf {
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        return PathBuf::from(local).join("home-lab").join("cache");
+    }
+
+    default_home_lab_data_root().join("cache")
+}
+
+fn resolve_wsl_resource_root(app: Option<&AppHandle>) -> Result<PathBuf> {
+    let mut candidates = Vec::new();
+
+    if let Some(app) = app {
+        if let Ok(resource_dir) = app.path().resource_dir() {
+            candidates.push(resource_dir.join("wsl"));
+            candidates.push(resource_dir.join("resources").join("wsl"));
+        }
+    }
+
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(bin_dir) = exe_path.parent() {
+            candidates.push(bin_dir.join("wsl"));
+            candidates.push(bin_dir.join("resources").join("wsl"));
+
+            if let Some(install_dir) = bin_dir.parent() {
+                candidates.push(install_dir.join("wsl"));
+                candidates.push(install_dir.join("resources").join("wsl"));
+            }
+        }
+    }
+
+    candidates.push(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("resources")
+            .join("wsl"),
+    );
+
+    for candidate in &candidates {
+        if candidate.join("setup-wsl.ps1").exists() && candidate.join("wsl-rootfs.tar").exists() {
+            return Ok(candidate.clone());
+        }
+    }
+
+    let searched = candidates
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(anyhow!(
+        "Impossible de trouver les ressources WSL (setup-wsl.ps1 et wsl-rootfs.tar). Dossiers testes: {searched}"
+    ))
+}
+
+fn wsl_execution_paths_from_app(app: &AppHandle) -> Result<WslExecutionPaths> {
+    let cache_root = app
+        .path()
+        .app_cache_dir()
+        .unwrap_or_else(|_| default_home_lab_cache_root());
+    Ok(WslExecutionPaths {
+        resource_root: resolve_wsl_resource_root(Some(app))?,
+        install_root: resolve_install_dir(app)?,
+        cache_root,
+    })
+}
+
+fn wsl_execution_paths_headless() -> Result<WslExecutionPaths> {
+    Ok(WslExecutionPaths {
+        resource_root: resolve_wsl_resource_root(None)?,
+        install_root: default_home_lab_data_root().join("wsl"),
+        cache_root: default_home_lab_cache_root(),
+    })
+}
+
 fn cluster_config_root() -> PathBuf {
     std::env::var_os("PROGRAMDATA")
         .map(PathBuf::from)
@@ -2068,9 +2159,8 @@ async fn configure_k3s_oidc_client(instance: &str) -> Result<String> {
     ))
 }
 
-#[tauri::command]
-pub async fn wsl_import_instance(
-    app: AppHandle,
+async fn wsl_import_instance_with_paths(
+    paths: WslExecutionPaths,
     force: Option<bool>,
     name: Option<String>,
 ) -> Result<ProvisionResult, String> {
@@ -2081,7 +2171,7 @@ pub async fn wsl_import_instance(
         e.to_string()
     })?;
     let sanitized_debug = escape_for_log(&sanitized_name);
-    let handle = app.clone();
+    let setup_paths = paths.clone();
     let instance_name = sanitized_name.clone();
 
     log_wsl_event(format!(
@@ -2097,7 +2187,7 @@ pub async fn wsl_import_instance(
     );
 
     let setup_result = tauri::async_runtime::spawn_blocking(move || {
-        run_wsl_setup(&handle, force_import, &instance_name)
+        run_wsl_setup_with_paths(&setup_paths, force_import, &instance_name)
     })
     .await
     .map_err(|e| {
@@ -2189,7 +2279,7 @@ pub async fn wsl_import_instance(
     }
 
     if allow_post_config {
-        match download_and_install_k3s(&app, &sanitized_name).await {
+        match download_and_install_k3s_with_paths(&paths, &sanitized_name).await {
             Ok(extra) => {
                 append_provision_message(&mut provision.message, &extra);
                 log_wsl_event(format!(
@@ -2328,17 +2418,36 @@ pub async fn wsl_import_instance(
     Ok(provision)
 }
 
-fn run_wsl_setup(
-    app: &AppHandle,
+#[tauri::command]
+pub async fn wsl_import_instance(
+    app: AppHandle,
+    force: Option<bool>,
+    name: Option<String>,
+) -> Result<ProvisionResult, String> {
+    let paths = wsl_execution_paths_from_app(&app).map_err(|e| {
+        error!(target: "wsl", error = %e, "Impossible de determiner les chemins WSL");
+        e.to_string()
+    })?;
+    wsl_import_instance_with_paths(paths, force, name).await
+}
+
+pub async fn wsl_import_instance_headless(
+    force: Option<bool>,
+    name: Option<String>,
+) -> Result<ProvisionResult, String> {
+    let paths = wsl_execution_paths_headless().map_err(|e| {
+        error!(target: "wsl", error = %e, "Impossible de determiner les chemins WSL headless");
+        e.to_string()
+    })?;
+    wsl_import_instance_with_paths(paths, force, name).await
+}
+
+fn run_wsl_setup_with_paths(
+    paths: &WslExecutionPaths,
     force_import: bool,
     instance_name: &str,
 ) -> Result<ProvisionResult> {
-    let resource_dir = app
-        .path()
-        .resource_dir()
-        .context("Impossible de recuperer le dossier des ressources")?;
-    let wsl_dir = resource_dir.join("wsl");
-    let script_path = wsl_dir.join("setup-wsl.ps1");
+    let script_path = paths.resource_root.join("setup-wsl.ps1");
     if !script_path.exists() {
         return Err(anyhow!(
             "Script setup-wsl.ps1 introuvable dans {:?}",
@@ -2346,12 +2455,12 @@ fn run_wsl_setup(
         ));
     }
 
-    let rootfs_path = wsl_dir.join("wsl-rootfs.tar");
+    let rootfs_path = paths.resource_root.join("wsl-rootfs.tar");
     if !rootfs_path.exists() {
         return Err(anyhow!("Archive rootfs introuvable dans {:?}", rootfs_path));
     }
 
-    let install_dir = (resolve_install_dir(app)?).join(instance_name);
+    let install_dir = paths.install_root.join(instance_name);
     let instance_debug = escape_for_log(instance_name);
     let plan = instance_port_plan(instance_name);
     let api_port = plan.api_backend_port;
@@ -6991,7 +7100,10 @@ struct GitHubRelease {
     assets: Vec<GitHubReleaseAsset>,
 }
 
-async fn download_and_install_k3s(app: &AppHandle, instance_name: &str) -> Result<String> {
+async fn download_and_install_k3s_with_paths(
+    paths: &WslExecutionPaths,
+    instance_name: &str,
+) -> Result<String> {
     let client = reqwest::Client::new();
     let release_url = "https://api.github.com/repos/k3s-io/k3s/releases/latest";
     let sanitized_instance = escape_for_log(instance_name);
@@ -7022,11 +7134,7 @@ async fn download_and_install_k3s(app: &AppHandle, instance_name: &str) -> Resul
             asset_name, release.tag_name
         ))?;
 
-    let cache_dir = app
-        .path()
-        .app_cache_dir()
-        .context("Impossible de trouver le dossier de cache de l'application")?;
-    let k3s_cache_dir = cache_dir.join("k3s");
+    let k3s_cache_dir = paths.cache_root.join("k3s");
     fs::create_dir_all(&k3s_cache_dir)
         .context("Impossible de créer le dossier de cache pour K3S")?;
 
