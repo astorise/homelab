@@ -227,7 +227,8 @@ const ENV_DNS_TARGET: &str = "HOME_LAB_WSL_DNS_TARGET";
 const DEFAULT_DNS_TTL: u32 = 60;
 const ENV_DNS_TTL: &str = "HOME_LAB_WSL_DNS_TTL";
 const DEFAULT_HTTP_PORT_BASE: u16 = 2001;
-const DEFAULT_HTTP_PORT_STEP: u16 = 1;
+// Ingress backends use an adjacent HTTP/HTTPS pair, so blocks must not overlap.
+const DEFAULT_HTTP_PORT_STEP: u16 = 2;
 const DEFAULT_HTTP_PORT_MAX: u16 = 60000;
 const ENV_HTTP_PORT_BASE: &str = "HOME_LAB_WSL_HTTP_PORT_BASE";
 const ENV_HTTP_PORT_STEP: &str = "HOME_LAB_WSL_HTTP_PORT_STEP";
@@ -239,7 +240,8 @@ const ENV_HTTPS_INBOUND: &str = "HOME_LAB_WSL_HTTPS_INBOUND";
 const DEFAULT_API_PORT: u16 = 6443;
 const ENV_API_PORT: &str = "HOME_LAB_WSL_K3S_API_PORT";
 const DEFAULT_API_PORT_BASE: u16 = 1001;
-const DEFAULT_API_PORT_STEP: u16 = 1;
+// k3s uses an adjacent supervisor listener, so consecutive API ports collide.
+const DEFAULT_API_PORT_STEP: u16 = 2;
 const DEFAULT_API_PORT_MAX: u16 = 60000;
 const ENV_API_PORT_BASE: &str = "HOME_LAB_WSL_K3S_API_PORT_BASE";
 const ENV_API_PORT_STEP: &str = "HOME_LAB_WSL_K3S_API_PORT_STEP";
@@ -445,12 +447,13 @@ fn dns_record_ttl() -> u32 {
 }
 
 fn http_port_base() -> u16 {
-    env_or_default_u16(ENV_HTTP_PORT_BASE, DEFAULT_HTTP_PORT_BASE)
+    // The configured base is the HTTPS backend port; the paired HTTP port uses base - 1.
+    env_or_default_u16(ENV_HTTP_PORT_BASE, DEFAULT_HTTP_PORT_BASE).max(2)
 }
 
 fn http_port_step() -> u16 {
     let step = env_or_default_u16(ENV_HTTP_PORT_STEP, DEFAULT_HTTP_PORT_STEP);
-    if step == 0 {
+    if step < 2 {
         DEFAULT_HTTP_PORT_STEP
     } else {
         step
@@ -489,7 +492,7 @@ fn k3s_api_port_base() -> u16 {
 
 fn k3s_api_port_step() -> u16 {
     let step = env_or_default_u16(ENV_API_PORT_STEP, DEFAULT_API_PORT_STEP);
-    if step == 0 {
+    if step < 2 {
         DEFAULT_API_PORT_STEP
     } else {
         step
@@ -548,19 +551,6 @@ fn deterministic_port_for_instance(instance: &str, base: u16, step: u16, max: u1
     u16::try_from(computed).unwrap_or(base)
 }
 
-fn k3s_api_port_for_instance(instance: &str) -> u16 {
-    if std::env::var(ENV_API_PORT).is_ok() {
-        return env_or_default_u16(ENV_API_PORT, DEFAULT_API_PORT);
-    }
-
-    deterministic_port_for_instance(
-        instance,
-        k3s_api_port_base(),
-        k3s_api_port_step(),
-        k3s_api_port_max(),
-    )
-}
-
 fn public_k3s_api_port() -> u16 {
     env_or_default_u16(ENV_API_INBOUND_PORT, DEFAULT_API_INBOUND_PORT)
 }
@@ -583,43 +573,7 @@ fn k3s_nodeport_max() -> u16 {
     max.max(k3s_nodeport_base())
 }
 
-fn k3s_nodeport_range_for_instance(instance: &str) -> (u16, u16) {
-    let base = deterministic_port_for_instance(
-        instance,
-        k3s_nodeport_base(),
-        k3s_nodeport_step(),
-        k3s_nodeport_max(),
-    );
-    let range_end = base.saturating_add(DEFAULT_K3S_NODEPORT_SPAN);
-    (base, range_end)
-}
-
-fn https_backend_port_for_instance(instance: &str) -> u16 {
-    deterministic_port_for_instance(instance, http_port_base(), http_port_step(), http_port_max())
-}
-
-fn ssh_port_for_instance(instance: &str) -> u16 {
-    deterministic_port_for_instance(
-        instance,
-        env_or_default_u16(ENV_SSH_PORT_BASE, DEFAULT_SSH_PORT_BASE),
-        env_or_default_u16(ENV_SSH_PORT_STEP, DEFAULT_SSH_PORT_STEP).max(1),
-        env_or_default_u16(ENV_SSH_PORT_MAX, DEFAULT_SSH_PORT_MAX),
-    )
-}
-
-fn containerd_stream_port_for_instance(instance: &str) -> Result<u16> {
-    let capacity = u32::from(u16::MAX) - u32::from(DEFAULT_CONTAINERD_STREAM_PORT_BASE) + 1;
-    let slot = bounded_instance_slot(instance, capacity);
-    let port = u32::from(DEFAULT_CONTAINERD_STREAM_PORT_BASE) + slot;
-    u16::try_from(port).map_err(|_| {
-        anyhow!(
-            "Port stream containerd invalide ({port}) pour l'instance '{}'.",
-            instance
-        )
-    })
-}
-
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct K3sLocalPortLayout {
     lb_server_port: u16,
     kubelet_port: u16,
@@ -629,7 +583,28 @@ struct K3sLocalPortLayout {
     kube_scheduler_secure_port: u16,
 }
 
-fn k3s_local_port_layout_for_instance(instance: &str) -> Result<K3sLocalPortLayout> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PortRange {
+    start: u16,
+    end: u16,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct InstancePortPlan {
+    inbound_http: u16,
+    inbound_https: u16,
+    api_public_port: u16,
+    api_backend_port: u16,
+    api_reserved_ports: PortRange,
+    ingress_http_backend_port: u16,
+    ingress_https_backend_port: u16,
+    ssh_public_port: u16,
+    nodeport_range: PortRange,
+    containerd_stream_port: u16,
+    k3s_local: K3sLocalPortLayout,
+}
+
+fn k3s_local_port_layout_for_instance(instance: &str) -> K3sLocalPortLayout {
     let base = u32::from(DEFAULT_K3S_LOCAL_PORT_BASE);
     let step = u32::from(DEFAULT_K3S_LOCAL_PORT_STEP);
     let max_offset = 7u32;
@@ -637,24 +612,75 @@ fn k3s_local_port_layout_for_instance(instance: &str) -> Result<K3sLocalPortLayo
     let slot = bounded_instance_slot(instance, capacity);
     let block_base = base + slot * step;
 
-    let port_at = |offset: u32| -> Result<u16> {
-        u16::try_from(block_base + offset).map_err(|_| {
-            anyhow!(
-                "Port local k3s invalide ({}) pour l'instance '{}'.",
-                block_base + offset,
-                instance
-            )
-        })
+    let port_at = |offset: u32| -> u16 {
+        u16::try_from(block_base + offset).unwrap_or(DEFAULT_K3S_LOCAL_PORT_BASE)
     };
 
-    Ok(K3sLocalPortLayout {
-        lb_server_port: port_at(0)?,
-        kubelet_port: port_at(1)?,
-        kubelet_healthz_port: port_at(2)?,
-        kube_controller_manager_secure_port: port_at(5)?,
-        kube_cloud_controller_manager_secure_port: port_at(6)?,
-        kube_scheduler_secure_port: port_at(7)?,
-    })
+    K3sLocalPortLayout {
+        lb_server_port: port_at(0),
+        kubelet_port: port_at(1),
+        kubelet_healthz_port: port_at(2),
+        kube_controller_manager_secure_port: port_at(5),
+        kube_cloud_controller_manager_secure_port: port_at(6),
+        kube_scheduler_secure_port: port_at(7),
+    }
+}
+
+fn containerd_stream_port_for_instance(instance: &str) -> u16 {
+    let capacity = u32::from(u16::MAX) - u32::from(DEFAULT_CONTAINERD_STREAM_PORT_BASE) + 1;
+    let slot = bounded_instance_slot(instance, capacity);
+    let port = u32::from(DEFAULT_CONTAINERD_STREAM_PORT_BASE) + slot;
+    u16::try_from(port).unwrap_or(DEFAULT_CONTAINERD_STREAM_PORT_BASE)
+}
+
+fn instance_port_plan(instance: &str) -> InstancePortPlan {
+    let api_backend_port = if std::env::var(ENV_API_PORT).is_ok() {
+        env_or_default_u16(ENV_API_PORT, DEFAULT_API_PORT)
+    } else {
+        deterministic_port_for_instance(
+            instance,
+            k3s_api_port_base(),
+            k3s_api_port_step(),
+            k3s_api_port_max(),
+        )
+    };
+    let ingress_https_backend_port =
+        deterministic_port_for_instance(instance, http_port_base(), http_port_step(), http_port_max());
+    let nodeport_start = deterministic_port_for_instance(
+        instance,
+        k3s_nodeport_base(),
+        k3s_nodeport_step(),
+        k3s_nodeport_max(),
+    );
+
+    InstancePortPlan {
+        inbound_http: inbound_http_port(),
+        inbound_https: inbound_https_port(),
+        api_public_port: public_k3s_api_port(),
+        api_backend_port,
+        api_reserved_ports: PortRange {
+            start: api_backend_port,
+            end: api_backend_port.saturating_add(1),
+        },
+        ingress_http_backend_port: ingress_https_backend_port.saturating_sub(1),
+        ingress_https_backend_port,
+        ssh_public_port: deterministic_port_for_instance(
+            instance,
+            env_or_default_u16(ENV_SSH_PORT_BASE, DEFAULT_SSH_PORT_BASE),
+            env_or_default_u16(ENV_SSH_PORT_STEP, DEFAULT_SSH_PORT_STEP).max(1),
+            env_or_default_u16(ENV_SSH_PORT_MAX, DEFAULT_SSH_PORT_MAX),
+        ),
+        nodeport_range: PortRange {
+            start: nodeport_start,
+            end: nodeport_start.saturating_add(DEFAULT_K3S_NODEPORT_SPAN),
+        },
+        containerd_stream_port: containerd_stream_port_for_instance(instance),
+        k3s_local: k3s_local_port_layout_for_instance(instance),
+    }
+}
+
+fn k3s_api_port_for_instance(instance: &str) -> u16 {
+    instance_port_plan(instance).api_backend_port
 }
 
 async fn configure_cluster_networking(instance: &str) -> Result<String> {
@@ -663,7 +689,8 @@ async fn configure_cluster_networking(instance: &str) -> Result<String> {
         anyhow::bail!("Aucun nom de domaine valide pour l'instance {instance}");
     }
 
-    let https_backend_port = https_backend_port_for_instance(instance);
+    let plan = instance_port_plan(instance);
+    let https_backend_port = plan.ingress_https_backend_port;
 
     let mut applied_hosts = Vec::new();
     for host in &hosts {
@@ -685,8 +712,8 @@ async fn configure_cluster_networking(instance: &str) -> Result<String> {
         .map_err(|e| anyhow!("dns_add_record({host}): {e}"))?;
     }
 
-    let api_public_port = public_k3s_api_port();
-    let api_backend_port = k3s_api_port_for_instance(instance);
+    let api_public_port = plan.api_public_port;
+    let api_backend_port = plan.api_backend_port;
     let tcp_route_name = kube_api_proxy_route_name(instance);
     let api_scope = kube_api_proxy_scope();
     let api_server_name = primary_cluster_domain(instance)
@@ -705,7 +732,7 @@ async fn configure_cluster_networking(instance: &str) -> Result<String> {
     .await
     .map_err(|e| anyhow!("http_add_tcp_route({tcp_route_name}): {e}"))?;
 
-    let ssh_public_port = ssh_port_for_instance(instance);
+    let ssh_public_port = plan.ssh_public_port;
     let ssh_route_name = ssh_proxy_route_name(instance);
     retry_http_rpc("add_tcp_route", || {
         http::http_add_tcp_route(http::TcpRouteIn {
@@ -906,8 +933,6 @@ async fn attach_cluster_details(instances: &mut [WslInstance]) {
         return;
     }
 
-    let inbound_http = inbound_http_port();
-    let inbound_https = inbound_https_port();
     let http_routes = match http::http_list_routes().await {
         Ok(list) => Some(list.routes),
         Err(err) => {
@@ -945,6 +970,7 @@ async fn attach_cluster_details(instances: &mut [WslInstance]) {
     };
 
     for instance in instances.iter_mut() {
+        let plan = instance_port_plan(&instance.name);
         let domains = cluster_domains(&instance.name);
         if domains.is_empty() {
             instance.cluster = None;
@@ -1015,11 +1041,11 @@ async fn attach_cluster_details(instances: &mut [WslInstance]) {
         instance.cluster = Some(WslClusterStatus {
             domains,
             proxy: ClusterProxyInfo {
-                inbound_http,
-                inbound_https,
+                inbound_http: plan.inbound_http,
+                inbound_https: plan.inbound_https,
                 routes,
             },
-            api_port: public_k3s_api_port(),
+            api_port: plan.api_public_port,
             dns_records: dns_entries,
             oidc: oidc_info,
         });
@@ -1440,17 +1466,16 @@ fn run_wsl_shell_script_via_stdin(
 }
 
 fn render_k3s_env_file_for_instance(instance: &str) -> Result<String> {
-    let api_port = k3s_api_port_for_instance(instance);
-    let (nodeport_start, nodeport_end) = k3s_nodeport_range_for_instance(instance);
-    let stream_port = containerd_stream_port_for_instance(instance)?;
-    let local_ports = k3s_local_port_layout_for_instance(instance)?;
+    let plan = instance_port_plan(instance);
     let tls_sans = cluster_domains(instance).join(",");
-    let ingress_https_port = https_backend_port_for_instance(instance);
-    let ingress_http_port = ingress_https_port.saturating_sub(1);
-    let ssh_port = ssh_port_for_instance(instance);
+    let local_ports = plan.k3s_local;
 
     Ok(format!(
         "WSL_ROLE=server\nK3S_API_PORT={api_port}\nPORT_RANGE={nodeport_start}-{nodeport_end}\nCONTAINERD_STREAM_PORT={stream_port}\nK3S_LB_SERVER_PORT={lb_server_port}\nK3S_KUBELET_PORT={kubelet_port}\nK3S_KUBELET_HEALTHZ_PORT={kubelet_healthz_port}\nK3S_KUBE_CONTROLLER_MANAGER_SECURE_PORT={kube_controller_manager_secure_port}\nK3S_KUBE_CLOUD_CONTROLLER_MANAGER_SECURE_PORT={kube_cloud_controller_manager_secure_port}\nK3S_KUBE_SCHEDULER_SECURE_PORT={kube_scheduler_secure_port}\nK3S_INGRESS_HTTP_PORT={ingress_http_port}\nK3S_INGRESS_HTTPS_PORT={ingress_https_port}\nK3S_GIT_SSH_PORT={ssh_port}\nK3S_TLS_SANS={tls_sans}\n",
+        api_port = plan.api_backend_port,
+        nodeport_start = plan.nodeport_range.start,
+        nodeport_end = plan.nodeport_range.end,
+        stream_port = plan.containerd_stream_port,
         lb_server_port = local_ports.lb_server_port,
         kubelet_port = local_ports.kubelet_port,
         kubelet_healthz_port = local_ports.kubelet_healthz_port,
@@ -1458,14 +1483,19 @@ fn render_k3s_env_file_for_instance(instance: &str) -> Result<String> {
         kube_cloud_controller_manager_secure_port =
             local_ports.kube_cloud_controller_manager_secure_port,
         kube_scheduler_secure_port = local_ports.kube_scheduler_secure_port,
+        ingress_http_port = plan.ingress_http_backend_port,
+        ingress_https_port = plan.ingress_https_backend_port,
+        ssh_port = plan.ssh_public_port,
     ))
 }
 
 fn render_k3s_config_yaml_for_instance(instance: &str, node_ip_expression: &str) -> String {
-    let api_port = k3s_api_port_for_instance(instance);
-    let (nodeport_start, nodeport_end) = k3s_nodeport_range_for_instance(instance);
+    let plan = instance_port_plan(instance);
     let mut config = format!(
-        "write-kubeconfig-mode: \"0644\"\nnode-ip: {node_ip_expression}\nhttps-listen-port: {api_port}\nservice-node-port-range: {nodeport_start}-{nodeport_end}\n"
+        "write-kubeconfig-mode: \"0644\"\nnode-ip: {node_ip_expression}\nhttps-listen-port: {api_port}\nservice-node-port-range: {nodeport_start}-{nodeport_end}\n",
+        api_port = plan.api_backend_port,
+        nodeport_start = plan.nodeport_range.start,
+        nodeport_end = plan.nodeport_range.end
     );
     let domains = cluster_domains(instance);
     if !domains.is_empty() {
@@ -1844,14 +1874,15 @@ fn build_managed_kube_entry(instance: &str) -> Result<ManagedKubeEntry> {
         .or_else(|| view.users.first())
         .ok_or_else(|| anyhow!("Aucun utilisateur kubectl disponible"))?;
 
+    let plan = instance_port_plan(instance);
     let base_name = managed_kube_base_name(instance);
     let cluster_name = format!("{base_name}-cluster");
     let user_name = format!("{base_name}-user");
     let context_name = base_name;
     let api_port = if is_home_lab_wsl_instance(instance) {
-        public_k3s_api_port()
+        plan.api_public_port
     } else {
-        k3s_api_port_for_instance(instance)
+        plan.api_backend_port
     };
     let api_host = primary_cluster_domain(instance).unwrap_or_else(|| "127.0.0.1".to_string());
 
@@ -2328,8 +2359,9 @@ fn run_wsl_setup(
 
     let install_dir = (resolve_install_dir(app)?).join(instance_name);
     let instance_debug = escape_for_log(instance_name);
-    let api_port = k3s_api_port_for_instance(instance_name);
-    let (_, nodeport_range_end) = k3s_nodeport_range_for_instance(instance_name);
+    let plan = instance_port_plan(instance_name);
+    let api_port = plan.api_backend_port;
+    let nodeport_range_end = plan.nodeport_range.end;
 
     info!(
         target: "wsl",
@@ -3112,6 +3144,43 @@ fn kubectl_error_result(
         stdout: String::new(),
         stderr: message,
     }
+}
+
+fn format_error_chain(err: &anyhow::Error) -> String {
+    let mut parts = Vec::new();
+    for cause in err.chain() {
+        let rendered = cause.to_string();
+        let trimmed = rendered.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if parts.last().is_some_and(|previous: &String| previous == trimmed) {
+            continue;
+        }
+        parts.push(trimmed.to_string());
+    }
+
+    if parts.is_empty() {
+        "Erreur inconnue.".to_string()
+    } else {
+        parts.join(" | cause: ")
+    }
+}
+
+async fn format_kubernetes_runtime_error(instance: &str, err: &anyhow::Error) -> String {
+    let mut message = format_error_chain(err);
+
+    if is_home_lab_wsl_instance(instance) {
+        if let Some(hint) = collect_k3s_runtime_failure_hint(instance).await {
+            let hint = hint.trim();
+            if !hint.is_empty() && !message.contains(hint) {
+                message.push_str(" | Diagnostic runtime: ");
+                message.push_str(hint);
+            }
+        }
+    }
+
+    message
 }
 
 fn parse_kubectl_get_request(args: &[String]) -> Result<KubectlGetRequest> {
@@ -4474,7 +4543,7 @@ async fn ensure_home_lab_k3s_runtime_started(
         ));
     }
 
-    let api_port = k3s_api_port_for_instance(instance);
+    let api_port = instance_port_plan(instance).api_backend_port;
     let instance_owned = instance.to_string();
     let repair_flag = if allow_stale_repair { "1" } else { "0" };
     let script = format!(
@@ -4677,8 +4746,9 @@ async fn resolve_wsl_instance_ipv4(instance: &str) -> Result<String> {
 }
 
 async fn resolve_kube_api_port_for_instance(instance: &str, trace_id: &str) -> u16 {
+    let plan = instance_port_plan(instance);
     if !is_home_lab_wsl_instance(instance) {
-        let expected_port = k3s_api_port_for_instance(instance);
+        let expected_port = plan.api_backend_port;
         let instance_owned = instance.to_string();
         let script = "set -eu; if [ -f /etc/k3s-env ]; then line=$(grep '^K3S_API_PORT=' /etc/k3s-env | head -n1 || true); if [ -n \"$line\" ]; then port=${line#K3S_API_PORT=}; printf '%s\\n' \"$port\"; exit 0; fi; line=$(grep '^PORT_RANGE=' /etc/k3s-env | head -n1 || true); if [ -n \"$line\" ]; then range=${line#PORT_RANGE=}; port=${range%%-*}; printf '%s\\n' \"$port\"; exit 0; fi; fi; if [ -f /etc/rancher/k3s/k3s.yaml ]; then line=$(grep -E '^[[:space:]]*server:[[:space:]]*https?://' /etc/rancher/k3s/k3s.yaml | head -n1 || true); if [ -n \"$line\" ]; then port=$(printf '%s\\n' \"$line\" | sed -n 's#.*://[^:]*:\\([0-9][0-9]*\\).*#\\1#p' | head -n1); if [ -n \"$port\" ]; then printf '%s\\n' \"$port\"; exit 0; fi; fi; fi; exit 0";
         let detected = tauri::async_runtime::spawn_blocking(move || {
@@ -4713,7 +4783,7 @@ async fn resolve_kube_api_port_for_instance(instance: &str, trace_id: &str) -> u
         return api_port;
     }
 
-    let api_port = public_k3s_api_port();
+    let api_port = plan.api_public_port;
     info!(
         target: "wsl",
         trace_id = %trace_id,
@@ -4835,7 +4905,8 @@ async fn wait_for_kube_api_port(
     let mut attempt: u32 = 0;
     let mut last_error = String::new();
     let probe_targets = if is_home_lab_wsl_instance(instance) {
-        vec![("127.0.0.1".to_string(), k3s_api_port_for_instance(instance))]
+        let plan = instance_port_plan(instance);
+        vec![("127.0.0.1".to_string(), plan.api_backend_port)]
     } else {
         vec![(endpoint.host.clone(), endpoint.port)]
     };
@@ -6379,7 +6450,7 @@ async fn run_wsl_kubectl_exec(instance: &str, args: &[String]) -> Result<WslKube
     let api_endpoint = match prepare_outcome {
         Ok(Ok(endpoint)) => endpoint,
         Ok(Err(err)) => {
-            let message = err.to_string();
+            let message = format_kubernetes_runtime_error(instance, &err).await;
             warn!(
                 target: "wsl",
                 trace_id = %trace_id,
@@ -6498,7 +6569,7 @@ Verifie que '{}' peut demarrer et exposer l'API Kubernetes.",
             })
         }
         Ok(Ok(Err(err))) => {
-            let message = err.to_string();
+            let message = format_kubernetes_runtime_error(instance, &err).await;
             warn!(
                 target: "wsl",
                 trace_id = %trace_id,
@@ -6652,7 +6723,7 @@ async fn run_wsl_kubectl_apply_yaml(
     let api_endpoint = match prepare_outcome {
         Ok(Ok(endpoint)) => endpoint,
         Ok(Err(err)) => {
-            let message = err.to_string();
+            let message = format_kubernetes_runtime_error(instance, &err).await;
             warn!(
                 target: "wsl",
                 trace_id = %trace_id,
@@ -6764,7 +6835,7 @@ Verifie que '{}' peut demarrer et exposer l'API Kubernetes.",
             })
         }
         Ok(Ok(Err(err))) => {
-            let message = err.to_string();
+            let message = format_kubernetes_runtime_error(instance, &err).await;
             warn!(
                 target: "wsl",
                 trace_id = %trace_id,
@@ -7059,4 +7130,89 @@ async fn download_and_install_k3s(app: &AppHandle, instance_name: &str) -> Resul
     }
 
     Ok(format!("K3S {} installe avec succes.", release.tag_name))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn allocation_overrides_present() -> bool {
+        [
+            ENV_API_PORT,
+            ENV_API_PORT_BASE,
+            ENV_API_PORT_STEP,
+            ENV_API_PORT_MAX,
+            ENV_HTTP_PORT_BASE,
+            ENV_HTTP_PORT_STEP,
+            ENV_HTTP_PORT_MAX,
+            ENV_K3S_NODEPORT_BASE,
+            ENV_K3S_NODEPORT_STEP,
+            ENV_K3S_NODEPORT_MAX,
+            ENV_SSH_PORT_BASE,
+            ENV_SSH_PORT_STEP,
+            ENV_SSH_PORT_MAX,
+        ]
+        .iter()
+        .any(|var| std::env::var_os(var).is_some())
+    }
+
+    fn default_home_lab_plans() -> Option<(InstancePortPlan, InstancePortPlan)> {
+        if allocation_overrides_present() {
+            return None;
+        }
+
+        Some((
+            instance_port_plan(HOME_LAB_WSL_INSTANCE_PREFIX),
+            instance_port_plan("home-lab-k3s-2"),
+        ))
+    }
+
+    #[test]
+    fn api_blocks_do_not_overlap_between_instances() {
+        let Some((first, second)) = default_home_lab_plans() else {
+            return;
+        };
+
+        assert_eq!(first.api_reserved_ports.end, first.api_backend_port + 1);
+        assert_eq!(second.api_reserved_ports.end, second.api_backend_port + 1);
+        assert!(first.api_reserved_ports.end < second.api_reserved_ports.start);
+    }
+
+    #[test]
+    fn ingress_backend_pairs_do_not_overlap_between_instances() {
+        let Some((first, second)) = default_home_lab_plans() else {
+            return;
+        };
+
+        assert_eq!(
+            first.ingress_http_backend_port + 1,
+            first.ingress_https_backend_port
+        );
+        assert_eq!(
+            second.ingress_http_backend_port + 1,
+            second.ingress_https_backend_port
+        );
+
+        let first_ports = [
+            first.ingress_http_backend_port,
+            first.ingress_https_backend_port,
+        ];
+        let second_ports = [
+            second.ingress_http_backend_port,
+            second.ingress_https_backend_port,
+        ];
+
+        assert!(first_ports
+            .iter()
+            .all(|left| second_ports.iter().all(|right| left != right)));
+    }
+
+    #[test]
+    fn nodeport_ranges_do_not_overlap_between_instances() {
+        let Some((first, second)) = default_home_lab_plans() else {
+            return;
+        };
+
+        assert!(first.nodeport_range.end < second.nodeport_range.start);
+    }
 }
