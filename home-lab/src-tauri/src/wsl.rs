@@ -1580,10 +1580,10 @@ fn render_k3s_env_file_for_instance(instance: &str) -> Result<String> {
     ))
 }
 
-fn render_k3s_config_yaml_for_instance(instance: &str, node_ip_expression: &str) -> String {
+fn render_k3s_config_yaml_for_instance(instance: &str) -> String {
     let plan = instance_port_plan(instance);
     let mut config = format!(
-        "write-kubeconfig-mode: \"0644\"\nnode-ip: {node_ip_expression}\nhttps-listen-port: {api_port}\nservice-node-port-range: {nodeport_start}-{nodeport_end}\n",
+        "write-kubeconfig-mode: \"0644\"\nhttps-listen-port: {api_port}\nservice-node-port-range: {nodeport_start}-{nodeport_end}\n",
         api_port = plan.api_backend_port,
         nodeport_start = plan.nodeport_range.start,
         nodeport_end = plan.nodeport_range.end
@@ -1605,40 +1605,9 @@ fn repair_k3s_runtime_for_instance(instance: &str) -> Result<()> {
         .replace("\r\n", "\n")
         .replace('\r', "\n");
     let env_file = render_k3s_env_file_for_instance(instance)?;
-    let k3s_config_yaml = render_k3s_config_yaml_for_instance(instance, "$NODE_IP");
+    let k3s_config_yaml = render_k3s_config_yaml_for_instance(instance);
     let script = format!(
         r#"set -eu
-detect_node_ip() {{
-    route_line=$(ip -4 route get 1.1.1.1 2>/dev/null | head -n1 || true)
-    if [ -n "$route_line" ]; then
-        candidate=$(printf '%s\n' "$route_line" | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -n1)
-        case "$candidate" in
-            127.*|169.254.*|'')
-                ;;
-            *)
-                echo "$candidate"
-                return 0
-                ;;
-        esac
-    fi
-
-    ip -4 -o addr show 2>/dev/null \
-        | awk '$2 != "lo" {{
-            split($4, parts, "/");
-            ip = parts[1];
-            if (ip !~ /^127\./ && ip !~ /^169\.254\./) {{
-                print ip;
-                exit;
-            }}
-        }}'
-}}
-
-NODE_IP=$(detect_node_ip)
-if [ -z "$NODE_IP" ]; then
-    echo "Unable to determine a non-loopback IPv4 address for node-ip." >&2
-    exit 1
-fi
-
 mkdir -p /usr/local/bin /etc/rancher/k3s /var/lib/rancher/k3s/agent/etc/containerd /root/.kube
 cat > /usr/local/bin/k3s-init.sh <<'__HOME_LAB_K3S_INIT_EOF__'
 {k3s_init_script}
@@ -1691,7 +1660,7 @@ rm -f /etc/rancher/k3s/k3s.yaml /root/.kube/config || true
 
 fn bootstrap_k3s_for_instance_if_available(instance: &str) -> Result<()> {
     let script = format!(
-        "set -eu; if [ ! -x /usr/local/bin/k3s-init.sh ]; then exit 0; fi; BOOTSTRAP_ONLY=1 BOOTSTRAP_TIMEOUT={} sh /usr/local/bin/k3s-init.sh",
+        "set -eu; if [ ! -s /usr/local/bin/k3s-init.sh ]; then exit 0; fi; BOOTSTRAP_ONLY=1 BOOTSTRAP_TIMEOUT={} sh /usr/local/bin/k3s-init.sh",
         K3S_BOOTSTRAP_TIMEOUT_SECONDS
     );
     let command_line = format_cli_command("wsl.exe", &["-d", instance, "--", "sh", "-lc", &script]);
@@ -4651,7 +4620,7 @@ async fn ensure_home_lab_k3s_runtime_started(
     let repair_flag = if allow_stale_repair { "1" } else { "0" };
     let script = format!(
         r#"set -eu
-if [ ! -x /usr/local/bin/k3s-init.sh ]; then
+if [ ! -s /usr/local/bin/k3s-init.sh ]; then
     exit 0
 fi
 if [ -f /run/k3s-init.lock/pid ]; then
@@ -4807,47 +4776,6 @@ fn is_loopback_host(host: &str) -> bool {
         .unwrap_or(normalized == "::1")
 }
 
-async fn resolve_wsl_instance_ipv4(instance: &str) -> Result<String> {
-    let instance_owned = instance.to_string();
-    let output = tauri::async_runtime::spawn_blocking(move || {
-        Command::new("wsl.exe")
-            .args(["-d", &instance_owned, "--", "sh", "-lc", "ip route get 1"])
-            .output()
-    })
-    .await
-    .map_err(|e| anyhow!("Erreur JoinHandle lors de la resolution IP WSL: {e}"))?
-    .with_context(|| format!("Impossible de determiner l'IP WSL pour '{}'", instance))?;
-
-    let stdout = decode_cli_output(&output.stdout);
-    let stderr = decode_cli_output(&output.stderr);
-    if !output.status.success() {
-        let detail = if !stderr.trim().is_empty() {
-            stderr.trim().to_string()
-        } else if !stdout.trim().is_empty() {
-            stdout.trim().to_string()
-        } else {
-            format!(
-                "wsl.exe -d {} ip route get 1 a echoue ({})",
-                instance, output.status
-            )
-        };
-        anyhow::bail!("{detail}");
-    }
-
-    let re = Regex::new(r"src\s+([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)")
-        .context("Compilation regex IP WSL impossible")?;
-    let ip = re
-        .captures(stdout.trim())
-        .and_then(|captures| captures.get(1))
-        .map(|m| m.as_str().to_string())
-        .ok_or_else(|| anyhow!("IP WSL introuvable dans la sortie: {}", stdout.trim()))?;
-
-    if ip.parse::<Ipv4Addr>().is_err() {
-        anyhow::bail!("IP WSL invalide detectee: '{}'", ip);
-    }
-    Ok(ip)
-}
-
 async fn resolve_kube_api_port_for_instance(instance: &str, trace_id: &str) -> u16 {
     let plan = instance_port_plan(instance);
     if !is_home_lab_wsl_instance(instance) {
@@ -4923,24 +4851,12 @@ async fn resolve_kube_api_endpoint_for_instance(
             }
         }
 
-        let wsl_ip = resolve_wsl_instance_ipv4(instance).await?;
         if tcp_connect_once("127.0.0.1", api_port, Duration::from_millis(700))
             .await
             .is_ok()
         {
             return Ok(KubeApiEndpoint {
                 host: "127.0.0.1".to_string(),
-                port: api_port,
-                tls_server_name: None,
-            });
-        }
-
-        if tcp_connect_once(&wsl_ip, api_port, Duration::from_millis(700))
-            .await
-            .is_ok()
-        {
-            return Ok(KubeApiEndpoint {
-                host: wsl_ip,
                 port: api_port,
                 tls_server_name: None,
             });

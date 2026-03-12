@@ -112,46 +112,12 @@ acquire_lock_or_exit() {
     exit 1
 }
 
-detect_node_ip() {
-    # Prefer the source IP of the default route so mirrored networking keeps
-    # the real adapter address instead of the WSL loopback helper address.
-    route_line=$(ip -4 route get 1.1.1.1 2>/dev/null | head -n1 || true)
-    if [ -n "$route_line" ]; then
-        candidate=$(printf '%s\n' "$route_line" | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -n1)
-        case "$candidate" in
-            127.*|169.254.*|'')
-                ;;
-            *)
-                echo "$candidate"
-                return 0
-                ;;
-        esac
-    fi
-
-    ip -4 -o addr show 2>/dev/null \
-        | awk '$2 != "lo" {
-            split($4, parts, "/");
-            ip = parts[1];
-            if (ip !~ /^127\./ && ip !~ /^169\.254\./) {
-                print ip;
-                exit;
-            }
-        }'
-}
-
 ensure_server_config() {
-    NODE_IP=$(detect_node_ip)
-    if [ -z "$NODE_IP" ]; then
-        log_error "Unable to determine a non-loopback IPv4 address for node-ip."
-        exit 1
-    fi
-
     mkdir -p /etc/rancher/k3s
     desired_config=$(mktemp)
     {
     cat <<EOF
 write-kubeconfig-mode: "0644"
-node-ip: $NODE_IP
 https-listen-port: $API_PORT
 service-node-port-range: $PORT_RANGE
 EOF
@@ -171,7 +137,7 @@ EOF
     } > "$desired_config"
 
     if [ ! -f /etc/rancher/k3s/config.yaml ] || ! cmp -s "$desired_config" /etc/rancher/k3s/config.yaml; then
-        log_info "Writing /etc/rancher/k3s/config.yaml with node-ip $NODE_IP and api port $API_PORT"
+        log_info "Writing /etc/rancher/k3s/config.yaml with api port $API_PORT"
         mv "$desired_config" /etc/rancher/k3s/config.yaml
     else
         rm -f "$desired_config"
@@ -196,6 +162,10 @@ metadata:
   namespace: kube-system
 spec:
   valuesContent: |-
+    # Keep Traefik internal to the cluster; localhost exposure is handled by
+    # the explicit loopback bridge below.
+    service:
+      type: ClusterIP
     ports:
       web:
         expose:
@@ -248,13 +218,15 @@ start_traefik_loopback_listener() {
 
     wrapper=$(write_traefik_loopback_forwarder "$listen_port" "$target_port")
     log_file="/var/log/traefik-loopback-$listen_port.log"
-    cmd="nc -lk -s 127.0.0.1 -p $listen_port -e $wrapper"
+    # BusyBox nc binds dual-stack when no local address is forced, which makes
+    # the listener visible from Windows localhost in WSL mirrored mode.
+    cmd="nc -lk -p $listen_port -e $wrapper"
 
     if pgrep -f "$cmd" >/dev/null 2>&1; then
         return 0
     fi
 
-    pkill -f "nc -lk -s 127.0.0.1 -p $listen_port " 2>/dev/null || true
+    pkill -f "nc -lk .* -p $listen_port " 2>/dev/null || true
     nohup sh -c "exec $cmd" >> "$log_file" 2>&1 &
 }
 
