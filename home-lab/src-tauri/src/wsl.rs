@@ -19,7 +19,7 @@ use crate::oidc::{
 };
 use anyhow::{anyhow, Context, Result};
 use home_pki::ServerCertificateRequest;
-use k8s_openapi::api::core::v1::{Event as CoreEvent, Namespace, Node, Pod};
+use k8s_openapi::api::core::v1::{Event as CoreEvent, Namespace, Node, Pod, Secret};
 use k8s_openapi::api::events::v1::Event as EventsV1Event;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{MicroTime, Time};
 use kube::api::{Api, DynamicObject, ListParams, LogParams, Patch, PatchParams};
@@ -286,6 +286,11 @@ const KUBECTL_APPLY_MAX_BYTES: usize = 2 * 1024 * 1024;
 const KUBECTL_APPLY_FIELD_MANAGER: &str = "home-lab-tauri";
 const HOME_LAB_DEFAULT_TLS_SECRET_NAME: &str = "home-lab-default-tls";
 const HOME_LAB_DEFAULT_TLS_NAMESPACE: &str = "kube-system";
+const HOME_LAB_TRAEFIK_TLSSTORE_KIND: &str = "TLSStore";
+const HOME_LAB_TRAEFIK_TLSSTORE_API_VERSIONS: &[&str] =
+    &["traefik.io/v1alpha1", "traefik.containo.us/v1alpha1"];
+const HOME_LAB_TRAEFIK_TLSSTORE_DISCOVERY_TIMEOUT_SECONDS: u64 = 45;
+const HOME_LAB_TRAEFIK_TLSSTORE_DISCOVERY_INTERVAL_MS: u64 = 1500;
 const HOME_LAB_WSL_INSTANCE_PREFIX: &str = "home-lab-k3s";
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
@@ -472,7 +477,39 @@ fn indent_yaml_block(value: &str, spaces: usize) -> String {
     rendered
 }
 
-fn render_home_lab_default_tls_manifest(instance: &str) -> Result<String> {
+#[derive(Clone, Debug)]
+struct HomeLabDefaultTlsAssets {
+    cert_pem: String,
+    secret_manifest: String,
+    tls_store_manifest: String,
+}
+
+fn render_home_lab_default_tls_secret_manifest(cert_pem: &str, key_pem: &str) -> String {
+    let cert_block = indent_yaml_block(cert_pem, 4);
+    let key_block = indent_yaml_block(key_pem, 4);
+    format!(
+        "apiVersion: v1\nkind: Secret\nmetadata:\n  name: {secret_name}\n  namespace: {namespace}\ntype: kubernetes.io/tls\nstringData:\n  tls.crt: |\n{cert_block}  tls.key: |\n{key_block}",
+        secret_name = HOME_LAB_DEFAULT_TLS_SECRET_NAME,
+        namespace = HOME_LAB_DEFAULT_TLS_NAMESPACE,
+        cert_block = cert_block,
+        key_block = key_block,
+    )
+}
+
+fn render_home_lab_default_tls_store_manifest(tls_store_api_version: &str) -> String {
+    format!(
+        "apiVersion: {api_version}\nkind: {kind}\nmetadata:\n  name: default\n  namespace: {namespace}\nspec:\n  defaultCertificate:\n    secretName: {secret_name}\n",
+        api_version = tls_store_api_version,
+        kind = HOME_LAB_TRAEFIK_TLSSTORE_KIND,
+        namespace = HOME_LAB_DEFAULT_TLS_NAMESPACE,
+        secret_name = HOME_LAB_DEFAULT_TLS_SECRET_NAME,
+    )
+}
+
+fn build_home_lab_default_tls_assets(
+    instance: &str,
+    tls_store_api_version: &str,
+) -> Result<HomeLabDefaultTlsAssets> {
     let dns_names = cluster_tls_dns_names(instance);
     let common_name = dns_names.first().cloned().ok_or_else(|| {
         anyhow!("Aucun hostname disponible pour le certificat TLS de '{instance}'")
@@ -484,15 +521,14 @@ fn render_home_lab_default_tls_manifest(instance: &str) -> Result<String> {
         existing_key_pair_pem: None,
     })?;
 
-    let cert_block = indent_yaml_block(&issued.cert_pem, 4);
-    let key_block = indent_yaml_block(&issued.key_pem, 4);
-    Ok(format!(
-        "apiVersion: v1\nkind: Secret\nmetadata:\n  name: {secret_name}\n  namespace: {namespace}\ntype: kubernetes.io/tls\nstringData:\n  tls.crt: |\n{cert_block}  tls.key: |\n{key_block}---\napiVersion: traefik.io/v1alpha1\nkind: TLSStore\nmetadata:\n  name: default\n  namespace: {namespace}\nspec:\n  defaultCertificate:\n    secretName: {secret_name}\n",
-        secret_name = HOME_LAB_DEFAULT_TLS_SECRET_NAME,
-        namespace = HOME_LAB_DEFAULT_TLS_NAMESPACE,
-        cert_block = cert_block,
-        key_block = key_block,
-    ))
+    Ok(HomeLabDefaultTlsAssets {
+        cert_pem: issued.cert_pem.clone(),
+        secret_manifest: render_home_lab_default_tls_secret_manifest(
+            &issued.cert_pem,
+            &issued.key_pem,
+        ),
+        tls_store_manifest: render_home_lab_default_tls_store_manifest(tls_store_api_version),
+    })
 }
 
 fn kube_api_proxy_route_name(instance: &str) -> String {
@@ -4186,6 +4222,144 @@ async fn execute_kubectl_apply_yaml(
     Ok(applied_lines.join("\n"))
 }
 
+async fn wait_for_traefik_tls_store_resource(
+    client: &Client,
+    trace_id: &str,
+    instance: &str,
+) -> Result<(String, ResolvedResource)> {
+    let started_at = Instant::now();
+    let timeout = Duration::from_secs(HOME_LAB_TRAEFIK_TLSSTORE_DISCOVERY_TIMEOUT_SECONDS);
+    let mut last_error = String::new();
+
+    while started_at.elapsed() < timeout {
+        for api_version in HOME_LAB_TRAEFIK_TLSSTORE_API_VERSIONS {
+            match resolve_dynamic_resource_for_gvk(
+                client,
+                api_version,
+                HOME_LAB_TRAEFIK_TLSSTORE_KIND,
+            )
+            .await
+            {
+                Ok(resource) => {
+                    info!(
+                        target: "wsl",
+                        trace_id = %trace_id,
+                        instance = %instance,
+                        api_version = %api_version,
+                        kind = HOME_LAB_TRAEFIK_TLSSTORE_KIND,
+                        "CRD Traefik TLSStore detecte"
+                    );
+                    return Ok((api_version.to_string(), resource));
+                }
+                Err(err) => {
+                    last_error = err.to_string();
+                }
+            }
+        }
+
+        sleep(Duration::from_millis(
+            HOME_LAB_TRAEFIK_TLSSTORE_DISCOVERY_INTERVAL_MS,
+        ))
+        .await;
+    }
+
+    anyhow::bail!(
+        "CRD Traefik {} indisponible apres {}s: {}",
+        HOME_LAB_TRAEFIK_TLSSTORE_KIND,
+        HOME_LAB_TRAEFIK_TLSSTORE_DISCOVERY_TIMEOUT_SECONDS,
+        last_error
+    )
+}
+
+async fn verify_home_lab_default_tls_resources(
+    client: &Client,
+    tls_store_resource: &ResolvedResource,
+    instance: &str,
+    expected_cert_pem: &str,
+) -> Result<()> {
+    let secrets: Api<Secret> = Api::namespaced(client.clone(), HOME_LAB_DEFAULT_TLS_NAMESPACE);
+    let secret = secrets
+        .get(HOME_LAB_DEFAULT_TLS_SECRET_NAME)
+        .await
+        .with_context(|| {
+            format!(
+                "Secret TLS '{}' introuvable dans namespace '{}'.",
+                HOME_LAB_DEFAULT_TLS_SECRET_NAME, HOME_LAB_DEFAULT_TLS_NAMESPACE
+            )
+        })?;
+
+    let cert_bytes = secret
+        .data
+        .as_ref()
+        .and_then(|data| data.get("tls.crt"))
+        .ok_or_else(|| {
+            anyhow!(
+                "Le secret TLS '{}' ne contient pas la cle 'tls.crt'.",
+                HOME_LAB_DEFAULT_TLS_SECRET_NAME
+            )
+        })?;
+    let cert_pem =
+        String::from_utf8(cert_bytes.0.clone()).context("Certificat TLS Traefik non UTF-8")?;
+    if cert_pem.trim() != expected_cert_pem.trim() {
+        anyhow::bail!(
+            "Le certificat stocke dans le secret TLS '{}' ne correspond pas au leaf genere pour cette reconciliation.",
+            HOME_LAB_DEFAULT_TLS_SECRET_NAME
+        );
+    }
+    if !home_pki::is_certificate_signed_by_current_root(&cert_pem)? {
+        anyhow::bail!(
+            "Le secret TLS '{}' n'est pas signe par la racine Home Lab courante.",
+            HOME_LAB_DEFAULT_TLS_SECRET_NAME
+        );
+    }
+
+    let tls_stores: Api<DynamicObject> = Api::namespaced_with(
+        client.clone(),
+        HOME_LAB_DEFAULT_TLS_NAMESPACE,
+        &tls_store_resource.api_resource,
+    );
+    let tls_store = tls_stores.get("default").await.with_context(|| {
+        format!(
+            "TLSStore default introuvable dans namespace '{}'.",
+            HOME_LAB_DEFAULT_TLS_NAMESPACE
+        )
+    })?;
+    let referenced_secret = tls_store
+        .data
+        .get("spec")
+        .and_then(|spec| spec.get("defaultCertificate"))
+        .and_then(|default_certificate| default_certificate.get("secretName"))
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| anyhow!("Le TLSStore default ne reference aucun secret par defaut."))?;
+    if referenced_secret != HOME_LAB_DEFAULT_TLS_SECRET_NAME {
+        anyhow::bail!(
+            "Le TLSStore default reference '{}' au lieu de '{}'.",
+            referenced_secret,
+            HOME_LAB_DEFAULT_TLS_SECRET_NAME
+        );
+    }
+
+    let expected_domain = primary_cluster_domain(instance).ok_or_else(|| {
+        anyhow!(
+            "Aucun domaine principal disponible pour verifier le certificat de '{}'.",
+            instance
+        )
+    })?;
+    let dns_names = home_pki::certificate_dns_names(&cert_pem)?;
+    if !dns_names
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case(&expected_domain))
+    {
+        anyhow::bail!(
+            "Le certificat TLS par defaut ne contient pas le domaine attendu '{}' (SAN actuels: {}).",
+            expected_domain,
+            dns_names.join(", ")
+        );
+    }
+
+    Ok(())
+}
+
 fn format_age_from_seconds(created: i64) -> String {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -6510,19 +6684,29 @@ async fn ensure_home_lab_cluster_default_tls(
         return Ok(());
     }
 
-    let manifest = render_home_lab_default_tls_manifest(instance)?;
-    let stdout = execute_kubectl_apply_yaml(client, config, &manifest).await?;
+    let (tls_store_api_version, tls_store_resource) =
+        wait_for_traefik_tls_store_resource(client, trace_id, instance).await?;
+    let assets = build_home_lab_default_tls_assets(instance, &tls_store_api_version)?;
+    let secret_stdout = execute_kubectl_apply_yaml(client, config, &assets.secret_manifest).await?;
+    let tls_store_stdout =
+        execute_kubectl_apply_yaml(client, config, &assets.tls_store_manifest).await?;
+    verify_home_lab_default_tls_resources(client, &tls_store_resource, instance, &assets.cert_pem)
+        .await?;
     info!(
         target: "wsl",
         trace_id = %trace_id,
         instance = %instance,
-        stdout = %escape_for_log(stdout.trim()),
-        "Certificat TLS par defaut Traefik reconcilie"
+        tls_store_api_version = %tls_store_api_version,
+        secret_stdout = %escape_for_log(secret_stdout.trim()),
+        tls_store_stdout = %escape_for_log(tls_store_stdout.trim()),
+        "Certificat TLS par defaut Traefik reconcilie et verifie"
     );
     log_wsl_event(format!(
-        "[{trace_id}] Certificat TLS Traefik reconcilie pour {}: {}",
+        "[{trace_id}] Certificat TLS Traefik reconcilie pour {}: secret={} tlsstore={} apiVersion={}",
         escape_for_log(instance),
-        escape_for_log(stdout.trim())
+        escape_for_log(secret_stdout.trim()),
+        escape_for_log(tls_store_stdout.trim()),
+        escape_for_log(&tls_store_api_version)
     ));
     Ok(())
 }
@@ -7431,11 +7615,49 @@ mod tests {
     }
 
     #[test]
+    fn default_home_lab_instances_use_expected_publication_ports() {
+        let Some((first, second)) = default_home_lab_plans() else {
+            return;
+        };
+
+        assert_eq!(first.api_backend_port, 1001);
+        assert_eq!(second.api_backend_port, 1003);
+        assert_eq!(first.ingress_http_backend_port, 2000);
+        assert_eq!(first.ingress_https_backend_port, 2001);
+        assert_eq!(second.ingress_http_backend_port, 2002);
+        assert_eq!(second.ingress_https_backend_port, 2003);
+    }
+
+    #[test]
     fn nodeport_ranges_do_not_overlap_between_instances() {
         let Some((first, second)) = default_home_lab_plans() else {
             return;
         };
 
         assert!(first.nodeport_range.end < second.nodeport_range.start);
+    }
+
+    #[test]
+    fn home_lab_default_tls_manifests_are_valid_and_root_signed() {
+        let assets =
+            build_home_lab_default_tls_assets(HOME_LAB_WSL_INSTANCE_PREFIX, "traefik.io/v1alpha1")
+                .expect("tls assets");
+
+        assert!(
+            home_pki::is_certificate_signed_by_current_root(&assets.cert_pem)
+                .expect("verify root-signed cert"),
+            "the generated Traefik default certificate must be signed by the Home Lab root CA"
+        );
+
+        let combined = format!(
+            "{}\n---\n{}",
+            assets.secret_manifest, assets.tls_store_manifest
+        );
+        let manifests = parse_apply_manifest_documents(&combined).expect("parse TLS manifests");
+        assert_eq!(manifests.len(), 2);
+        assert_eq!(manifests[0].kind, "Secret");
+        assert_eq!(manifests[1].kind, HOME_LAB_TRAEFIK_TLSSTORE_KIND);
+        assert_eq!(manifests[0].name, HOME_LAB_DEFAULT_TLS_SECRET_NAME);
+        assert_eq!(manifests[1].name, "default");
     }
 }
