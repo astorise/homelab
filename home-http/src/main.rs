@@ -175,11 +175,6 @@ struct HttpConfig {
     http: u16,
     #[serde(default = "default_https_port")]
     https: u16,
-    #[serde(default = "default_resolve")]
-    wsl_resolve: String, // "auto" | "static"
-    wsl_ip: Option<String>,
-    #[serde(default = "default_refresh")]
-    wsl_refresh_secs: u64,
     #[serde(default)]
     routes: HashMap<String, u16>, // host -> port (u16)
     #[serde(default)]
@@ -267,15 +262,9 @@ impl TcpRouteConfig {
         SocketAddr::new(self.listen_scope.bind_ip(), self.listen_port)
     }
 
-    fn resolve_target_hosts(&self, shared: &Shared) -> Vec<String> {
+    fn resolve_target_hosts(&self) -> Vec<String> {
         match self.target_kind {
-            TcpTargetKindConfig::Wsl => select_wsl_target_hosts(
-                self.server_name.as_deref(),
-                self.listen_port,
-                self.target_port,
-                &shared.cfg.lock(),
-                &shared.cache,
-            ),
+            TcpTargetKindConfig::Wsl => select_wsl_target_hosts(),
             TcpTargetKindConfig::Address => vec![
                 self.target_host
                     .clone()
@@ -290,29 +279,8 @@ impl TcpRouteConfig {
     }
 }
 
-fn select_wsl_target_hosts(
-    server_name: Option<&str>,
-    listen_port: u16,
-    target_port: u16,
-    cfg: &HttpConfig,
-    cache: &Arc<Mutex<(u64, Option<String>)>>,
-) -> Vec<String> {
-    let mut hosts = Vec::new();
-    if listen_port != target_port {
-        hosts.push(Ipv4Addr::LOCALHOST.to_string());
-    }
-    if let Some(instance) = wsl_instance_name_from_host(server_name) {
-        if let Some(ip) = resolve_wsl_ipv4_for_instance(&instance) {
-            if !hosts.iter().any(|host| host == &ip) {
-                hosts.push(ip);
-            }
-        }
-    }
-    let resolved = wsl_ip(cfg, cache);
-    if !hosts.iter().any(|host| host == &resolved) {
-        hosts.push(resolved);
-    }
-    hosts
+fn select_wsl_target_hosts() -> Vec<String> {
+    vec![Ipv4Addr::LOCALHOST.to_string()]
 }
 
 async fn connect_target_hosts(hosts: Vec<String>, port: u16) -> Result<(TcpStream, String)> {
@@ -332,12 +300,6 @@ fn default_http_port() -> u16 {
 }
 fn default_https_port() -> u16 {
     443
-}
-fn default_resolve() -> String {
-    "auto".into()
-}
-fn default_refresh() -> u64 {
-    30
 }
 
 fn program_data_dir() -> PathBuf {
@@ -397,9 +359,6 @@ fn load_config_or_init() -> Result<HttpConfig> {
         let cfg = HttpConfig {
             http: 80,
             https: 443,
-            wsl_resolve: "auto".into(),
-            wsl_ip: None,
-            wsl_refresh_secs: 30,
             routes: HashMap::new(),
             tcp_routes: Vec::new(),
             log_level: Some(default_level_str().into()),
@@ -421,102 +380,6 @@ fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
     std::fs::write(&tmp, data)?;
     std::fs::rename(&tmp, path)?;
     Ok(())
-}
-
-fn parse_first_ipv4_token(output: &[u8]) -> Option<String> {
-    String::from_utf8_lossy(output)
-        .split_whitespace()
-        .find_map(|token| {
-            let candidate = token.split('/').next().unwrap_or(token);
-            let ip = candidate.parse::<Ipv4Addr>().ok()?;
-            if !is_usable_ipv4(ip) {
-                return None;
-            }
-            Some(ip.to_string())
-        })
-}
-
-fn is_usable_ipv4(ip: Ipv4Addr) -> bool {
-    !(ip.is_loopback() || ip.is_unspecified() || ip.is_link_local())
-}
-
-fn parse_src_ipv4_token(output: &[u8]) -> Option<String> {
-    let text = String::from_utf8_lossy(output);
-    let mut tokens = text.split_whitespace();
-    while let Some(token) = tokens.next() {
-        if token != "src" {
-            continue;
-        }
-        let candidate = tokens.next()?;
-        let ip = candidate.parse::<Ipv4Addr>().ok()?;
-        if !is_usable_ipv4(ip) {
-            return None;
-        }
-        return Some(ip.to_string());
-    }
-    None
-}
-
-fn resolve_wsl_ipv4_with_args(args: &[&str]) -> Option<String> {
-    let out = std::process::Command::new("wsl.exe")
-        .args(args)
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    parse_src_ipv4_token(&out.stdout).or_else(|| parse_first_ipv4_token(&out.stdout))
-}
-
-fn resolve_wsl_ipv4_for_instance(instance: &str) -> Option<String> {
-    resolve_wsl_ipv4_with_args(&["-d", instance, "--", "sh", "-lc", "ip route get 1"])
-}
-
-fn resolve_wsl_ipv4() -> Option<String> {
-    // BusyBox images do not support `hostname -I`, so prefer the route source IP.
-    let probes = [
-        vec!["-e", "sh", "-lc", "ip route get 1"],
-        vec!["-e", "sh", "-lc", "ip -4 -o addr show"],
-        vec!["-e", "sh", "-lc", "hostname -I"],
-        vec!["-e", "sh", "-lc", "hostname -i"],
-    ];
-    probes
-        .iter()
-        .find_map(|probe| resolve_wsl_ipv4_with_args(probe))
-}
-
-fn wsl_instance_name_from_host(host: Option<&str>) -> Option<String> {
-    host?
-        .trim()
-        .trim_end_matches('.')
-        .to_ascii_lowercase()
-        .strip_suffix(".wsl")
-        .and_then(|value| (!value.is_empty()).then_some(value))
-        .map(|value| value.to_string())
-}
-
-fn wsl_ip(cfg: &HttpConfig, cache: &Arc<Mutex<(u64, Option<String>)>>) -> String {
-    if cfg.wsl_resolve == "static" {
-        if let Some(ip) = resolve_wsl_ipv4() {
-            return ip;
-        }
-        return cfg.wsl_ip.clone().unwrap_or_else(|| "127.0.0.1".into());
-    }
-    let now = chrono::Utc::now().timestamp() as u64;
-    {
-        let mut guard = cache.lock();
-        if let Some(ip) = &guard.1 {
-            if now - guard.0 < cfg.wsl_refresh_secs {
-                return ip.clone();
-            }
-        }
-        if let Some(ip) = resolve_wsl_ipv4() {
-            guard.0 = now;
-            guard.1 = Some(ip.clone());
-            return ip;
-        }
-        "127.0.0.1".into()
-    }
 }
 
 fn normalize_tcp_route_name(name: &str) -> Result<String> {
@@ -579,10 +442,10 @@ fn tcp_route_from_request(req: AddTcpRouteRequest) -> Result<TcpRouteConfig> {
 async fn proxy_tcp_connection(
     mut inbound: TcpStream,
     route: TcpRouteConfig,
-    shared: Shared,
+    _shared: Shared,
 ) -> Result<()> {
     let (mut outbound, target_host) =
-        connect_target_hosts(route.resolve_target_hosts(&shared), route.target_port).await?;
+        connect_target_hosts(route.resolve_target_hosts(), route.target_port).await?;
     inbound.set_nodelay(true)?;
     outbound.set_nodelay(true)?;
     let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound)
@@ -770,7 +633,6 @@ async fn tcp_route_reconciler(shared: Shared) {
 #[derive(Clone)]
 struct Shared {
     cfg: Arc<Mutex<HttpConfig>>,
-    cache: Arc<Mutex<(u64, Option<String>)>>,
     stopping: Arc<AtomicBool>,
     tcp_listeners: Arc<Mutex<HashMap<String, TcpListenerRuntime>>>,
 }
@@ -1084,12 +946,7 @@ async fn handle_tls_conn(inb: &mut TcpStream, _peer: SocketAddr, shared: Shared)
         .get(&host)
         .copied()
         .context("no route for host")?;
-    let cfg = shared.cfg.lock().clone();
-    let (mut outb, _) = connect_target_hosts(
-        select_wsl_target_hosts(Some(&host), cfg.https, port, &cfg, &shared.cache),
-        port,
-    )
-    .await?;
+    let (mut outb, _) = connect_target_hosts(select_wsl_target_hosts(), port).await?;
     outb.set_nodelay(true)?;
     let (mut ri, mut wi) = inb.split();
     let (mut ro, mut wo) = outb.split();
@@ -1222,7 +1079,6 @@ fn run_service() -> Result<()> {
 
     let shared = Shared {
         cfg: Arc::new(Mutex::new(cfg)),
-        cache: Arc::new(Mutex::new((0, None))),
         stopping: Arc::new(AtomicBool::new(false)),
         tcp_listeners: Arc::new(Mutex::new(HashMap::new())),
     };
@@ -1397,7 +1253,6 @@ fn main() -> Result<()> {
             rt.block_on(async {
                 let shared = Shared {
                     cfg: Arc::new(Mutex::new(cfg)),
-                    cache: Arc::new(Mutex::new((0, None))),
                     stopping: Arc::new(AtomicBool::new(false)),
                     tcp_listeners: Arc::new(Mutex::new(HashMap::new())),
                 };

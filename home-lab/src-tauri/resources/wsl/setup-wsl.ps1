@@ -206,7 +206,7 @@ function Install-K3sInitScript {
     Write-Info "Installation du script /usr/local/bin/k3s-init.sh"
     $scriptContent = Get-Content -Raw -LiteralPath $sourcePath
     $normalizedScript = $scriptContent.Replace("`r`n", "`n").Replace("`r", "`n")
-
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
     $mkdirResult = Invoke-WslScript -Distro $Distro -Script "set -eu; mkdir -p /usr/local/bin" -Operation 'Preparation /usr/local/bin'
     if ($mkdirResult.ExitCode -ne 0) {
         $details = ($mkdirResult.Output) -join "`n"
@@ -217,16 +217,42 @@ function Install-K3sInitScript {
     }
 
     $uncPath = "\\wsl$\$Distro\usr\local\bin\k3s-init.sh"
-    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
-    [System.IO.File]::WriteAllText($uncPath, $normalizedScript, $utf8NoBom)
-
-    $chmodStd = & wsl.exe -d $Distro -- chmod +x /usr/local/bin/k3s-init.sh 2>&1
-    if ($LASTEXITCODE -ne 0) {
-        $details = ($chmodStd | Where-Object { $_ -and $_.Trim().Length -gt 0 }) -join "`n"
-        if ($details) {
-            throw "Installation k3s-init.sh echouee (chmod, code $LASTEXITCODE) :`n$details"
+    $lastWriteError = $null
+    for ($attempt = 1; $attempt -le 10; $attempt++) {
+        try {
+            [System.IO.File]::WriteAllText($uncPath, $normalizedScript, $utf8NoBom)
+            $lastWriteError = $null
+            break
+        } catch {
+            $lastWriteError = $_.Exception.Message
+            Start-Sleep -Milliseconds 300
         }
-        throw "Installation k3s-init.sh echouee (chmod, code $LASTEXITCODE)"
+    }
+    if ($lastWriteError) {
+        throw "Installation k3s-init.sh echouee via \\\\wsl$ : $lastWriteError"
+    }
+
+    $chmodOk = $false
+    for ($attempt = 1; $attempt -le 10; $attempt++) {
+        $chmodResult = Invoke-WslScript -Distro $Distro -Script "set -eu; chmod 0755 /usr/local/bin/k3s-init.sh; test -s /usr/local/bin/k3s-init.sh" -Operation 'Activation k3s-init.sh'
+        if ($chmodResult.ExitCode -eq 0) {
+            $chmodOk = $true
+            break
+        }
+        Start-Sleep -Milliseconds 300
+    }
+
+    if (-not [System.IO.File]::Exists($uncPath)) {
+        throw "Installation k3s-init.sh echouee : fichier absent apres ecriture via \\\\wsl$."
+    }
+
+    $fileInfo = Get-Item -LiteralPath $uncPath
+    if ($fileInfo.Length -le 0) {
+        throw "Installation k3s-init.sh echouee : fichier vide apres ecriture via \\\\wsl$."
+    }
+
+    if (-not $chmodOk) {
+        Write-Info "Activation chmod de k3s-init.sh non confirmee immediatement, poursuite avec script present."
     }
 }
 
