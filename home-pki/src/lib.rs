@@ -9,6 +9,7 @@ use std::io::Write;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use time::{Duration, OffsetDateTime};
+use x509_parser::pem::parse_x509_pem;
 
 const ROOT_CA_COMMON_NAME: &str = "Home Lab Root CA";
 const ROOT_CA_CERT_FILE: &str = "home-lab-root-ca.pem";
@@ -221,6 +222,29 @@ pub fn issue_server_certificate(
         key_pem,
         ca_cert_pem: root.cert_pem,
     })
+}
+
+pub fn is_certificate_signed_by_current_root(cert_pem: &str) -> Result<bool> {
+    let root = ensure_root_ca()?;
+    let (_, leaf_pem) =
+        parse_x509_pem(cert_pem.as_bytes()).map_err(|_| anyhow!("parse leaf PEM certificate"))?;
+    let leaf_cert = leaf_pem
+        .parse_x509()
+        .context("parse leaf DER certificate")?;
+
+    let (_, root_pem) = parse_x509_pem(root.cert_pem.as_bytes())
+        .map_err(|_| anyhow!("parse root PEM certificate"))?;
+    let root_cert = root_pem
+        .parse_x509()
+        .context("parse root DER certificate")?;
+
+    if leaf_cert.issuer() != root_cert.subject() {
+        return Ok(false);
+    }
+
+    Ok(leaf_cert
+        .verify_signature(Some(root_cert.public_key()))
+        .is_ok())
 }
 
 #[cfg(windows)]

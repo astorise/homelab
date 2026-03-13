@@ -1395,13 +1395,23 @@ fn ensure_doh_certificate(cfg: &DnsConfig) -> Result<()> {
         let recorded_host = fs::read_to_string(&host_marker)
             .ok()
             .map(|value| value.trim().to_ascii_lowercase());
-        if recorded_host.as_deref() == Some(normalized_host.as_str()) {
+        let existing_cert_pem =
+            fs::read_to_string(doh_certificate_path()).context("read existing DoH certificate")?;
+        let cert_matches_root = home_pki::is_certificate_signed_by_current_root(&existing_cert_pem)
+            .context("verify existing DoH certificate issuer")?;
+
+        if recorded_host.as_deref() == Some(normalized_host.as_str()) && cert_matches_root {
             return Ok(());
         }
-        info!(
-            "DoH certificate host changed (old={:?}, new={}), regenerating certificate",
-            recorded_host, normalized_host
-        );
+
+        if recorded_host.as_deref() != Some(normalized_host.as_str()) {
+            info!(
+                "DoH certificate host changed (old={:?}, new={}), regenerating certificate",
+                recorded_host, normalized_host
+            );
+        } else {
+            info!("DoH certificate is not signed by Home Lab Root CA, regenerating certificate");
+        }
     }
 
     let key_pem = ensure_doh_private_key_pem()?;

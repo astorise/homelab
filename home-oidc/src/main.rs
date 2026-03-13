@@ -390,7 +390,12 @@ fn ensure_certificate(cfg: &ServiceConfig) -> Result<()> {
         let recorded_host = fs::read_to_string(&host_marker_path)
             .ok()
             .map(|value| value.trim().to_ascii_lowercase());
-        if recorded_host.as_deref() == Some(normalized_host.as_str()) {
+        let existing_cert_pem =
+            fs::read_to_string(certificate_path()).context("read existing certificate")?;
+        let cert_matches_root = home_pki::is_certificate_signed_by_current_root(&existing_cert_pem)
+            .context("verify existing OIDC certificate issuer")?;
+
+        if recorded_host.as_deref() == Some(normalized_host.as_str()) && cert_matches_root {
             return Ok(());
         }
     }

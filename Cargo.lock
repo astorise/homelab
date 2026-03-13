@@ -2305,6 +2305,7 @@ dependencies = [
  "anyhow",
  "rcgen",
  "time",
+ "x509-parser",
 ]
 
 [[package]]
