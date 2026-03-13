@@ -19,6 +19,7 @@ use crate::oidc::{
 };
 use anyhow::{anyhow, Context, Result};
 use home_pki::ServerCertificateRequest;
+use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::core::v1::{Event as CoreEvent, Namespace, Node, Pod, Secret};
 use k8s_openapi::api::events::v1::Event as EventsV1Event;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{MicroTime, Time};
@@ -286,11 +287,15 @@ const KUBECTL_APPLY_MAX_BYTES: usize = 2 * 1024 * 1024;
 const KUBECTL_APPLY_FIELD_MANAGER: &str = "home-lab-tauri";
 const HOME_LAB_DEFAULT_TLS_SECRET_NAME: &str = "home-lab-default-tls";
 const HOME_LAB_DEFAULT_TLS_NAMESPACE: &str = "kube-system";
+const HOME_LAB_TRAEFIK_DEPLOYMENT_NAME: &str = "traefik";
+const HOME_LAB_TRAEFIK_RESTART_ANNOTATION: &str = "kubectl.kubernetes.io/restartedAt";
 const HOME_LAB_TRAEFIK_TLSSTORE_KIND: &str = "TLSStore";
 const HOME_LAB_TRAEFIK_TLSSTORE_API_VERSIONS: &[&str] =
     &["traefik.io/v1alpha1", "traefik.containo.us/v1alpha1"];
 const HOME_LAB_TRAEFIK_TLSSTORE_DISCOVERY_TIMEOUT_SECONDS: u64 = 45;
 const HOME_LAB_TRAEFIK_TLSSTORE_DISCOVERY_INTERVAL_MS: u64 = 1500;
+const HOME_LAB_TRAEFIK_ROLLOUT_TIMEOUT_SECONDS: u64 = 180;
+const HOME_LAB_TRAEFIK_ROLLOUT_POLL_INTERVAL_MS: u64 = 1500;
 const HOME_LAB_WSL_INSTANCE_PREFIX: &str = "home-lab-k3s";
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
@@ -4097,6 +4102,35 @@ fn render_apply_resource_name(manifest: &KubectlApplyManifest) -> String {
     }
 }
 
+fn manifest_requests_home_lab_traefik_restart(manifest: &KubectlApplyManifest) -> bool {
+    let kind = manifest.kind.trim();
+    if kind.eq_ignore_ascii_case("Ingress") || kind.eq_ignore_ascii_case("IngressClass") {
+        return true;
+    }
+
+    let (group, _) = split_api_version(&manifest.api_version);
+    if group.eq_ignore_ascii_case("traefik.io") || group.eq_ignore_ascii_case("traefik.containo.us")
+    {
+        return true;
+    }
+
+    kind.eq_ignore_ascii_case("Secret")
+        && manifest
+            .name
+            .eq_ignore_ascii_case(HOME_LAB_DEFAULT_TLS_SECRET_NAME)
+        && manifest
+            .namespace
+            .as_deref()
+            .map(|ns| ns.eq_ignore_ascii_case(HOME_LAB_DEFAULT_TLS_NAMESPACE))
+            .unwrap_or(false)
+}
+
+fn manifests_require_home_lab_traefik_restart(manifests: &[KubectlApplyManifest]) -> bool {
+    manifests
+        .iter()
+        .any(manifest_requests_home_lab_traefik_restart)
+}
+
 async fn resolve_dynamic_resource_for_gvk(
     client: &Client,
     api_version: &str,
@@ -4358,6 +4392,138 @@ async fn verify_home_lab_default_tls_resources(
     }
 
     Ok(())
+}
+
+async fn restart_home_lab_traefik_deployment(
+    client: &Client,
+    instance: &str,
+    trace_id: &str,
+    reason: &str,
+) -> Result<()> {
+    let deployments: Api<Deployment> =
+        Api::namespaced(client.clone(), HOME_LAB_DEFAULT_TLS_NAMESPACE);
+    let restart_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .to_string();
+    let patch = json!({
+        "spec": {
+            "template": {
+                "metadata": {
+                    "annotations": {
+                        HOME_LAB_TRAEFIK_RESTART_ANNOTATION: restart_at
+                    }
+                }
+            }
+        }
+    });
+    let patched = deployments
+        .patch(
+            HOME_LAB_TRAEFIK_DEPLOYMENT_NAME,
+            &PatchParams::default(),
+            &Patch::Merge(&patch),
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "Redemarrage du deployment '{}' impossible dans le namespace '{}'.",
+                HOME_LAB_TRAEFIK_DEPLOYMENT_NAME, HOME_LAB_DEFAULT_TLS_NAMESPACE
+            )
+        })?;
+    let expected_generation = patched.metadata.generation.unwrap_or_default();
+
+    info!(
+        target: "wsl",
+        trace_id = %trace_id,
+        instance = %instance,
+        reason = %reason,
+        expected_generation,
+        "Redemarrage du deployment Traefik demande"
+    );
+    log_wsl_event(format!(
+        "[{trace_id}] Redemarrage Traefik demande pour {}: reason={} generation={}",
+        escape_for_log(instance),
+        escape_for_log(reason),
+        expected_generation
+    ));
+
+    let started_at = Instant::now();
+    let timeout = Duration::from_secs(HOME_LAB_TRAEFIK_ROLLOUT_TIMEOUT_SECONDS);
+    loop {
+        let deployment = deployments
+            .get(HOME_LAB_TRAEFIK_DEPLOYMENT_NAME)
+            .await
+            .with_context(|| {
+                format!(
+                    "Lecture du deployment '{}' impossible apres redemarrage.",
+                    HOME_LAB_TRAEFIK_DEPLOYMENT_NAME
+                )
+            })?;
+        let desired_replicas = deployment
+            .spec
+            .as_ref()
+            .and_then(|spec| spec.replicas)
+            .unwrap_or(1);
+        let status = deployment.status.as_ref();
+        let observed_generation = status
+            .and_then(|value| value.observed_generation)
+            .unwrap_or_default();
+        let ready_replicas = status
+            .and_then(|value| value.ready_replicas)
+            .unwrap_or_default();
+        let updated_replicas = status
+            .and_then(|value| value.updated_replicas)
+            .unwrap_or_default();
+        let unavailable_replicas = status
+            .and_then(|value| value.unavailable_replicas)
+            .unwrap_or_default();
+        let available_replicas = status
+            .and_then(|value| value.available_replicas)
+            .unwrap_or_default();
+
+        let rolled_out = observed_generation >= expected_generation
+            && ready_replicas >= desired_replicas
+            && updated_replicas >= desired_replicas
+            && available_replicas >= desired_replicas
+            && unavailable_replicas == 0;
+        if rolled_out {
+            info!(
+                target: "wsl",
+                trace_id = %trace_id,
+                instance = %instance,
+                reason = %reason,
+                desired_replicas,
+                "Deployment Traefik redemarre et disponible"
+            );
+            log_wsl_event(format!(
+                "[{trace_id}] Deployment Traefik disponible pour {} apres restart: reason={} replicas={}",
+                escape_for_log(instance),
+                escape_for_log(reason),
+                desired_replicas
+            ));
+            return Ok(());
+        }
+
+        if started_at.elapsed() >= timeout {
+            anyhow::bail!(
+                "Le deployment '{}' n'est pas redevenu disponible apres {}s (reason={}, generation observee={}, ready={}, updated={}, available={}, unavailable={}).",
+                HOME_LAB_TRAEFIK_DEPLOYMENT_NAME,
+                HOME_LAB_TRAEFIK_ROLLOUT_TIMEOUT_SECONDS,
+                reason,
+                observed_generation,
+                ready_replicas,
+                updated_replicas,
+                available_replicas,
+                unavailable_replicas
+            );
+        }
+
+        sleep(Duration::from_millis(
+            HOME_LAB_TRAEFIK_ROLLOUT_POLL_INTERVAL_MS,
+        ))
+        .await;
+    }
 }
 
 fn format_age_from_seconds(created: i64) -> String {
@@ -5109,13 +5275,13 @@ async fn resolve_kube_api_port_for_instance(instance: &str, trace_id: &str) -> u
         return api_port;
     }
 
-    let api_port = plan.api_public_port;
+    let api_port = plan.api_backend_port;
     info!(
         target: "wsl",
         trace_id = %trace_id,
         instance = %instance,
         selected_api_port = api_port,
-        "Port API Kubernetes public retenu via proxy SNI"
+        "Port API Kubernetes backend retenu pour les operations internes"
     );
     api_port
 }
@@ -5132,6 +5298,27 @@ async fn resolve_kube_api_endpoint_for_instance(
     trace_id: &str,
 ) -> Result<KubeApiEndpoint> {
     let api_port = resolve_kube_api_port_for_instance(instance, trace_id).await;
+    if is_home_lab_wsl_instance(instance) {
+        info!(
+            target: "wsl",
+            trace_id = %trace_id,
+            instance = %instance,
+            api_host = "127.0.0.1",
+            api_port,
+            "Endpoint API Kubernetes retenu (backend loopback direct)"
+        );
+        log_wsl_event(format!(
+            "[{trace_id}] Endpoint API Kubernetes pour {}: 127.0.0.1:{} (direct-backend)",
+            escape_for_log(instance),
+            api_port
+        ));
+        return Ok(KubeApiEndpoint {
+            host: "127.0.0.1".to_string(),
+            port: api_port,
+            tls_server_name: None,
+        });
+    }
+
     if !is_home_lab_wsl_instance(instance) {
         if let Some(domain) = primary_cluster_domain(instance) {
             if tcp_connect_once(&domain, api_port, Duration::from_millis(700))
@@ -5159,29 +5346,6 @@ async fn resolve_kube_api_endpoint_for_instance(
     }
 
     if let Some(domain) = primary_cluster_domain(instance) {
-        if is_home_lab_wsl_instance(instance) {
-            info!(
-                target: "wsl",
-                trace_id = %trace_id,
-                instance = %instance,
-                api_host = "127.0.0.1",
-                api_port = api_port,
-                tls_server_name = %domain,
-                "Endpoint API Kubernetes retenu (proxy SNI public via loopback)"
-            );
-            log_wsl_event(format!(
-                "[{trace_id}] Endpoint API Kubernetes pour {}: 127.0.0.1:{} (tls_server_name={})",
-                escape_for_log(instance),
-                api_port,
-                escape_for_log(&domain)
-            ));
-            return Ok(KubeApiEndpoint {
-                host: "127.0.0.1".to_string(),
-                port: api_port,
-                tls_server_name: Some(domain),
-            });
-        }
-
         info!(
             target: "wsl",
             trace_id = %trace_id,
@@ -6721,7 +6885,8 @@ async fn reconcile_home_lab_cluster_default_tls(instance: &str, trace_id: &str) 
     let endpoint = resolve_kube_api_endpoint_for_instance(instance, trace_id).await?;
     let endpoint = wait_for_kube_api_port(instance, &endpoint, trace_id).await?;
     let (client, config, _, _) = build_kube_client_for_instance(instance, Some(&endpoint)).await?;
-    ensure_home_lab_cluster_default_tls(&client, &config, instance, trace_id).await
+    ensure_home_lab_cluster_default_tls(&client, &config, instance, trace_id).await?;
+    restart_home_lab_traefik_deployment(&client, instance, trace_id, "tls-reconcile").await
 }
 
 async fn run_wsl_kubectl_exec(instance: &str, args: &[String]) -> Result<WslKubectlExecResult> {
@@ -7052,6 +7217,9 @@ async fn run_wsl_kubectl_apply_yaml(
     let command_line = build_kubectl_apply_command_line(&context_name, source_name);
     let instance_log = escape_for_log(instance);
     let source_log = source_name.unwrap_or("<uploaded-yaml>");
+    let parsed_manifests = parse_apply_manifest_documents(manifest_yaml)?;
+    let restart_traefik_after_apply = is_home_lab_wsl_instance(instance)
+        && manifests_require_home_lab_traefik_restart(&parsed_manifests);
 
     if let Err(err) = ensure_rustls_crypto_provider(&trace_id, instance) {
         let message = err.to_string();
@@ -7163,6 +7331,7 @@ Verifie que '{}' peut demarrer et exposer l'API Kubernetes.",
     let instance_for_task = instance.to_string();
     let api_endpoint_for_task = api_endpoint.clone();
     let manifest_for_task = manifest_yaml.to_string();
+    let restart_traefik_after_apply_for_task = restart_traefik_after_apply;
     let mut operation = tauri::async_runtime::spawn(async move {
         ensure_rustls_crypto_provider(&trace_for_task, &instance_for_task)?;
         info!(
@@ -7199,6 +7368,15 @@ Verifie que '{}' peut demarrer et exposer l'API Kubernetes.",
             ));
         }
         let stdout = execute_kubectl_apply_yaml(&client, &config, &manifest_for_task).await?;
+        if restart_traefik_after_apply_for_task {
+            restart_home_lab_traefik_deployment(
+                &client,
+                &instance_for_task,
+                &trace_for_task,
+                "apply-manifest",
+            )
+            .await?;
+        }
         Ok::<(String, String, PathBuf), anyhow::Error>((stdout, resolved_context, kubeconfig_path))
     });
 
@@ -7659,5 +7837,49 @@ mod tests {
         assert_eq!(manifests[1].kind, HOME_LAB_TRAEFIK_TLSSTORE_KIND);
         assert_eq!(manifests[0].name, HOME_LAB_DEFAULT_TLS_SECRET_NAME);
         assert_eq!(manifests[1].name, "default");
+    }
+
+    #[test]
+    fn ingress_manifest_requests_traefik_restart() {
+        let manifests = parse_apply_manifest_documents(
+            r#"
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: demo
+  namespace: default
+spec:
+  ingressClassName: traefik
+"#,
+        )
+        .expect("parse ingress manifest");
+        assert!(manifests_require_home_lab_traefik_restart(&manifests));
+    }
+
+    #[test]
+    fn ordinary_workload_manifest_does_not_request_traefik_restart() {
+        let manifests = parse_apply_manifest_documents(
+            r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: demo
+  namespace: default
+spec:
+  selector:
+    matchLabels:
+      app: demo
+  template:
+    metadata:
+      labels:
+        app: demo
+    spec:
+      containers:
+        - name: demo
+          image: traefik/whoami:v1.10.1
+"#,
+        )
+        .expect("parse deployment manifest");
+        assert!(!manifests_require_home_lab_traefik_restart(&manifests));
     }
 }

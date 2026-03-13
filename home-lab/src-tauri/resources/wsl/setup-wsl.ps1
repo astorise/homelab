@@ -254,6 +254,20 @@ function Install-K3sInitScript {
     if (-not $chmodOk) {
         Write-Info "Activation chmod de k3s-init.sh non confirmee immediatement, poursuite avec script present."
     }
+
+    $readyOk = $false
+    for ($attempt = 1; $attempt -le 20; $attempt++) {
+        $readyResult = Invoke-WslScript -Distro $Distro -Script "set -eu; test -x /usr/local/bin/k3s-init.sh; test -s /usr/local/bin/k3s-init.sh" -Operation 'Verification k3s-init.sh'
+        if ($readyResult.ExitCode -eq 0) {
+            $readyOk = $true
+            break
+        }
+        Start-Sleep -Milliseconds 500
+    }
+
+    if (-not $readyOk) {
+        throw "Installation k3s-init.sh echouee : le script n'est pas executable et visible dans la distribution apres attente."
+    }
 }
 
 function Configure-K3sEnv {
