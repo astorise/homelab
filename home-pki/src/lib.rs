@@ -9,6 +9,7 @@ use std::io::Write;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use time::{Duration, OffsetDateTime};
+use x509_parser::extensions::GeneralName;
 use x509_parser::pem::parse_x509_pem;
 
 const ROOT_CA_COMMON_NAME: &str = "Home Lab Root CA";
@@ -245,6 +246,25 @@ pub fn is_certificate_signed_by_current_root(cert_pem: &str) -> Result<bool> {
     Ok(leaf_cert
         .verify_signature(Some(root_cert.public_key()))
         .is_ok())
+}
+
+pub fn certificate_dns_names(cert_pem: &str) -> Result<Vec<String>> {
+    let (_, leaf_pem) =
+        parse_x509_pem(cert_pem.as_bytes()).map_err(|_| anyhow!("parse leaf PEM certificate"))?;
+    let leaf_cert = leaf_pem
+        .parse_x509()
+        .context("parse leaf DER certificate")?;
+
+    let mut names = BTreeSet::new();
+    if let Ok(Some(subject_alt_name)) = leaf_cert.subject_alternative_name() {
+        for general_name in &subject_alt_name.value.general_names {
+            if let GeneralName::DNSName(name) = general_name {
+                names.insert(name.to_string());
+            }
+        }
+    }
+
+    Ok(names.into_iter().collect())
 }
 
 #[cfg(windows)]

@@ -412,11 +412,20 @@ function Get-K3sNodePortRangeForInstance {
 function Get-IngressPortLayoutForInstance {
     param([string]$Name)
 
-    $httpsPort = Get-DeterministicPortForInstance -Name $Name -BasePort 2001 -Step 1 -MaxPort 60000
+    # HTTPS is the published backend port; keep one full HTTP/HTTPS pair per instance.
+    $httpsPort = Get-DeterministicPortForInstance -Name $Name -BasePort 2001 -Step 2 -MaxPort 60000
     [pscustomobject]@{
         HttpPort  = [int]($httpsPort - 1)
         HttpsPort = [int]$httpsPort
     }
+}
+
+function Get-K3sApiPortForInstance {
+    param([string]$Name)
+
+    # k3s reserves the adjacent supervisor/apiserver port pair, so instances must
+    # advance by 2 to avoid collisions between home-lab-k3s and home-lab-k3s-N.
+    return Get-DeterministicPortForInstance -Name $Name -BasePort 1001 -Step 2 -MaxPort 60000
 }
 
 function Get-SshPortForInstance {
@@ -492,7 +501,7 @@ try {
         $Rootfs = [System.IO.Path]::Combine((Get-ScriptDirectory), 'wsl-rootfs.tar')
     }
     if ($ApiPort -le 0) {
-        $ApiPort = Get-DeterministicPortForInstance -Name $DistroName -BasePort 1001 -Step 1 -MaxPort 60000
+        $ApiPort = Get-K3sApiPortForInstance -Name $DistroName
     }
 
     Write-Info "Parametres d'execution :"
