@@ -73,6 +73,16 @@ FunctionEnd
   ${EndIf}
   DetailPrint "Configuration du domaine pour home-oidc ($OIDC_DOMAIN)..."
   Call ApplyOidcDomain
+  DetailPrint "Installing Home Lab root certificate..."
+  nsExec::ExecToStack '"$INSTDIR\bin\home-lab-cert.exe" install-root'
+  Pop $0
+  Pop $1
+  DetailPrint "home-lab-cert.exe install-root => rc=$0 out=$1"
+  ${If} $0 != 0
+    DetailPrint "[WARN] home-lab-cert.exe install-root returned $0"
+  ${EndIf}
+  StrCmp $LOG_HANDLE "" +2
+  FileWrite $LOG_HANDLE "home-lab-cert.exe install-root => rc=$0 out=$1$\r$\n"
   DetailPrint "Installing Windows services..."
   nsExec::ExecToStack '"$INSTDIR\bin\home-dns.exe" install'
   Pop $0

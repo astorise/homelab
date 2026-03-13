@@ -24,6 +24,7 @@ console.log('[prepare-services] Building Windows service binaries...')
 for (const svc of services) {
   run(`cargo build -p ${svc} --release`)
 }
+run('cargo build --manifest-path home-lab/src-tauri/Cargo.toml --bin home-lab-cert --release')
 
 mkdirSync(bundleBinDir, { recursive: true })
 for (const svc of services) {
@@ -35,6 +36,18 @@ for (const svc of services) {
     throw new Error(`[prepare-services] Missing compiled binary: ${src}`)
   }
 
+  copyFileSync(src, dst)
+  const size = statSync(dst).size
+  console.log(`[prepare-services] Updated ${dst} (${size} bytes)`)
+}
+
+{
+  const exeName = 'home-lab-cert.exe'
+  const src = join(targetDir, exeName)
+  const dst = join(bundleBinDir, exeName)
+  if (!existsSync(src)) {
+    throw new Error(`[prepare-services] Missing compiled binary: ${src}`)
+  }
   copyFileSync(src, dst)
   const size = statSync(dst).size
   console.log(`[prepare-services] Updated ${dst} (${size} bytes)`)

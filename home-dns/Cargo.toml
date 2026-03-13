@@ -37,6 +37,7 @@ futures-util = "0.3.30"
 pin-project = "1.1.5"
 hyper-util = { version = "0.1", features = ["tokio"] }
 url = "2.5"
+home-pki = { path = "../home-pki" }
 
 [build-dependencies]
 tonic-prost-build = "0.14"

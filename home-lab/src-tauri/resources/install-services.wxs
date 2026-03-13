@@ -14,6 +14,8 @@
 
   <Fragment>
     <!-- Post-install: run "home-dns.exe install", "home-http.exe install" and "home-oidc.exe install", then start them -->
+    <CustomAction Id="InstallHomeLabRootCa" Directory="INSTALLDIR" Execute="deferred" Impersonate="no"
+                  ExeCommand='"[SystemFolder]cmd.exe" /C ""[INSTALLDIR]bin\home-lab-cert.exe" install-root &gt;&gt; "[INSTALLDIR]installer-msi.log" 2&gt;&amp;1"' Return="check" />
     <CustomAction Id="InstallHomeDns" Directory="INSTALLDIR" Execute="deferred" Impersonate="no"
                   ExeCommand='"[SystemFolder]cmd.exe" /C ""[INSTALLDIR]bin\home-dns.exe" install &gt;&gt; "[INSTALLDIR]installer-msi.log" 2&gt;&amp;1"' Return="check" />
     <CustomAction Id="InstallHomeHttp" Directory="INSTALLDIR" Execute="deferred" Impersonate="no"
@@ -49,7 +51,8 @@
       <Custom Action="TraceInstallServices" After="InstallInitialize">NOT Installed</Custom>
       <Custom Action="TraceUninstallServices" After="InstallInitialize">(REMOVE = "ALL")</Custom>
       <Custom Action="TraceAfterInstallFiles" Before="InstallHomeDns">NOT Installed</Custom>
-      <Custom Action="InstallHomeDns" After="InstallFiles"><![CDATA[NOT (REMOVE = "ALL")]]></Custom>
+      <Custom Action="InstallHomeLabRootCa" After="InstallFiles"><![CDATA[NOT (REMOVE = "ALL")]]></Custom>
+      <Custom Action="InstallHomeDns" After="InstallHomeLabRootCa"><![CDATA[NOT (REMOVE = "ALL")]]></Custom>
       <Custom Action="InstallHomeHttp" After="InstallHomeDns"><![CDATA[NOT (REMOVE = "ALL")]]></Custom>
       <Custom Action="InstallHomeOidc" After="InstallHomeHttp"><![CDATA[NOT (REMOVE = "ALL")]]></Custom>
       <Custom Action="StartHomeDns" After="InstallHomeOidc"><![CDATA[NOT (REMOVE = "ALL")]]></Custom>
@@ -84,6 +87,7 @@
     </Feature>
 
     <FeatureRef Id="ServicesFeature" />
+    <CustomActionRef Id="InstallHomeLabRootCa" />
     <CustomActionRef Id="InstallHomeDns" />
     <CustomActionRef Id="InstallHomeHttp" />
     <CustomActionRef Id="InstallHomeOidc" />

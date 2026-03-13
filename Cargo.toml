@@ -1,5 +1,6 @@
 [workspace]
 members = [
+  "home-pki",
   "home-dns",
   "home-http",
   "home-oidc",

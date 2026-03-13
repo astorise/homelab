@@ -8,6 +8,7 @@ use anyhow::{anyhow, Context, Result};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use flexi_logger::{Age, Cleanup, Criterion, Duplicate, FileSpec, Logger, Naming};
+use home_pki::ServerCertificateRequest;
 use http::{Method, StatusCode};
 use http_body_util::{BodyExt, Full};
 use hyper::body::{Bytes, Incoming};
@@ -17,7 +18,6 @@ use hyper_util::rt::TokioIo;
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use log::{error, info};
 use rand::{rng, Rng};
-use rcgen::{CertificateParams, DnType, IsCa, KeyPair, SanType};
 use rsa::pkcs1::DecodeRsaPrivateKey;
 use rsa::pkcs8::{DecodePrivateKey, EncodePrivateKey, LineEnding};
 use rsa::rand_core::OsRng;
@@ -30,7 +30,6 @@ use serde_json::json;
 use serde_with::skip_serializing_none;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::convert::TryInto;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -128,6 +127,10 @@ fn private_key_path() -> PathBuf {
 
 fn certificate_path() -> PathBuf {
     program_data_dir().join("oidc-cert.pem")
+}
+
+fn certificate_host_path() -> PathBuf {
+    program_data_dir().join("oidc-cert-host.txt")
 }
 
 fn jwks_path() -> PathBuf {
@@ -351,47 +354,67 @@ struct KeyMaterial {
     tls_config: Arc<ServerConfig>,
 }
 
-fn ensure_certificate(cfg: &ServiceConfig) -> Result<()> {
-    if private_key_path().exists() && certificate_path().exists() {
-        return Ok(());
-    }
-    let issuer = Url::parse(&cfg.issuer).context("invalid issuer url")?;
-    let host = issuer
+fn issuer_host(cfg: &ServiceConfig) -> Result<String> {
+    Url::parse(&cfg.issuer)
+        .context("invalid issuer url")?
         .host_str()
-        .ok_or_else(|| anyhow!("issuer host missing"))?
-        .to_string();
-    let mut params = CertificateParams::new(vec![host.clone()])?;
-    params.is_ca = IsCa::NoCa;
-    params
-        .distinguished_name
-        .push(DnType::CommonName, host.clone());
-    params
-        .subject_alt_names
-        .push(SanType::DnsName("localhost".to_string().try_into()?));
-    params
-        .subject_alt_names
-        .push(SanType::DnsName(host.clone().try_into()?));
-    params
-        .subject_alt_names
-        .push(SanType::IpAddress(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))));
-    if let Ok(ip) = host.parse::<Ipv4Addr>() {
-        params
-            .subject_alt_names
-            .push(SanType::IpAddress(IpAddr::V4(ip)));
+        .map(|host| host.to_string())
+        .ok_or_else(|| anyhow!("issuer host missing"))
+}
+
+fn ensure_tls_private_key_pem() -> Result<String> {
+    if private_key_path().exists() {
+        let key_pem = fs::read_to_string(private_key_path()).context("read private key")?;
+        let rsa_key = RsaPrivateKey::from_pkcs1_pem(&key_pem)
+            .or_else(|_| RsaPrivateKey::from_pkcs8_pem(&key_pem))
+            .context("parse existing rsa key")?;
+        return rsa_key
+            .to_pkcs8_pem(LineEnding::LF)
+            .map(|pem| pem.to_string())
+            .context("serialize existing rsa key to PKCS#8");
     }
+
     let mut rng = OsRng;
     let rsa_key = RsaPrivateKey::new(&mut rng, 4096).context("generate rsa key")?;
-    let key_pem = rsa_key
+    rsa_key
         .to_pkcs8_pem(LineEnding::LF)
-        .context("serialize rsa key to PKCS#8")?
-        .to_string();
-    let key_pair = KeyPair::from_pem(&key_pem).context("load rcgen key pair")?;
-    let cert = params
-        .self_signed(&key_pair)
-        .context("self-sign certificate with rsa key")?;
-    let cert_pem = cert.pem();
+        .map(|pem| pem.to_string())
+        .context("serialize rsa key to PKCS#8")
+}
+
+fn ensure_certificate(cfg: &ServiceConfig) -> Result<()> {
+    let host = issuer_host(cfg)?;
+    let normalized_host = host.trim().to_ascii_lowercase();
+    let host_marker_path = certificate_host_path();
+    if private_key_path().exists() && certificate_path().exists() {
+        let recorded_host = fs::read_to_string(&host_marker_path)
+            .ok()
+            .map(|value| value.trim().to_ascii_lowercase());
+        if recorded_host.as_deref() == Some(normalized_host.as_str()) {
+            return Ok(());
+        }
+    }
+
+    let key_pem = ensure_tls_private_key_pem()?;
+    let mut dns_names = vec!["localhost".to_string()];
+    let mut ip_addresses = vec![IpAddr::V4(Ipv4Addr::LOCALHOST)];
+    if host.eq_ignore_ascii_case("localhost") {
+        // Already covered by the default SANs.
+    } else if let Ok(ip) = host.parse::<IpAddr>() {
+        ip_addresses.push(ip);
+    } else {
+        dns_names.push(host.clone());
+    }
+    let issued = home_pki::issue_server_certificate(&ServerCertificateRequest {
+        common_name: host,
+        dns_names,
+        ip_addresses,
+        existing_key_pair_pem: Some(key_pem.clone()),
+    })?;
+
     write_atomic(&private_key_path(), key_pem.as_bytes())?;
-    write_atomic(&certificate_path(), cert_pem.as_bytes())?;
+    write_atomic(&certificate_path(), issued.cert_pem.as_bytes())?;
+    write_atomic(&host_marker_path, normalized_host.as_bytes())?;
     Ok(())
 }
 
@@ -1492,11 +1515,10 @@ fn install_service() -> Result<()> {
     append_install_log("=== home-oidc install_service starting ===");
     let cfg = load_config_or_init().context("load or initialize config")?;
     append_install_log("Configuration loaded");
+    home_pki::ensure_root_ca_installed().context("ensure Home Lab root CA is installed")?;
+    append_install_log("Home Lab root CA installed");
     load_key_material(&cfg).context("ensure TLS key material")?;
     append_install_log("Key material ensured");
-    import_certificate_to_trust_store(&certificate_path())
-        .context("import certificate to Windows trust store")?;
-    append_install_log("Certificate imported (best effort)");
     ensure_firewall_rule(cfg.https_port).context("ensure firewall rule")?;
     append_install_log(&format!(
         "Firewall rule verified for port {}",
@@ -1559,25 +1581,6 @@ fn uninstall_service() -> Result<()> {
             }
             Err(_) => break,
         }
-    }
-    Ok(())
-}
-
-#[cfg(windows)]
-fn import_certificate_to_trust_store(path: &Path) -> Result<()> {
-    let path_str = path.display().to_string();
-    let status = std::process::Command::new("powershell.exe")
-        .args([
-            "-NoProfile",
-            "-Command",
-            &format!(
-                "try {{ Import-Certificate -FilePath '{}' -CertStoreLocation Cert:\\LocalMachine\\Root -ErrorAction Stop }} catch {{ Import-Certificate -FilePath '{}' -CertStoreLocation Cert:\\CurrentUser\\Root }}",
-                path_str, path_str
-            ),
-        ])
-        .status()?;
-    if !status.success() {
-        warn!("certificate import failed with status {:?}", status);
     }
     Ok(())
 }

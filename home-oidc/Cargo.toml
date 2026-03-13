@@ -43,6 +43,7 @@ windows-sys = { version = "0.61", features = [
 tonic = { version = "0.14", features = ["transport"] }
 prost = "0.14"
 tonic-prost = "0.14"
+home-pki = { path = "../home-pki" }
 
 [dev-dependencies]
 assert_cmd = "2.0"

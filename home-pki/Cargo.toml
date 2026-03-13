@@ -1,0 +1,12 @@
+[package]
+name = "home-pki"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-only"
+authors = ["Homelab Maintainers <maintainers@example.com>"]
+description = "Local PKI helpers for Home Lab"
+
+[dependencies]
+anyhow = "1.0"
+rcgen = { version = "0.14", features = ["pem", "x509-parser"] }
+time = "0.3"

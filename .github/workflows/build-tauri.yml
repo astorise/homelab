@@ -94,11 +94,13 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Build MCP server (Windows MSVC)
+      - name: Build MCP and certificate helpers (Windows MSVC)
         shell: pwsh
         run: |
           cargo build --manifest-path home-lab/src-tauri/Cargo.toml --bin home-lab-mcp --release
+          cargo build --manifest-path home-lab/src-tauri/Cargo.toml --bin home-lab-cert --release
           Copy-Item target/release/home-lab-mcp.exe home-lab/src-tauri/resources/bin/ -Force
+          Copy-Item target/release/home-lab-cert.exe home-lab/src-tauri/resources/bin/ -Force
           Get-ChildItem home-lab/src-tauri/resources/bin -Filter 'home-*.exe'
 
       - name: Setup Node.js

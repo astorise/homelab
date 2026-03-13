@@ -18,6 +18,7 @@ use crate::oidc::{
     StatusOut,
 };
 use anyhow::{anyhow, Context, Result};
+use home_pki::ServerCertificateRequest;
 use k8s_openapi::api::core::v1::{Event as CoreEvent, Namespace, Node, Pod};
 use k8s_openapi::api::events::v1::Event as EventsV1Event;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{MicroTime, Time};
@@ -283,6 +284,8 @@ const KUBE_API_READY_TIMEOUT_SECONDS: u64 = 30;
 const KUBE_API_READY_POLL_INTERVAL_MS: u64 = 350;
 const KUBECTL_APPLY_MAX_BYTES: usize = 2 * 1024 * 1024;
 const KUBECTL_APPLY_FIELD_MANAGER: &str = "home-lab-tauri";
+const HOME_LAB_DEFAULT_TLS_SECRET_NAME: &str = "home-lab-default-tls";
+const HOME_LAB_DEFAULT_TLS_NAMESPACE: &str = "kube-system";
 const HOME_LAB_WSL_INSTANCE_PREFIX: &str = "home-lab-k3s";
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
@@ -420,6 +423,76 @@ fn cluster_domains(instance: &str) -> Vec<String> {
 
 fn primary_cluster_domain(instance: &str) -> Option<String> {
     cluster_domains(instance).into_iter().next()
+}
+
+fn push_unique_domain(domains: &mut Vec<String>, candidate: String) {
+    if !domains
+        .iter()
+        .any(|existing| existing.eq_ignore_ascii_case(candidate.as_str()))
+    {
+        domains.push(candidate);
+    }
+}
+
+fn wildcard_domain_for_host(host: &str) -> Option<String> {
+    let (_, suffix) = host.split_once('.')?;
+    let suffix = suffix.trim().trim_matches('.');
+    if suffix.is_empty() {
+        None
+    } else {
+        Some(format!("*.{suffix}"))
+    }
+}
+
+fn cluster_tls_dns_names(instance: &str) -> Vec<String> {
+    let mut domains = Vec::new();
+    for host in cluster_domains(instance) {
+        push_unique_domain(&mut domains, host.clone());
+        if let Some(wildcard) = wildcard_domain_for_host(&host) {
+            push_unique_domain(&mut domains, wildcard);
+        }
+    }
+    domains
+}
+
+fn indent_yaml_block(value: &str, spaces: usize) -> String {
+    let indent = " ".repeat(spaces);
+    let normalized = value.replace("\r\n", "\n").replace('\r', "\n");
+    let trimmed = normalized.trim_end_matches('\n');
+    if trimmed.is_empty() {
+        return format!("{indent}\n");
+    }
+
+    let mut rendered = String::new();
+    for line in trimmed.lines() {
+        rendered.push_str(&indent);
+        rendered.push_str(line);
+        rendered.push('\n');
+    }
+    rendered
+}
+
+fn render_home_lab_default_tls_manifest(instance: &str) -> Result<String> {
+    let dns_names = cluster_tls_dns_names(instance);
+    let common_name = dns_names.first().cloned().ok_or_else(|| {
+        anyhow!("Aucun hostname disponible pour le certificat TLS de '{instance}'")
+    })?;
+    let issued = home_pki::issue_server_certificate(&ServerCertificateRequest {
+        common_name,
+        dns_names,
+        ip_addresses: Vec::new(),
+        existing_key_pair_pem: None,
+    })?;
+
+    let cert_block = indent_yaml_block(&issued.cert_pem, 4);
+    let key_block = indent_yaml_block(&issued.key_pem, 4);
+    Ok(format!(
+        "apiVersion: v1\nkind: Secret\nmetadata:\n  name: {secret_name}\n  namespace: {namespace}\ntype: kubernetes.io/tls\nstringData:\n  tls.crt: |\n{cert_block}  tls.key: |\n{key_block}---\napiVersion: traefik.io/v1alpha1\nkind: TLSStore\nmetadata:\n  name: default\n  namespace: {namespace}\nspec:\n  defaultCertificate:\n    secretName: {secret_name}\n",
+        secret_name = HOME_LAB_DEFAULT_TLS_SECRET_NAME,
+        namespace = HOME_LAB_DEFAULT_TLS_NAMESPACE,
+        cert_block = cert_block,
+        key_block = key_block,
+    ))
 }
 
 fn kube_api_proxy_route_name(instance: &str) -> String {
@@ -651,8 +724,12 @@ fn instance_port_plan(instance: &str) -> InstancePortPlan {
             k3s_api_port_max(),
         )
     };
-    let ingress_https_backend_port =
-        deterministic_port_for_instance(instance, http_port_base(), http_port_step(), http_port_max());
+    let ingress_https_backend_port = deterministic_port_for_instance(
+        instance,
+        http_port_base(),
+        http_port_step(),
+        http_port_max(),
+    );
     let nodeport_start = deterministic_port_for_instance(
         instance,
         k3s_nodeport_base(),
@@ -1515,13 +1592,19 @@ fn run_wsl_shell_script_via_stdin(
                 description
             )
         })?;
-        stdin
-            .write_all(script.as_bytes())
-            .with_context(|| format!("Ecriture stdin WSL impossible pour {} ({})", instance, description))?;
+        stdin.write_all(script.as_bytes()).with_context(|| {
+            format!(
+                "Ecriture stdin WSL impossible pour {} ({})",
+                instance, description
+            )
+        })?;
         if !script.ends_with('\n') {
-            stdin
-                .write_all(b"\n")
-                .with_context(|| format!("Finalisation stdin WSL impossible pour {} ({})", instance, description))?;
+            stdin.write_all(b"\n").with_context(|| {
+                format!(
+                    "Finalisation stdin WSL impossible pour {} ({})",
+                    instance, description
+                )
+            })?;
         }
     }
 
@@ -1885,8 +1968,7 @@ fn read_instance_kubectl_config_view(instance: &str) -> Result<KubectlConfigView
             Err(err) => {
                 last_issue = Some(format!(
                     "lecture kubectl impossible apres bootstrap (tentative {attempt}/{}): {}",
-                    KUBECTL_CONFIG_VIEW_RETRY_ATTEMPTS_AFTER_BOOTSTRAP,
-                    err
+                    KUBECTL_CONFIG_VIEW_RETRY_ATTEMPTS_AFTER_BOOTSTRAP, err
                 ));
             }
         }
@@ -2329,6 +2411,37 @@ async fn wsl_import_instance_with_paths(
                     sanitized_debug,
                     escape_for_log(&err.to_string())
                 ));
+            }
+        }
+
+        if is_home_lab_wsl_instance(&sanitized_name) {
+            let tls_trace_id = format!("{}-tls", next_kubectl_trace_id());
+            match reconcile_home_lab_cluster_default_tls(&sanitized_name, &tls_trace_id).await {
+                Ok(_) => {
+                    append_provision_message(
+                        &mut provision.message,
+                        "Certificat TLS par defaut Traefik reconcilie.",
+                    );
+                }
+                Err(err) => {
+                    warn!(
+                        target: "wsl",
+                        instance = %sanitized_name,
+                        trace_id = %tls_trace_id,
+                        error = %err,
+                        "Reconciliation TLS Traefik impossible apres import"
+                    );
+                    append_provision_message(
+                        &mut provision.message,
+                        &format!("Reconciliation TLS Traefik impossible: {err}"),
+                    );
+                    log_wsl_event(format!(
+                        "[{}] Reconciliation TLS Traefik impossible apres import {}: {}",
+                        tls_trace_id,
+                        sanitized_debug,
+                        escape_for_log(&err.to_string())
+                    ));
+                }
             }
         }
 
@@ -2997,7 +3110,8 @@ pub async fn wsl_remove_instance(name: String) -> Result<WslOperationResult, Str
     })?;
 
     for host in cluster_domains(&instance_name) {
-        if let Err(err) = retry_http_rpc("remove_route", || http::http_remove_route(host.clone())).await
+        if let Err(err) =
+            retry_http_rpc("remove_route", || http::http_remove_route(host.clone())).await
         {
             warn!(
                 target: "wsl",
@@ -3024,9 +3138,10 @@ pub async fn wsl_remove_instance(name: String) -> Result<WslOperationResult, Str
     }
 
     let tcp_route_name = kube_api_proxy_route_name(&instance_name);
-    if let Err(err) =
-        retry_http_rpc("remove_tcp_route", || http::http_remove_tcp_route(tcp_route_name.clone()))
-            .await
+    if let Err(err) = retry_http_rpc("remove_tcp_route", || {
+        http::http_remove_tcp_route(tcp_route_name.clone())
+    })
+    .await
     {
         warn!(
             target: "wsl",
@@ -3038,9 +3153,10 @@ pub async fn wsl_remove_instance(name: String) -> Result<WslOperationResult, Str
     }
 
     let ssh_route_name = ssh_proxy_route_name(&instance_name);
-    if let Err(err) =
-        retry_http_rpc("remove_tcp_route", || http::http_remove_tcp_route(ssh_route_name.clone()))
-            .await
+    if let Err(err) = retry_http_rpc("remove_tcp_route", || {
+        http::http_remove_tcp_route(ssh_route_name.clone())
+    })
+    .await
     {
         warn!(
             target: "wsl",
@@ -3226,7 +3342,10 @@ fn format_error_chain(err: &anyhow::Error) -> String {
         if trimmed.is_empty() {
             continue;
         }
-        if parts.last().is_some_and(|previous: &String| previous == trimmed) {
+        if parts
+            .last()
+            .is_some_and(|previous: &String| previous == trimmed)
+        {
             continue;
         }
         parts.push(trimmed.to_string());
@@ -4703,9 +4822,11 @@ printf 'launch-k3s-init port=%s repair=%s\n' '{api_port}' '{repair_flag}'
 
     if stdout.contains("launch-k3s-init") {
         let instance_for_launcher = instance.to_string();
-        tauri::async_runtime::spawn_blocking(move || run_k3s_runtime_launcher(&instance_for_launcher))
-            .await
-            .map_err(|e| anyhow!("Erreur JoinHandle lors du demarrage runtime k3s: {e}"))??;
+        tauri::async_runtime::spawn_blocking(move || {
+            run_k3s_runtime_launcher(&instance_for_launcher)
+        })
+        .await
+        .map_err(|e| anyhow!("Erreur JoinHandle lors du demarrage runtime k3s: {e}"))??;
     }
 
     sleep(Duration::from_millis(350)).await;
@@ -6379,6 +6500,46 @@ async fn execute_kubectl_command(
     }
 }
 
+async fn ensure_home_lab_cluster_default_tls(
+    client: &Client,
+    config: &KubeClientConfig,
+    instance: &str,
+    trace_id: &str,
+) -> Result<()> {
+    if !is_home_lab_wsl_instance(instance) {
+        return Ok(());
+    }
+
+    let manifest = render_home_lab_default_tls_manifest(instance)?;
+    let stdout = execute_kubectl_apply_yaml(client, config, &manifest).await?;
+    info!(
+        target: "wsl",
+        trace_id = %trace_id,
+        instance = %instance,
+        stdout = %escape_for_log(stdout.trim()),
+        "Certificat TLS par defaut Traefik reconcilie"
+    );
+    log_wsl_event(format!(
+        "[{trace_id}] Certificat TLS Traefik reconcilie pour {}: {}",
+        escape_for_log(instance),
+        escape_for_log(stdout.trim())
+    ));
+    Ok(())
+}
+
+async fn reconcile_home_lab_cluster_default_tls(instance: &str, trace_id: &str) -> Result<()> {
+    if !is_home_lab_wsl_instance(instance) {
+        return Ok(());
+    }
+
+    ensure_rustls_crypto_provider(trace_id, instance)?;
+    ensure_wsl_instance_running(instance, trace_id).await?;
+    let endpoint = resolve_kube_api_endpoint_for_instance(instance, trace_id).await?;
+    let endpoint = wait_for_kube_api_port(instance, &endpoint, trace_id).await?;
+    let (client, config, _, _) = build_kube_client_for_instance(instance, Some(&endpoint)).await?;
+    ensure_home_lab_cluster_default_tls(&client, &config, instance, trace_id).await
+}
+
 async fn run_wsl_kubectl_exec(instance: &str, args: &[String]) -> Result<WslKubectlExecResult> {
     if args.is_empty() {
         return Err(anyhow!("La commande kubectl est requise."));
@@ -6543,6 +6704,28 @@ Verifie que '{}' peut demarrer et exposer l'API Kubernetes.",
             kubeconfig = %kubeconfig_path.display(),
             "Client Kubernetes initialise"
         );
+        if let Err(err) = ensure_home_lab_cluster_default_tls(
+            &client,
+            &config,
+            &instance_for_task,
+            &trace_for_task,
+        )
+        .await
+        {
+            warn!(
+                target: "wsl",
+                trace_id = %trace_for_task,
+                instance = %instance_for_task,
+                error = %err,
+                "Reconciliation TLS Traefik ignoree avant kubectl"
+            );
+            log_wsl_event(format!(
+                "[{}] Reconciliation TLS Traefik ignoree pour {} avant kubectl: {}",
+                trace_for_task,
+                escape_for_log(&instance_for_task),
+                escape_for_log(&err.to_string())
+            ));
+        }
         let stdout = execute_kubectl_command(&client, &config, command).await?;
         Ok::<(String, String, PathBuf), anyhow::Error>((stdout, resolved_context, kubeconfig_path))
     });
@@ -6809,6 +6992,28 @@ Verifie que '{}' peut demarrer et exposer l'API Kubernetes.",
         let (client, config, resolved_context, kubeconfig_path) =
             build_kube_client_for_instance(&instance_for_task, Some(&api_endpoint_for_task))
                 .await?;
+        if let Err(err) = ensure_home_lab_cluster_default_tls(
+            &client,
+            &config,
+            &instance_for_task,
+            &trace_for_task,
+        )
+        .await
+        {
+            warn!(
+                target: "wsl",
+                trace_id = %trace_for_task,
+                instance = %instance_for_task,
+                error = %err,
+                "Reconciliation TLS Traefik ignoree avant kubectl apply"
+            );
+            log_wsl_event(format!(
+                "[{}] Reconciliation TLS Traefik ignoree pour {} avant kubectl apply: {}",
+                trace_for_task,
+                escape_for_log(&instance_for_task),
+                escape_for_log(&err.to_string())
+            ));
+        }
         let stdout = execute_kubectl_apply_yaml(&client, &config, &manifest_for_task).await?;
         Ok::<(String, String, PathBuf), anyhow::Error>((stdout, resolved_context, kubeconfig_path))
     });

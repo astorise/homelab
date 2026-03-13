@@ -11,6 +11,7 @@ use hickory_proto::op::{Message, MessageType, ResponseCode};
 use hickory_proto::rr::rdata::{A as RDataA, AAAA as RDataAAAA};
 use hickory_proto::rr::{DNSClass, RData, Record as DnsRecord, RecordType};
 use hickory_proto::serialize::binary::{BinEncodable, BinEncoder};
+use home_pki::ServerCertificateRequest;
 use http::header::CONTENT_TYPE;
 use http::{Method, StatusCode};
 use http_body_util::{BodyExt, Full};
@@ -21,15 +22,15 @@ use hyper_util::rt::TokioIo;
 use log::{LevelFilter, debug, error, info, warn};
 use parking_lot::Mutex;
 use pin_project::pin_project;
-use rcgen::{CertificateParams, DnType, IsCa, KeyPair, SanType};
 use rsa::RsaPrivateKey;
-use rsa::pkcs8::{EncodePrivateKey, LineEnding};
+use rsa::pkcs1::DecodeRsaPrivateKey;
+use rsa::pkcs8::{DecodePrivateKey, EncodePrivateKey, LineEnding};
 use rsa::rand_core::OsRng;
 use rustls::ServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::convert::{Infallible, TryInto};
+use std::convert::Infallible;
 use std::ffi::{OsString, c_void};
 use std::fs::{self, File};
 use std::io::{self, Write};
@@ -1403,43 +1404,47 @@ fn ensure_doh_certificate(cfg: &DnsConfig) -> Result<()> {
         );
     }
 
-    let mut params = CertificateParams::new(vec![host.to_string()])?;
-    params.is_ca = IsCa::NoCa;
-    params
-        .distinguished_name
-        .push(DnType::CommonName, host.to_string());
-    params
-        .subject_alt_names
-        .push(SanType::DnsName("localhost".to_string().try_into()?));
+    let key_pem = ensure_doh_private_key_pem()?;
+    let mut dns_names = vec!["localhost".to_string()];
+    let mut ip_addresses = vec![IpAddr::V4(Ipv4Addr::LOCALHOST)];
     if host.eq_ignore_ascii_case("localhost") {
-        params
-            .subject_alt_names
-            .push(SanType::IpAddress(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+        // Already covered by the default SANs.
     } else if let Ok(ip) = host.parse::<IpAddr>() {
-        params.subject_alt_names.push(SanType::IpAddress(ip));
+        ip_addresses.push(ip);
     } else {
-        params
-            .subject_alt_names
-            .push(SanType::DnsName(host.to_string().try_into()?));
+        dns_names.push(host.to_string());
     }
-    params
-        .subject_alt_names
-        .push(SanType::IpAddress(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+    let cert = home_pki::issue_server_certificate(&ServerCertificateRequest {
+        common_name: host.to_string(),
+        dns_names,
+        ip_addresses,
+        existing_key_pair_pem: Some(key_pem.clone()),
+    })?;
 
-    let mut rng = OsRng;
-    let rsa_key = RsaPrivateKey::new(&mut rng, 4096).context("generate rsa key")?;
-    let key_pem = rsa_key
-        .to_pkcs8_pem(LineEnding::LF)
-        .context("serialize rsa key to PKCS#8")?
-        .to_string();
-    let key_pair = KeyPair::from_pem(&key_pem).context("load rcgen key pair")?;
-    let cert = params
-        .self_signed(&key_pair)
-        .context("self-sign DoH certificate")?;
     write_atomic(&doh_private_key_path(), key_pem.as_bytes())?;
-    write_atomic(&doh_certificate_path(), cert.pem().as_bytes())?;
+    write_atomic(&doh_certificate_path(), cert.cert_pem.as_bytes())?;
     write_atomic(&host_marker, normalized_host.as_bytes())?;
     Ok(())
+}
+
+fn ensure_doh_private_key_pem() -> Result<String> {
+    if doh_private_key_path().exists() {
+        let key_pem = fs::read_to_string(doh_private_key_path()).context("read DoH private key")?;
+        let rsa_key = RsaPrivateKey::from_pkcs1_pem(&key_pem)
+            .or_else(|_| RsaPrivateKey::from_pkcs8_pem(&key_pem))
+            .context("parse existing DoH rsa key")?;
+        return rsa_key
+            .to_pkcs8_pem(LineEnding::LF)
+            .map(|pem| pem.to_string())
+            .context("serialize existing DoH rsa key to PKCS#8");
+    }
+
+    let mut rng = OsRng;
+    let rsa_key = RsaPrivateKey::new(&mut rng, 4096).context("generate DoH rsa key")?;
+    rsa_key
+        .to_pkcs8_pem(LineEnding::LF)
+        .map(|pem| pem.to_string())
+        .context("serialize DoH rsa key to PKCS#8")
 }
 
 fn load_doh_tls_config(cfg: &DnsConfig) -> Result<Arc<ServerConfig>> {
@@ -1477,27 +1482,6 @@ fn load_doh_tls_config(cfg: &DnsConfig) -> Result<Arc<ServerConfig>> {
         .with_single_cert(certs, key)
         .context("build DoH rustls config")?;
     Ok(Arc::new(tls))
-}
-
-fn import_certificate_to_trust_store(path: &Path) -> Result<()> {
-    let path_str = path.display().to_string();
-    let script = format!(
-        "try {{ Import-Certificate -FilePath '{path}' -CertStoreLocation Cert:\\\\LocalMachine\\\\Root -ErrorAction Stop }} catch {{ Import-Certificate -FilePath '{path}' -CertStoreLocation Cert:\\\\CurrentUser\\\\Root }}",
-        path = path_str.replace('\'', "''"),
-    );
-    let status = Command::new("powershell.exe")
-        .args([
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            &script,
-        ])
-        .status()?;
-    if !status.success() {
-        warn!("DoH certificate import failed with status {:?}", status);
-    }
-    Ok(())
 }
 
 fn install_rustls_provider() -> Result<()> {
@@ -1827,7 +1811,7 @@ fn run_service() -> Result<()> {
             None
         };
         if cfg.doh.enabled {
-            let _ = import_certificate_to_trust_store(&doh_certificate_path());
+            let _ = home_pki::ensure_root_ca_installed();
             if let Err(e) = register_windows_doh_template(&cfg) {
                 warn!("DoH template registration skipped: {e:#}");
             }
@@ -1964,7 +1948,7 @@ fn run_console() -> Result<()> {
             None
         };
         if cfg.doh.enabled {
-            let _ = import_certificate_to_trust_store(&doh_certificate_path());
+            let _ = home_pki::ensure_root_ca_installed();
             if let Err(e) = register_windows_doh_template(&cfg) {
                 warn!("DoH template registration skipped: {e:#}");
             }
@@ -2052,9 +2036,9 @@ fn install_service() -> Result<()> {
     if let Err(e) = init_logger(level_from_cfg(&cfg)) {
         eprintln!("[install] logger init failed (continuing): {e}");
     }
+    home_pki::ensure_root_ca_installed().context("ensure Home Lab root CA is installed")?;
     if cfg.doh.enabled {
         ensure_doh_certificate(&cfg)?;
-        let _ = import_certificate_to_trust_store(&doh_certificate_path());
         let _ = ensure_doh_firewall_rule(cfg.doh.port);
         if let Err(e) = register_windows_doh_template(&cfg) {
             warn!("DoH template registration failed during install: {e:#}");
@@ -2179,8 +2163,8 @@ fn main() -> Result<()> {
         "doh-register" => {
             let cfg = load_config_or_init()?;
             init_logger(level_from_cfg(&cfg))?;
+            home_pki::ensure_root_ca_installed()?;
             ensure_doh_certificate(&cfg)?;
-            let _ = import_certificate_to_trust_store(&doh_certificate_path());
             register_windows_doh_template(&cfg)?;
             println!("Template DoH enregistré: {}", cfg.doh_template_url());
         }

@@ -53,6 +53,7 @@ reqwest = { version = "0.13", features = ["json", "stream"] }
 kube = "3.0.1"
 k8s-openapi = { version = "0.27.0", features = ["latest"] }
 rustls = { version = "0.23", features = ["ring", "aws-lc-rs"] }
+home-pki = { path = "../../home-pki" }
 
 [dev-dependencies]
 tempfile = "3"
@@ -66,6 +67,9 @@ path = "src/main.rs"
 name = "home-lab-mcp"
 path = "src/bin/home-lab-mcp.rs"
 
+[[bin]]
+name = "home-lab-cert"
+path = "src/bin/home-lab-cert.rs"
 
 
 [target.'cfg(windows)'.dependencies]

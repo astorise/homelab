@@ -2147,6 +2147,7 @@ dependencies = [
  "flexi_logger",
  "futures-util",
  "hickory-proto",
+ "home-pki",
  "http",
  "http-body-util",
  "hyper",
@@ -2218,6 +2219,7 @@ dependencies = [
  "anyhow",
  "dirs",
  "futures-util",
+ "home-pki",
  "hyper-util",
  "k8s-openapi",
  "kube",
@@ -2262,6 +2264,7 @@ dependencies = [
  "assert_cmd",
  "base64 0.22.1",
  "flexi_logger",
+ "home-pki",
  "http",
  "http-body-util",
  "hyper",
@@ -2293,6 +2296,15 @@ dependencies = [
  "url",
  "windows-service",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "home-pki"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "rcgen",
+ "time",
 ]
 
 [[package]]
