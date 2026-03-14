@@ -596,18 +596,28 @@ fn build_home_lab_default_tls_assets(
     })
 }
 
+fn home_lab_default_tls_dns_names_match_instance(
+    actual_dns_names: &[String],
+    instance: &str,
+) -> bool {
+    let expected_dns_names = cluster_tls_dns_names(instance);
+    expected_dns_names.iter().all(|expected| {
+        actual_dns_names
+            .iter()
+            .any(|actual| actual.eq_ignore_ascii_case(expected))
+    })
+}
+
 fn home_lab_default_tls_cert_matches_instance(cert_pem: &str, instance: &str) -> Result<bool> {
     if !home_pki::is_certificate_signed_by_current_root(cert_pem)? {
         return Ok(false);
     }
 
     let actual_dns_names = home_pki::certificate_dns_names(cert_pem)?;
-    let expected_dns_names = cluster_tls_dns_names(instance);
-    Ok(expected_dns_names.iter().all(|expected| {
-        actual_dns_names
-            .iter()
-            .any(|actual| actual.eq_ignore_ascii_case(expected))
-    }))
+    Ok(home_lab_default_tls_dns_names_match_instance(
+        &actual_dns_names,
+        instance,
+    ))
 }
 
 fn kube_api_proxy_route_name(instance: &str) -> String {
@@ -4600,6 +4610,43 @@ fn probe_home_lab_traefik_served_tls_certificate(instance: &str) -> Result<()> {
         })?;
     }
 
+    let served_cert_der = connection
+        .peer_certificates()
+        .and_then(|certificates| certificates.first())
+        .ok_or_else(|| {
+            anyhow!(
+                "Aucun certificat serveur retourne par Traefik pour '{}' sur 127.0.0.1:{}.",
+                instance,
+                port
+            )
+        })?;
+    let actual_dns_names = home_pki::certificate_dns_names_from_der(served_cert_der.as_ref())
+        .with_context(|| {
+            format!(
+                "Lecture des SAN du certificat TLS servi par Traefik impossible pour '{}'.",
+                instance
+            )
+        })?;
+    if !home_lab_default_tls_dns_names_match_instance(&actual_dns_names, instance) {
+        let expected_dns_names = cluster_tls_dns_names(instance);
+        let expected_display = if expected_dns_names.is_empty() {
+            "(aucun)".to_string()
+        } else {
+            expected_dns_names.join(", ")
+        };
+        let actual_display = if actual_dns_names.is_empty() {
+            "(aucun)".to_string()
+        } else {
+            actual_dns_names.join(", ")
+        };
+        anyhow::bail!(
+            "Le certificat TLS servi par Traefik pour '{}' ne correspond pas a l'instance attendue (SAN attendus: {}; SAN servis: {}).",
+            instance,
+            expected_display,
+            actual_display
+        );
+    }
+
     Ok(())
 }
 
@@ -8234,6 +8281,29 @@ mod tests {
             "home-lab-k3s-2"
         )
         .expect("match second instance"),);
+    }
+
+    #[test]
+    fn tls_dns_names_do_not_accept_other_instance_via_shared_wildcard() {
+        let first_dns_names = vec!["*.wsl".to_string(), "home-lab-k3s.wsl".to_string()];
+        let second_dns_names = vec!["*.wsl".to_string(), "home-lab-k3s-2.wsl".to_string()];
+
+        assert!(home_lab_default_tls_dns_names_match_instance(
+            &first_dns_names,
+            HOME_LAB_WSL_INSTANCE_PREFIX
+        ));
+        assert!(!home_lab_default_tls_dns_names_match_instance(
+            &first_dns_names,
+            "home-lab-k3s-2"
+        ));
+        assert!(home_lab_default_tls_dns_names_match_instance(
+            &second_dns_names,
+            "home-lab-k3s-2"
+        ));
+        assert!(!home_lab_default_tls_dns_names_match_instance(
+            &second_dns_names,
+            HOME_LAB_WSL_INSTANCE_PREFIX
+        ));
     }
 
     #[test]

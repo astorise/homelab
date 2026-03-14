@@ -6,15 +6,15 @@ use home_lab_lib::{
     oidc::{self, RegisterClientIn},
     wsl,
 };
+use rmcp::schemars;
 use rmcp::{
-    ErrorData as McpError, ServerHandler, ServiceExt,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{CallToolResult, Implementation, ServerCapabilities, ServerInfo},
     schemars::JsonSchema,
     tool, tool_handler, tool_router,
     transport::stdio,
+    ErrorData as McpError, ServerHandler, ServiceExt,
 };
-use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 use tracing_appender::rolling;
 use tracing_subscriber::{fmt, EnvFilter};
