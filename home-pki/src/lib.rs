@@ -248,12 +248,22 @@ pub fn is_certificate_signed_by_current_root(cert_pem: &str) -> Result<bool> {
         .is_ok())
 }
 
+pub fn current_root_ca_certificate_der() -> Result<Vec<u8>> {
+    let root = ensure_root_ca()?;
+    let (_, root_pem) = parse_x509_pem(root.cert_pem.as_bytes())
+        .map_err(|_| anyhow!("parse root PEM certificate"))?;
+    Ok(root_pem.contents)
+}
+
 pub fn certificate_dns_names(cert_pem: &str) -> Result<Vec<String>> {
     let (_, leaf_pem) =
         parse_x509_pem(cert_pem.as_bytes()).map_err(|_| anyhow!("parse leaf PEM certificate"))?;
-    let leaf_cert = leaf_pem
-        .parse_x509()
-        .context("parse leaf DER certificate")?;
+    certificate_dns_names_from_der(&leaf_pem.contents)
+}
+
+pub fn certificate_dns_names_from_der(cert_der: &[u8]) -> Result<Vec<String>> {
+    let (_, leaf_cert) = x509_parser::parse_x509_certificate(cert_der)
+        .map_err(|_| anyhow!("parse leaf DER certificate"))?;
 
     let mut names = BTreeSet::new();
     if let Ok(Some(subject_alt_name)) = leaf_cert.subject_alternative_name() {

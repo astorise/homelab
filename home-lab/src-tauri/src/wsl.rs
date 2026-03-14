@@ -2,11 +2,12 @@ use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::net::Ipv4Addr;
+use std::net::TcpStream as StdTcpStream;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpStream;
 use tokio::time::{sleep, Duration};
@@ -32,6 +33,8 @@ use reqwest::Url;
 use rsa::pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding};
 use rsa::rand_core::{OsRng, RngCore};
 use rsa::RsaPrivateKey;
+use rustls::pki_types::{CertificateDer, ServerName};
+use rustls::{ClientConfig as RustlsClientConfig, ClientConnection, RootCertStore};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::json;
 use tauri::{AppHandle, Manager};
@@ -296,6 +299,9 @@ const HOME_LAB_TRAEFIK_TLSSTORE_DISCOVERY_TIMEOUT_SECONDS: u64 = 45;
 const HOME_LAB_TRAEFIK_TLSSTORE_DISCOVERY_INTERVAL_MS: u64 = 1500;
 const HOME_LAB_TRAEFIK_ROLLOUT_TIMEOUT_SECONDS: u64 = 180;
 const HOME_LAB_TRAEFIK_ROLLOUT_POLL_INTERVAL_MS: u64 = 1500;
+const HOME_LAB_TRAEFIK_TLS_SERVE_VERIFY_TIMEOUT_SECONDS: u64 = 30;
+const HOME_LAB_TRAEFIK_TLS_SERVE_VERIFY_INTERVAL_MS: u64 = 750;
+const HOME_LAB_TRAEFIK_TLS_RESTART_MAX_ATTEMPTS: usize = 2;
 const HOME_LAB_WSL_INSTANCE_PREFIX: &str = "home-lab-k3s";
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
@@ -4543,6 +4549,118 @@ async fn read_home_lab_default_tls_secret_cert_pem(client: &Client) -> Result<Op
     Ok(Some(cert_pem))
 }
 
+fn probe_home_lab_traefik_served_tls_certificate(instance: &str) -> Result<()> {
+    let expected_host = primary_cluster_domain(instance).ok_or_else(|| {
+        anyhow!(
+            "Aucun domaine principal disponible pour verifier le certificat servi par '{}'.",
+            instance
+        )
+    })?;
+    let port = instance_port_plan(instance).ingress_https_backend_port;
+
+    let root_der = home_pki::current_root_ca_certificate_der()?;
+    let mut roots = RootCertStore::empty();
+    roots
+        .add(CertificateDer::from(root_der))
+        .context("Ajout de la racine Home Lab au store Rustls impossible")?;
+    let client_config = Arc::new(
+        RustlsClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    );
+    let server_name = ServerName::try_from(expected_host.clone())
+        .map_err(|_| anyhow!("Nom DNS invalide pour la verification TLS: {expected_host}"))?;
+
+    let mut socket = StdTcpStream::connect(("127.0.0.1", port)).with_context(|| {
+        format!(
+            "Connexion TCP au backend HTTPS Traefik impossible pour '{}' sur 127.0.0.1:{}.",
+            instance, port
+        )
+    })?;
+    let io_timeout = std::time::Duration::from_secs(KUBE_CONNECT_TIMEOUT_SECONDS.max(1));
+    socket
+        .set_read_timeout(Some(io_timeout))
+        .context("Configuration du read timeout TLS impossible")?;
+    socket
+        .set_write_timeout(Some(io_timeout))
+        .context("Configuration du write timeout TLS impossible")?;
+
+    let mut connection = ClientConnection::new(client_config, server_name).with_context(|| {
+        format!(
+            "Initialisation du client TLS Rustls impossible pour '{}' ({expected_host}).",
+            instance
+        )
+    })?;
+    while connection.is_handshaking() {
+        connection.complete_io(&mut socket).with_context(|| {
+            format!(
+                "Handshake TLS Traefik invalide pour '{}' sur 127.0.0.1:{} avec SNI '{}'.",
+                instance, port, expected_host
+            )
+        })?;
+    }
+
+    Ok(())
+}
+
+async fn wait_for_home_lab_traefik_served_tls_certificate(
+    instance: &str,
+    trace_id: &str,
+    reason: &str,
+    restart_attempt: usize,
+) -> Result<()> {
+    let started_at = Instant::now();
+    let timeout = Duration::from_secs(HOME_LAB_TRAEFIK_TLS_SERVE_VERIFY_TIMEOUT_SECONDS);
+    let mut last_error = String::new();
+
+    while started_at.elapsed() < timeout {
+        let instance_owned = instance.to_string();
+        match tauri::async_runtime::spawn_blocking(move || {
+            probe_home_lab_traefik_served_tls_certificate(&instance_owned)
+        })
+        .await
+        {
+            Ok(Ok(())) => {
+                info!(
+                    target: "wsl",
+                    trace_id = %trace_id,
+                    instance = %instance,
+                    reason = %reason,
+                    restart_attempt,
+                    "Certificat TLS effectivement servi par Traefik valide"
+                );
+                log_wsl_event(format!(
+                    "[{trace_id}] Certificat TLS servi valide pour {} apres restart Traefik: reason={} attempt={}",
+                    escape_for_log(instance),
+                    escape_for_log(reason),
+                    restart_attempt
+                ));
+                return Ok(());
+            }
+            Ok(Err(err)) => {
+                last_error = err.to_string();
+            }
+            Err(err) => {
+                last_error = format!("Verification TLS interrompue: {err}");
+            }
+        }
+
+        sleep(Duration::from_millis(
+            HOME_LAB_TRAEFIK_TLS_SERVE_VERIFY_INTERVAL_MS,
+        ))
+        .await;
+    }
+
+    anyhow::bail!(
+        "Le certificat TLS servi par Traefik pour '{}' reste invalide apres {}s (reason={}, attempt={}): {}",
+        instance,
+        HOME_LAB_TRAEFIK_TLS_SERVE_VERIFY_TIMEOUT_SECONDS,
+        reason,
+        restart_attempt,
+        last_error
+    )
+}
+
 async fn restart_home_lab_traefik_deployment(
     client: &Client,
     instance: &str,
@@ -4614,102 +4732,141 @@ async fn restart_home_lab_traefik_deployment(
         .await;
     }
 
-    let restart_at = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-        .to_string();
-    let patch = json!({
-        "spec": {
-            "template": {
-                "metadata": {
-                    "annotations": {
-                        HOME_LAB_TRAEFIK_RESTART_ANNOTATION: restart_at
+    for restart_attempt in 1..=HOME_LAB_TRAEFIK_TLS_RESTART_MAX_ATTEMPTS {
+        let restart_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .to_string();
+        let patch = json!({
+            "spec": {
+                "template": {
+                    "metadata": {
+                        "annotations": {
+                            HOME_LAB_TRAEFIK_RESTART_ANNOTATION: restart_at
+                        }
                     }
                 }
             }
-        }
-    });
-    let patched = deployments
-        .patch(
-            HOME_LAB_TRAEFIK_DEPLOYMENT_NAME,
-            &PatchParams::default(),
-            &Patch::Merge(&patch),
-        )
-        .await
-        .with_context(|| {
-            format!(
-                "Redemarrage du deployment '{}' impossible dans le namespace '{}'.",
-                HOME_LAB_TRAEFIK_DEPLOYMENT_NAME, HOME_LAB_DEFAULT_TLS_NAMESPACE
+        });
+        let patched = deployments
+            .patch(
+                HOME_LAB_TRAEFIK_DEPLOYMENT_NAME,
+                &PatchParams::default(),
+                &Patch::Merge(&patch),
             )
-        })?;
-    let expected_generation = patched.metadata.generation.unwrap_or_default();
-
-    info!(
-        target: "wsl",
-        trace_id = %trace_id,
-        instance = %instance,
-        reason = %reason,
-        expected_generation,
-        "Redemarrage du deployment Traefik demande"
-    );
-    log_wsl_event(format!(
-        "[{trace_id}] Redemarrage Traefik demande pour {}: reason={} generation={}",
-        escape_for_log(instance),
-        escape_for_log(reason),
-        expected_generation
-    ));
-
-    let started_at = Instant::now();
-    let timeout = Duration::from_secs(HOME_LAB_TRAEFIK_ROLLOUT_TIMEOUT_SECONDS);
-    loop {
-        let deployment = deployments
-            .get(HOME_LAB_TRAEFIK_DEPLOYMENT_NAME)
             .await
             .with_context(|| {
                 format!(
-                    "Lecture du deployment '{}' impossible apres redemarrage.",
-                    HOME_LAB_TRAEFIK_DEPLOYMENT_NAME
+                    "Redemarrage du deployment '{}' impossible dans le namespace '{}'.",
+                    HOME_LAB_TRAEFIK_DEPLOYMENT_NAME, HOME_LAB_DEFAULT_TLS_NAMESPACE
                 )
             })?;
-        let state = TraefikDeploymentRolloutState::from_deployment(&deployment);
-        if state.is_available_for_generation(expected_generation) {
-            info!(
-                target: "wsl",
-                trace_id = %trace_id,
-                instance = %instance,
-                reason = %reason,
-                desired_replicas = state.desired_replicas,
-                "Deployment Traefik redemarre et disponible"
-            );
-            log_wsl_event(format!(
-                "[{trace_id}] Deployment Traefik disponible pour {} apres restart: reason={} replicas={}",
-                escape_for_log(instance),
-                escape_for_log(reason),
-                state.desired_replicas
-            ));
-            return Ok(());
-        }
+        let expected_generation = patched.metadata.generation.unwrap_or_default();
 
-        if started_at.elapsed() >= timeout {
-            anyhow::bail!(
-                "Le deployment '{}' n'est pas redevenu disponible apres {}s (reason={}, generation observee={}, ready={}, updated={}, available={}, unavailable={}).",
-                HOME_LAB_TRAEFIK_DEPLOYMENT_NAME,
-                HOME_LAB_TRAEFIK_ROLLOUT_TIMEOUT_SECONDS,
-                reason,
-                state.observed_generation,
-                state.ready_replicas,
-                state.updated_replicas,
-                state.available_replicas,
-                state.unavailable_replicas
-            );
-        }
+        info!(
+            target: "wsl",
+            trace_id = %trace_id,
+            instance = %instance,
+            reason = %reason,
+            restart_attempt,
+            expected_generation,
+            "Redemarrage du deployment Traefik demande"
+        );
+        log_wsl_event(format!(
+            "[{trace_id}] Redemarrage Traefik demande pour {}: reason={} generation={} attempt={}",
+            escape_for_log(instance),
+            escape_for_log(reason),
+            expected_generation,
+            restart_attempt
+        ));
 
-        sleep(Duration::from_millis(
-            HOME_LAB_TRAEFIK_ROLLOUT_POLL_INTERVAL_MS,
-        ))
-        .await;
+        let started_at = Instant::now();
+        let timeout = Duration::from_secs(HOME_LAB_TRAEFIK_ROLLOUT_TIMEOUT_SECONDS);
+        loop {
+            let deployment = deployments
+                .get(HOME_LAB_TRAEFIK_DEPLOYMENT_NAME)
+                .await
+                .with_context(|| {
+                    format!(
+                        "Lecture du deployment '{}' impossible apres redemarrage.",
+                        HOME_LAB_TRAEFIK_DEPLOYMENT_NAME
+                    )
+                })?;
+            let state = TraefikDeploymentRolloutState::from_deployment(&deployment);
+            if state.is_available_for_generation(expected_generation) {
+                info!(
+                    target: "wsl",
+                    trace_id = %trace_id,
+                    instance = %instance,
+                    reason = %reason,
+                    restart_attempt,
+                    desired_replicas = state.desired_replicas,
+                    "Deployment Traefik redemarre et disponible"
+                );
+                log_wsl_event(format!(
+                    "[{trace_id}] Deployment Traefik disponible pour {} apres restart: reason={} replicas={} attempt={}",
+                    escape_for_log(instance),
+                    escape_for_log(reason),
+                    state.desired_replicas,
+                    restart_attempt
+                ));
+
+                match wait_for_home_lab_traefik_served_tls_certificate(
+                    instance,
+                    trace_id,
+                    reason,
+                    restart_attempt,
+                )
+                .await
+                {
+                    Ok(()) => return Ok(()),
+                    Err(err) if restart_attempt < HOME_LAB_TRAEFIK_TLS_RESTART_MAX_ATTEMPTS => {
+                        warn!(
+                            target: "wsl",
+                            trace_id = %trace_id,
+                            instance = %instance,
+                            reason = %reason,
+                            restart_attempt,
+                            error = %err,
+                            "Certificat TLS servi invalide apres restart Traefik; nouvelle tentative"
+                        );
+                        log_wsl_event(format!(
+                            "[{trace_id}] Certificat TLS servi invalide pour {} apres restart Traefik: reason={} attempt={} error={}",
+                            escape_for_log(instance),
+                            escape_for_log(reason),
+                            restart_attempt,
+                            escape_for_log(&err.to_string())
+                        ));
+                        break;
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
+
+            if started_at.elapsed() >= timeout {
+                anyhow::bail!(
+                    "Le deployment '{}' n'est pas redevenu disponible apres {}s (reason={}, attempt={}, generation observee={}, ready={}, updated={}, available={}, unavailable={}).",
+                    HOME_LAB_TRAEFIK_DEPLOYMENT_NAME,
+                    HOME_LAB_TRAEFIK_ROLLOUT_TIMEOUT_SECONDS,
+                    reason,
+                    restart_attempt,
+                    state.observed_generation,
+                    state.ready_replicas,
+                    state.updated_replicas,
+                    state.available_replicas,
+                    state.unavailable_replicas
+                );
+            }
+
+            sleep(Duration::from_millis(
+                HOME_LAB_TRAEFIK_ROLLOUT_POLL_INTERVAL_MS,
+            ))
+            .await;
+        }
     }
+
+    Ok(())
 }
 
 fn format_age_from_seconds(created: i64) -> String {
