@@ -2526,10 +2526,16 @@ async fn wsl_import_instance_with_paths(
         if is_home_lab_wsl_instance(&sanitized_name) {
             let tls_trace_id = format!("{}-tls", next_kubectl_trace_id());
             match reconcile_home_lab_cluster_default_tls(&sanitized_name, &tls_trace_id).await {
-                Ok(_) => {
+                Ok(HomeLabTraefikTlsReconcileStatus::Reconciled) => {
                     append_provision_message(
                         &mut provision.message,
                         "Certificat TLS par defaut Traefik reconcilie.",
+                    );
+                }
+                Ok(HomeLabTraefikTlsReconcileStatus::Deferred) => {
+                    append_provision_message(
+                        &mut provision.message,
+                        "Reconciliation TLS Traefik differee le temps que Traefik termine son bootstrap.",
                     );
                 }
                 Err(err) => {
@@ -4324,6 +4330,69 @@ async fn execute_kubectl_apply_yaml(
     Ok(applied_lines.join("\n"))
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HomeLabTraefikTlsReconcileStatus {
+    Reconciled,
+    Deferred,
+}
+
+async fn wait_for_home_lab_traefik_deployment_presence(
+    client: &Client,
+    trace_id: &str,
+    instance: &str,
+) -> Result<bool> {
+    let deployments: Api<Deployment> =
+        Api::namespaced(client.clone(), HOME_LAB_DEFAULT_TLS_NAMESPACE);
+    let started_at = Instant::now();
+    let timeout = Duration::from_secs(HOME_LAB_TRAEFIK_ROLLOUT_TIMEOUT_SECONDS);
+    let mut last_error = String::new();
+
+    while started_at.elapsed() < timeout {
+        match deployments.get_opt(HOME_LAB_TRAEFIK_DEPLOYMENT_NAME).await {
+            Ok(Some(_)) => {
+                info!(
+                    target: "wsl",
+                    trace_id = %trace_id,
+                    instance = %instance,
+                    deployment = HOME_LAB_TRAEFIK_DEPLOYMENT_NAME,
+                    "Deployment Traefik detecte"
+                );
+                return Ok(true);
+            }
+            Ok(None) => {
+                last_error = format!(
+                    "Deployment '{}' absent dans namespace '{}'",
+                    HOME_LAB_TRAEFIK_DEPLOYMENT_NAME, HOME_LAB_DEFAULT_TLS_NAMESPACE
+                );
+            }
+            Err(err) => {
+                last_error = err.to_string();
+            }
+        }
+
+        sleep(Duration::from_millis(
+            HOME_LAB_TRAEFIK_ROLLOUT_POLL_INTERVAL_MS,
+        ))
+        .await;
+    }
+
+    warn!(
+        target: "wsl",
+        trace_id = %trace_id,
+        instance = %instance,
+        timeout_seconds = HOME_LAB_TRAEFIK_ROLLOUT_TIMEOUT_SECONDS,
+        error = %last_error,
+        "Deployment Traefik indisponible pour la reconciliation TLS initiale"
+    );
+    log_wsl_event(format!(
+        "[{trace_id}] Deployment Traefik indisponible pour {} avant reconciliation TLS initiale apres {}s: {}",
+        escape_for_log(instance),
+        HOME_LAB_TRAEFIK_ROLLOUT_TIMEOUT_SECONDS,
+        escape_for_log(&last_error)
+    ));
+    Ok(false)
+}
+
 async fn wait_for_traefik_tls_store_resource(
     client: &Client,
     trace_id: &str,
@@ -4485,15 +4554,40 @@ async fn restart_home_lab_traefik_deployment(
     let warmup_started_at = Instant::now();
     let warmup_timeout = Duration::from_secs(HOME_LAB_TRAEFIK_ROLLOUT_TIMEOUT_SECONDS);
     loop {
-        let deployment = deployments
-            .get(HOME_LAB_TRAEFIK_DEPLOYMENT_NAME)
+        let Some(deployment) = deployments
+            .get_opt(HOME_LAB_TRAEFIK_DEPLOYMENT_NAME)
             .await
             .with_context(|| {
                 format!(
                     "Lecture du deployment '{}' impossible avant redemarrage.",
                     HOME_LAB_TRAEFIK_DEPLOYMENT_NAME
                 )
-            })?;
+            })?
+        else {
+            if warmup_started_at.elapsed() >= warmup_timeout {
+                warn!(
+                    target: "wsl",
+                    trace_id = %trace_id,
+                    instance = %instance,
+                    reason = %reason,
+                    timeout_seconds = HOME_LAB_TRAEFIK_ROLLOUT_TIMEOUT_SECONDS,
+                    "Deployment Traefik absent avant redemarrage force; restart ignore"
+                );
+                log_wsl_event(format!(
+                    "[{trace_id}] Redemarrage Traefik ignore pour {}: deployment absent avant restart (reason={} timeout={}s)",
+                    escape_for_log(instance),
+                    escape_for_log(reason),
+                    HOME_LAB_TRAEFIK_ROLLOUT_TIMEOUT_SECONDS
+                ));
+                return Ok(());
+            }
+
+            sleep(Duration::from_millis(
+                HOME_LAB_TRAEFIK_ROLLOUT_POLL_INTERVAL_MS,
+            ))
+            .await;
+            continue;
+        };
         let state = TraefikDeploymentRolloutState::from_deployment(&deployment);
         if state.is_available() {
             break;
@@ -6988,9 +7082,12 @@ async fn ensure_home_lab_cluster_default_tls(
     Ok(())
 }
 
-async fn reconcile_home_lab_cluster_default_tls(instance: &str, trace_id: &str) -> Result<()> {
+async fn reconcile_home_lab_cluster_default_tls(
+    instance: &str,
+    trace_id: &str,
+) -> Result<HomeLabTraefikTlsReconcileStatus> {
     if !is_home_lab_wsl_instance(instance) {
-        return Ok(());
+        return Ok(HomeLabTraefikTlsReconcileStatus::Reconciled);
     }
 
     ensure_rustls_crypto_provider(trace_id, instance)?;
@@ -6998,8 +7095,12 @@ async fn reconcile_home_lab_cluster_default_tls(instance: &str, trace_id: &str) 
     let endpoint = resolve_kube_api_endpoint_for_instance(instance, trace_id).await?;
     let endpoint = wait_for_kube_api_port(instance, &endpoint, trace_id).await?;
     let (client, config, _, _) = build_kube_client_for_instance(instance, Some(&endpoint)).await?;
+    if !wait_for_home_lab_traefik_deployment_presence(&client, trace_id, instance).await? {
+        return Ok(HomeLabTraefikTlsReconcileStatus::Deferred);
+    }
     ensure_home_lab_cluster_default_tls(&client, &config, instance, trace_id).await?;
-    restart_home_lab_traefik_deployment(&client, instance, trace_id, "tls-reconcile").await
+    restart_home_lab_traefik_deployment(&client, instance, trace_id, "tls-reconcile").await?;
+    Ok(HomeLabTraefikTlsReconcileStatus::Reconciled)
 }
 
 async fn run_wsl_kubectl_exec(instance: &str, args: &[String]) -> Result<WslKubectlExecResult> {

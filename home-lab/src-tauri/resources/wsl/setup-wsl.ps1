@@ -195,6 +195,52 @@ fi
     }
 }
 
+function Test-K3sInitScriptReady {
+    param(
+        [string]$Distro,
+        [string]$Operation = 'Verification k3s-init.sh'
+    )
+
+$cmd = @'
+set -eu
+if [ ! -s /usr/local/bin/k3s-init.sh ]; then
+    exit 1
+fi
+chmod 0755 /usr/local/bin/k3s-init.sh >/dev/null 2>&1 || true
+test -r /usr/local/bin/k3s-init.sh
+'@
+    Invoke-WslScript -Distro $Distro -Script $cmd -Operation $Operation
+}
+
+function Wait-K3sInitScriptReady {
+    param(
+        [string]$Distro,
+        [int]$Attempts = 20,
+        [int]$DelayMs = 500,
+        [string]$Operation = 'Verification k3s-init.sh'
+    )
+
+    $lastResult = $null
+    for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
+        $lastResult = Test-K3sInitScriptReady -Distro $Distro -Operation $Operation
+        if ($lastResult.ExitCode -eq 0) {
+            return [pscustomobject]@{
+                Ready  = $true
+                Result = $lastResult
+            }
+        }
+
+        if ($attempt -lt $Attempts) {
+            Start-Sleep -Milliseconds $DelayMs
+        }
+    }
+
+    [pscustomobject]@{
+        Ready  = $false
+        Result = $lastResult
+    }
+}
+
 function Install-K3sInitScript {
     param([string]$Distro)
 
@@ -229,7 +275,7 @@ function Install-K3sInitScript {
         $hereDocMarker
         'chmod 0755 /usr/local/bin/k3s-init.sh'
         'test -s /usr/local/bin/k3s-init.sh'
-        'test -x /usr/local/bin/k3s-init.sh'
+        'test -r /usr/local/bin/k3s-init.sh'
     ) -join "`n"
     $directInstallResult = Invoke-WslScript -Distro $Distro -Script $directInstallScript -Operation 'Installation directe k3s-init.sh'
     if ($directInstallResult.ExitCode -eq 0) {
@@ -282,18 +328,9 @@ function Install-K3sInitScript {
         Write-Info "Activation chmod de k3s-init.sh non confirmee immediatement, poursuite avec script present."
     }
 
-    $readyOk = $false
-    for ($attempt = 1; $attempt -le 20; $attempt++) {
-        $readyResult = Invoke-WslScript -Distro $Distro -Script "set -eu; test -x /usr/local/bin/k3s-init.sh; test -s /usr/local/bin/k3s-init.sh" -Operation 'Verification k3s-init.sh'
-        if ($readyResult.ExitCode -eq 0) {
-            $readyOk = $true
-            break
-        }
-        Start-Sleep -Milliseconds 500
-    }
-
-    if (-not $readyOk) {
-        throw "Installation k3s-init.sh echouee : le script n'est pas executable et visible dans la distribution apres attente."
+    $readyState = Wait-K3sInitScriptReady -Distro $Distro -Attempts 20 -DelayMs 500 -Operation 'Verification k3s-init.sh'
+    if (-not $readyState.Ready) {
+        Write-Info "Visibilite de k3s-init.sh non confirmee immediatement dans la distribution; verification differee au bootstrap."
     }
 }
 
@@ -515,6 +552,20 @@ function Invoke-K3sBootstrap {
     )
 
     Write-Info "Initialisation de k3s (bootstrap) dans $Distro"
+    $visibilityAttempts = [Math]::Min([Math]::Max([int]($TimeoutSeconds * 2), 20), 120)
+    $readyState = Wait-K3sInitScriptReady -Distro $Distro -Attempts $visibilityAttempts -DelayMs 500 -Operation 'Preparation bootstrap k3s-init.sh'
+    if (-not $readyState.Ready) {
+        $details = if ($readyState.Result -and $readyState.Result.Output) {
+            ($readyState.Result.Output) -join "`n"
+        } else {
+            ''
+        }
+
+        if ($details) {
+            throw "Initialisation k3s impossible : k3s-init.sh n'est pas lisible dans la distribution apres attente.`n$details"
+        }
+        throw "Initialisation k3s impossible : k3s-init.sh n'est pas lisible dans la distribution apres attente."
+    }
 $cmd = @"
 set -eu
 BOOTSTRAP_ONLY=1 BOOTSTRAP_TIMEOUT=$TimeoutSeconds sh /usr/local/bin/k3s-init.sh
