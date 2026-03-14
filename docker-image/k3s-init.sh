@@ -154,16 +154,30 @@ EOF
 
 write_traefik_loopback_forwarder() {
     listen_port="$1"
-    target_port="$2"
+    service_port="$2"
     wrapper="/usr/local/bin/traefik-loopback-$listen_port.sh"
     cat <<EOF > "$wrapper"
 #!/bin/sh
 set -eu
-endpoint_ip=\$(KUBECONFIG=/etc/rancher/k3s/k3s.yaml /usr/local/bin/k3s kubectl get endpoints -n kube-system traefik -o jsonpath='{.subsets[0].addresses[0].ip}' 2>/dev/null || true)
-if [ -z "\$endpoint_ip" ]; then
-    exit 1
-fi
-exec nc "\$endpoint_ip" $target_port
+child_pid=
+cleanup() {
+    if [ -n "\$child_pid" ]; then
+        kill "\$child_pid" 2>/dev/null || true
+        wait "\$child_pid" 2>/dev/null || true
+    fi
+}
+trap cleanup INT TERM EXIT
+while true; do
+    if ! KUBECONFIG=/etc/rancher/k3s/k3s.yaml /usr/local/bin/k3s kubectl -n kube-system get service traefik >/dev/null 2>&1; then
+        sleep 1
+        continue
+    fi
+    KUBECONFIG=/etc/rancher/k3s/k3s.yaml /usr/local/bin/k3s kubectl -n kube-system port-forward --address 127.0.0.1 service/traefik $listen_port:$service_port &
+    child_pid=\$!
+    wait "\$child_pid" || true
+    child_pid=
+    sleep 1
+done
 EOF
     chmod 0755 "$wrapper"
     echo "$wrapper"
@@ -171,23 +185,23 @@ EOF
 
 start_traefik_loopback_listener() {
     listen_port="$1"
-    target_port="$2"
+    service_port="$2"
 
     if [ -z "$listen_port" ]; then
         return 0
     fi
 
-    wrapper=$(write_traefik_loopback_forwarder "$listen_port" "$target_port")
+    wrapper=$(write_traefik_loopback_forwarder "$listen_port" "$service_port")
     log_file="/var/log/traefik-loopback-$listen_port.log"
-    # BusyBox nc binds dual-stack when no local address is forced, which makes
-    # the listener visible from Windows localhost in WSL mirrored mode.
-    cmd="nc -lk -p $listen_port -e $wrapper"
+    cmd="sh $wrapper"
 
     if pgrep -f "$cmd" >/dev/null 2>&1; then
         return 0
     fi
 
+    pkill -f "kubectl -n kube-system port-forward --address 127.0.0.1 service/traefik $listen_port:$service_port" 2>/dev/null || true
     pkill -f "nc -lk .* -p $listen_port " 2>/dev/null || true
+    pkill -f "$cmd" 2>/dev/null || true
     nohup sh -c "exec $cmd" >> "$log_file" 2>&1 &
 }
 
@@ -198,10 +212,10 @@ ensure_traefik_loopback_proxy() {
 
     mkdir -p /var/log
     if [ -n "$K3S_INGRESS_HTTP_PORT" ]; then
-        start_traefik_loopback_listener "$K3S_INGRESS_HTTP_PORT" 8000
+        start_traefik_loopback_listener "$K3S_INGRESS_HTTP_PORT" "$K3S_INGRESS_HTTP_PORT"
     fi
     if [ -n "$K3S_INGRESS_HTTPS_PORT" ]; then
-        start_traefik_loopback_listener "$K3S_INGRESS_HTTPS_PORT" 8443
+        start_traefik_loopback_listener "$K3S_INGRESS_HTTPS_PORT" "$K3S_INGRESS_HTTPS_PORT"
     fi
 }
 
