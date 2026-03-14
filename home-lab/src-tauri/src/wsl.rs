@@ -484,9 +484,61 @@ fn indent_yaml_block(value: &str, spaces: usize) -> String {
 
 #[derive(Clone, Debug)]
 struct HomeLabDefaultTlsAssets {
+    #[cfg(test)]
     cert_pem: String,
     secret_manifest: String,
+    #[cfg(test)]
     tls_store_manifest: String,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TraefikDeploymentRolloutState {
+    desired_replicas: i32,
+    observed_generation: i64,
+    ready_replicas: i32,
+    updated_replicas: i32,
+    available_replicas: i32,
+    unavailable_replicas: i32,
+}
+
+impl TraefikDeploymentRolloutState {
+    fn from_deployment(deployment: &Deployment) -> Self {
+        let desired_replicas = deployment
+            .spec
+            .as_ref()
+            .and_then(|spec| spec.replicas)
+            .unwrap_or(1);
+        let status = deployment.status.as_ref();
+        Self {
+            desired_replicas,
+            observed_generation: status
+                .and_then(|value| value.observed_generation)
+                .unwrap_or_default(),
+            ready_replicas: status
+                .and_then(|value| value.ready_replicas)
+                .unwrap_or_default(),
+            updated_replicas: status
+                .and_then(|value| value.updated_replicas)
+                .unwrap_or_default(),
+            available_replicas: status
+                .and_then(|value| value.available_replicas)
+                .unwrap_or_default(),
+            unavailable_replicas: status
+                .and_then(|value| value.unavailable_replicas)
+                .unwrap_or_default(),
+        }
+    }
+
+    fn is_available(&self) -> bool {
+        self.ready_replicas >= self.desired_replicas
+            && self.updated_replicas >= self.desired_replicas
+            && self.available_replicas >= self.desired_replicas
+            && self.unavailable_replicas == 0
+    }
+
+    fn is_available_for_generation(&self, expected_generation: i64) -> bool {
+        self.observed_generation >= expected_generation && self.is_available()
+    }
 }
 
 fn render_home_lab_default_tls_secret_manifest(cert_pem: &str, key_pem: &str) -> String {
@@ -513,7 +565,7 @@ fn render_home_lab_default_tls_store_manifest(tls_store_api_version: &str) -> St
 
 fn build_home_lab_default_tls_assets(
     instance: &str,
-    tls_store_api_version: &str,
+    _tls_store_api_version: &str,
 ) -> Result<HomeLabDefaultTlsAssets> {
     let dns_names = cluster_tls_dns_names(instance);
     let common_name = dns_names.first().cloned().ok_or_else(|| {
@@ -527,13 +579,29 @@ fn build_home_lab_default_tls_assets(
     })?;
 
     Ok(HomeLabDefaultTlsAssets {
+        #[cfg(test)]
         cert_pem: issued.cert_pem.clone(),
         secret_manifest: render_home_lab_default_tls_secret_manifest(
             &issued.cert_pem,
             &issued.key_pem,
         ),
-        tls_store_manifest: render_home_lab_default_tls_store_manifest(tls_store_api_version),
+        #[cfg(test)]
+        tls_store_manifest: render_home_lab_default_tls_store_manifest(_tls_store_api_version),
     })
+}
+
+fn home_lab_default_tls_cert_matches_instance(cert_pem: &str, instance: &str) -> Result<bool> {
+    if !home_pki::is_certificate_signed_by_current_root(cert_pem)? {
+        return Ok(false);
+    }
+
+    let actual_dns_names = home_pki::certificate_dns_names(cert_pem)?;
+    let expected_dns_names = cluster_tls_dns_names(instance);
+    Ok(expected_dns_names.iter().all(|expected| {
+        actual_dns_names
+            .iter()
+            .any(|actual| actual.eq_ignore_ascii_case(expected))
+    }))
 }
 
 fn kube_api_proxy_route_name(instance: &str) -> String {
@@ -4309,7 +4377,6 @@ async fn verify_home_lab_default_tls_resources(
     client: &Client,
     tls_store_resource: &ResolvedResource,
     instance: &str,
-    expected_cert_pem: &str,
 ) -> Result<()> {
     let secrets: Api<Secret> = Api::namespaced(client.clone(), HOME_LAB_DEFAULT_TLS_NAMESPACE);
     let secret = secrets
@@ -4334,18 +4401,6 @@ async fn verify_home_lab_default_tls_resources(
         })?;
     let cert_pem =
         String::from_utf8(cert_bytes.0.clone()).context("Certificat TLS Traefik non UTF-8")?;
-    if cert_pem.trim() != expected_cert_pem.trim() {
-        anyhow::bail!(
-            "Le certificat stocke dans le secret TLS '{}' ne correspond pas au leaf genere pour cette reconciliation.",
-            HOME_LAB_DEFAULT_TLS_SECRET_NAME
-        );
-    }
-    if !home_pki::is_certificate_signed_by_current_root(&cert_pem)? {
-        anyhow::bail!(
-            "Le secret TLS '{}' n'est pas signe par la racine Home Lab courante.",
-            HOME_LAB_DEFAULT_TLS_SECRET_NAME
-        );
-    }
 
     let tls_stores: Api<DynamicObject> = Api::namespaced_with(
         client.clone(),
@@ -4380,18 +4435,43 @@ async fn verify_home_lab_default_tls_resources(
         )
     })?;
     let dns_names = home_pki::certificate_dns_names(&cert_pem)?;
-    if !dns_names
-        .iter()
-        .any(|name| name.eq_ignore_ascii_case(&expected_domain))
-    {
+    if !home_lab_default_tls_cert_matches_instance(&cert_pem, instance)? {
         anyhow::bail!(
-            "Le certificat TLS par defaut ne contient pas le domaine attendu '{}' (SAN actuels: {}).",
+            "Le certificat TLS par defaut ne couvre pas l'instance '{}' ou n'est pas signe par la racine Home Lab courante (domaine principal attendu '{}', SAN actuels: {}).",
+            instance,
             expected_domain,
             dns_names.join(", ")
         );
     }
 
     Ok(())
+}
+
+async fn read_home_lab_default_tls_secret_cert_pem(client: &Client) -> Result<Option<String>> {
+    let secrets: Api<Secret> = Api::namespaced(client.clone(), HOME_LAB_DEFAULT_TLS_NAMESPACE);
+    let Some(secret) = secrets
+        .get_opt(HOME_LAB_DEFAULT_TLS_SECRET_NAME)
+        .await
+        .with_context(|| {
+            format!(
+                "Lecture du secret TLS '{}' impossible dans namespace '{}'.",
+                HOME_LAB_DEFAULT_TLS_SECRET_NAME, HOME_LAB_DEFAULT_TLS_NAMESPACE
+            )
+        })?
+    else {
+        return Ok(None);
+    };
+
+    let Some(data) = secret.data.as_ref() else {
+        return Ok(None);
+    };
+    let Some(cert_bytes) = data.get("tls.crt") else {
+        return Ok(None);
+    };
+
+    let cert_pem =
+        String::from_utf8(cert_bytes.0.clone()).context("Certificat TLS Traefik non UTF-8")?;
+    Ok(Some(cert_pem))
 }
 
 async fn restart_home_lab_traefik_deployment(
@@ -4402,6 +4482,44 @@ async fn restart_home_lab_traefik_deployment(
 ) -> Result<()> {
     let deployments: Api<Deployment> =
         Api::namespaced(client.clone(), HOME_LAB_DEFAULT_TLS_NAMESPACE);
+    let warmup_started_at = Instant::now();
+    let warmup_timeout = Duration::from_secs(HOME_LAB_TRAEFIK_ROLLOUT_TIMEOUT_SECONDS);
+    loop {
+        let deployment = deployments
+            .get(HOME_LAB_TRAEFIK_DEPLOYMENT_NAME)
+            .await
+            .with_context(|| {
+                format!(
+                    "Lecture du deployment '{}' impossible avant redemarrage.",
+                    HOME_LAB_TRAEFIK_DEPLOYMENT_NAME
+                )
+            })?;
+        let state = TraefikDeploymentRolloutState::from_deployment(&deployment);
+        if state.is_available() {
+            break;
+        }
+        if warmup_started_at.elapsed() >= warmup_timeout {
+            warn!(
+                target: "wsl",
+                trace_id = %trace_id,
+                instance = %instance,
+                reason = %reason,
+                desired_replicas = state.desired_replicas,
+                ready_replicas = state.ready_replicas,
+                updated_replicas = state.updated_replicas,
+                available_replicas = state.available_replicas,
+                unavailable_replicas = state.unavailable_replicas,
+                "Traefik non disponible avant redemarrage force; poursuite du patch"
+            );
+            break;
+        }
+
+        sleep(Duration::from_millis(
+            HOME_LAB_TRAEFIK_ROLLOUT_POLL_INTERVAL_MS,
+        ))
+        .await;
+    }
+
     let restart_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -4460,47 +4578,21 @@ async fn restart_home_lab_traefik_deployment(
                     HOME_LAB_TRAEFIK_DEPLOYMENT_NAME
                 )
             })?;
-        let desired_replicas = deployment
-            .spec
-            .as_ref()
-            .and_then(|spec| spec.replicas)
-            .unwrap_or(1);
-        let status = deployment.status.as_ref();
-        let observed_generation = status
-            .and_then(|value| value.observed_generation)
-            .unwrap_or_default();
-        let ready_replicas = status
-            .and_then(|value| value.ready_replicas)
-            .unwrap_or_default();
-        let updated_replicas = status
-            .and_then(|value| value.updated_replicas)
-            .unwrap_or_default();
-        let unavailable_replicas = status
-            .and_then(|value| value.unavailable_replicas)
-            .unwrap_or_default();
-        let available_replicas = status
-            .and_then(|value| value.available_replicas)
-            .unwrap_or_default();
-
-        let rolled_out = observed_generation >= expected_generation
-            && ready_replicas >= desired_replicas
-            && updated_replicas >= desired_replicas
-            && available_replicas >= desired_replicas
-            && unavailable_replicas == 0;
-        if rolled_out {
+        let state = TraefikDeploymentRolloutState::from_deployment(&deployment);
+        if state.is_available_for_generation(expected_generation) {
             info!(
                 target: "wsl",
                 trace_id = %trace_id,
                 instance = %instance,
                 reason = %reason,
-                desired_replicas,
+                desired_replicas = state.desired_replicas,
                 "Deployment Traefik redemarre et disponible"
             );
             log_wsl_event(format!(
                 "[{trace_id}] Deployment Traefik disponible pour {} apres restart: reason={} replicas={}",
                 escape_for_log(instance),
                 escape_for_log(reason),
-                desired_replicas
+                state.desired_replicas
             ));
             return Ok(());
         }
@@ -4511,11 +4603,11 @@ async fn restart_home_lab_traefik_deployment(
                 HOME_LAB_TRAEFIK_DEPLOYMENT_NAME,
                 HOME_LAB_TRAEFIK_ROLLOUT_TIMEOUT_SECONDS,
                 reason,
-                observed_generation,
-                ready_replicas,
-                updated_replicas,
-                available_replicas,
-                unavailable_replicas
+                state.observed_generation,
+                state.ready_replicas,
+                state.updated_replicas,
+                state.available_replicas,
+                state.unavailable_replicas
             );
         }
 
@@ -6850,16 +6942,37 @@ async fn ensure_home_lab_cluster_default_tls(
 
     let (tls_store_api_version, tls_store_resource) =
         wait_for_traefik_tls_store_resource(client, trace_id, instance).await?;
-    let assets = build_home_lab_default_tls_assets(instance, &tls_store_api_version)?;
-    let secret_stdout = execute_kubectl_apply_yaml(client, config, &assets.secret_manifest).await?;
-    let tls_store_stdout =
-        execute_kubectl_apply_yaml(client, config, &assets.tls_store_manifest).await?;
-    verify_home_lab_default_tls_resources(client, &tls_store_resource, instance, &assets.cert_pem)
-        .await?;
+    let existing_cert_pem = read_home_lab_default_tls_secret_cert_pem(client).await?;
+    let secret_is_already_valid = match existing_cert_pem.as_deref() {
+        Some(cert_pem) => match home_lab_default_tls_cert_matches_instance(cert_pem, instance) {
+            Ok(valid) => valid,
+            Err(err) => {
+                warn!(
+                    target: "wsl",
+                    trace_id = %trace_id,
+                    instance = %instance,
+                    error = %err,
+                    "Verification du secret TLS Traefik existant impossible; regeneration forcee"
+                );
+                false
+            }
+        },
+        None => false,
+    };
+    let secret_stdout = if secret_is_already_valid {
+        "secret/home-lab-default-tls deja valide".to_string()
+    } else {
+        let assets = build_home_lab_default_tls_assets(instance, &tls_store_api_version)?;
+        execute_kubectl_apply_yaml(client, config, &assets.secret_manifest).await?
+    };
+    let tls_store_manifest = render_home_lab_default_tls_store_manifest(&tls_store_api_version);
+    let tls_store_stdout = execute_kubectl_apply_yaml(client, config, &tls_store_manifest).await?;
+    verify_home_lab_default_tls_resources(client, &tls_store_resource, instance).await?;
     info!(
         target: "wsl",
         trace_id = %trace_id,
         instance = %instance,
+        secret_reused = secret_is_already_valid,
         tls_store_api_version = %tls_store_api_version,
         secret_stdout = %escape_for_log(secret_stdout.trim()),
         tls_store_stdout = %escape_for_log(tls_store_stdout.trim()),
@@ -7837,6 +7950,32 @@ mod tests {
         assert_eq!(manifests[1].kind, HOME_LAB_TRAEFIK_TLSSTORE_KIND);
         assert_eq!(manifests[0].name, HOME_LAB_DEFAULT_TLS_SECRET_NAME);
         assert_eq!(manifests[1].name, "default");
+    }
+
+    #[test]
+    fn generated_home_lab_default_tls_cert_matches_expected_instance_only() {
+        let first_assets =
+            build_home_lab_default_tls_assets(HOME_LAB_WSL_INSTANCE_PREFIX, "traefik.io/v1alpha1")
+                .expect("first tls assets");
+        let second_assets =
+            build_home_lab_default_tls_assets("home-lab-k3s-2", "traefik.io/v1alpha1")
+                .expect("second tls assets");
+
+        assert!(home_lab_default_tls_cert_matches_instance(
+            &first_assets.cert_pem,
+            HOME_LAB_WSL_INSTANCE_PREFIX
+        )
+        .expect("match first instance"),);
+        assert!(!home_lab_default_tls_cert_matches_instance(
+            &first_assets.cert_pem,
+            "home-lab-k3s-2"
+        )
+        .expect("reject second instance"),);
+        assert!(home_lab_default_tls_cert_matches_instance(
+            &second_assets.cert_pem,
+            "home-lab-k3s-2"
+        )
+        .expect("match second instance"),);
     }
 
     #[test]

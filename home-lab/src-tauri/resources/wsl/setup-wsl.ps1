@@ -216,6 +216,33 @@ function Install-K3sInitScript {
         throw "Preparation /usr/local/bin echouee (code $($mkdirResult.ExitCode))"
     }
 
+    $hereDocMarker = '__HOME_LAB_K3S_INIT_EOF__'
+    $markerIndex = 0
+    while ($normalizedScript.Contains($hereDocMarker)) {
+        $markerIndex += 1
+        $hereDocMarker = "__HOME_LAB_K3S_INIT_EOF_$markerIndex__"
+    }
+    $directInstallScript = @(
+        'set -eu'
+        "cat > /usr/local/bin/k3s-init.sh <<'$hereDocMarker'"
+        $normalizedScript.TrimEnd("`n")
+        $hereDocMarker
+        'chmod 0755 /usr/local/bin/k3s-init.sh'
+        'test -s /usr/local/bin/k3s-init.sh'
+        'test -x /usr/local/bin/k3s-init.sh'
+    ) -join "`n"
+    $directInstallResult = Invoke-WslScript -Distro $Distro -Script $directInstallScript -Operation 'Installation directe k3s-init.sh'
+    if ($directInstallResult.ExitCode -eq 0) {
+        return
+    }
+
+    $directInstallDetails = ($directInstallResult.Output) -join [Environment]::NewLine
+    if ($directInstallDetails) {
+        Write-Info ("Installation directe k3s-init.sh non confirmee, fallback via \\wsl$ :" + [Environment]::NewLine + $directInstallDetails)
+    } else {
+        Write-Info "Installation directe k3s-init.sh non confirmee, fallback via \\wsl$."
+    }
+
     $uncPath = "\\wsl$\$Distro\usr\local\bin\k3s-init.sh"
     $lastWriteError = $null
     for ($attempt = 1; $attempt -le 10; $attempt++) {
