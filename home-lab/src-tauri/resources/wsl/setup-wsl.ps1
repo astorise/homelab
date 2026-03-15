@@ -157,7 +157,7 @@ function Invoke-WslScript {
     $normalizedScript = $Script.Replace("`r`n", "`n").Replace("`r", "`n")
     $process.StandardInput.Write($normalizedScript)
     if (-not $normalizedScript.EndsWith("`n")) {
-        $process.StandardInput.WriteLine()
+        $process.StandardInput.Write("`n")
     }
     $process.StandardInput.Close()
 
@@ -241,17 +241,42 @@ function Wait-K3sInitScriptReady {
     }
 }
 
-function Install-K3sInitScript {
-    param([string]$Distro)
-
+function Get-K3sInitScriptContent {
     $sourcePath = [System.IO.Path]::Combine((Get-ScriptDirectory), 'k3s-init.sh')
     if (-not (Test-Path -LiteralPath $sourcePath)) {
         throw "Script k3s-init.sh introuvable: $sourcePath"
     }
 
+    (Get-Content -Raw -LiteralPath $sourcePath).Replace("`r`n", "`n").Replace("`r", "`n")
+}
+
+function New-K3sInitWriteScript {
+    param(
+        [string]$ScriptContent
+    )
+
+    $hereDocMarker = '__HOME_LAB_K3S_INIT_EOF__'
+    $markerIndex = 0
+    while ($ScriptContent.Contains($hereDocMarker)) {
+        $markerIndex += 1
+        $hereDocMarker = "__HOME_LAB_K3S_INIT_EOF_$markerIndex__"
+    }
+
+    @(
+        "cat > /usr/local/bin/k3s-init.sh <<'$hereDocMarker'"
+        $ScriptContent.TrimEnd("`n")
+        $hereDocMarker
+        'chmod 0755 /usr/local/bin/k3s-init.sh'
+        'test -s /usr/local/bin/k3s-init.sh'
+        'test -r /usr/local/bin/k3s-init.sh'
+    ) -join "`n"
+}
+
+function Install-K3sInitScript {
+    param([string]$Distro)
+
     Write-Info "Installation du script /usr/local/bin/k3s-init.sh"
-    $scriptContent = Get-Content -Raw -LiteralPath $sourcePath
-    $normalizedScript = $scriptContent.Replace("`r`n", "`n").Replace("`r", "`n")
+    $normalizedScript = Get-K3sInitScriptContent
     $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
     $mkdirResult = Invoke-WslScript -Distro $Distro -Script "set -eu; mkdir -p /usr/local/bin" -Operation 'Preparation /usr/local/bin'
     if ($mkdirResult.ExitCode -ne 0) {
@@ -262,20 +287,9 @@ function Install-K3sInitScript {
         throw "Preparation /usr/local/bin echouee (code $($mkdirResult.ExitCode))"
     }
 
-    $hereDocMarker = '__HOME_LAB_K3S_INIT_EOF__'
-    $markerIndex = 0
-    while ($normalizedScript.Contains($hereDocMarker)) {
-        $markerIndex += 1
-        $hereDocMarker = "__HOME_LAB_K3S_INIT_EOF_$markerIndex__"
-    }
     $directInstallScript = @(
         'set -eu'
-        "cat > /usr/local/bin/k3s-init.sh <<'$hereDocMarker'"
-        $normalizedScript.TrimEnd("`n")
-        $hereDocMarker
-        'chmod 0755 /usr/local/bin/k3s-init.sh'
-        'test -s /usr/local/bin/k3s-init.sh'
-        'test -r /usr/local/bin/k3s-init.sh'
+        (New-K3sInitWriteScript -ScriptContent $normalizedScript)
     ) -join "`n"
     $directInstallResult = Invoke-WslScript -Distro $Distro -Script $directInstallScript -Operation 'Installation directe k3s-init.sh'
     if ($directInstallResult.ExitCode -eq 0) {
@@ -562,14 +576,17 @@ function Invoke-K3sBootstrap {
         }
 
         if ($details) {
-            throw "Initialisation k3s impossible : k3s-init.sh n'est pas lisible dans la distribution apres attente.`n$details"
+            Write-Info ("Visibilite de k3s-init.sh non confirmee juste avant bootstrap; tentative d'execution directe :" + [Environment]::NewLine + $details)
+        } else {
+            Write-Info "Visibilite de k3s-init.sh non confirmee juste avant bootstrap; tentative d'execution directe."
         }
-        throw "Initialisation k3s impossible : k3s-init.sh n'est pas lisible dans la distribution apres attente."
     }
-$cmd = @"
-set -eu
-BOOTSTRAP_ONLY=1 BOOTSTRAP_TIMEOUT=$TimeoutSeconds sh /usr/local/bin/k3s-init.sh
-"@
+    $k3sInitScript = Get-K3sInitScriptContent
+    $cmd = @(
+        'set -eu'
+        (New-K3sInitWriteScript -ScriptContent $k3sInitScript)
+        "BOOTSTRAP_ONLY=1 BOOTSTRAP_TIMEOUT=$TimeoutSeconds sh /usr/local/bin/k3s-init.sh"
+    ) -join "`n"
     $result = Invoke-WslScript -Distro $Distro -Script $cmd -Operation 'Initialisation k3s'
     $exitCode = $result.ExitCode
 
