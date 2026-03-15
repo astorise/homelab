@@ -5,6 +5,8 @@ const REFRESHABLE_COMPONENTS = Object.freeze([
   { selector: 'dns-records', method: 'load' },
   { selector: 'http-status', method: 'load' },
   { selector: 'http-routes', method: 'load' },
+  { selector: 's3-status', method: 'load' },
+  { selector: 's3-buckets', method: 'load' },
   { selector: 'oidc-status', method: 'load' },
   { selector: 'oidc-clients', method: 'load' },
   { selector: 'wsl-instance-manager', method: 'loadInstances' },

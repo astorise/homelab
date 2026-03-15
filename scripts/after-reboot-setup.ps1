@@ -31,13 +31,13 @@ if (-not $SkipBuild) {
 
 # Make sure services are Auto and started
 Write-Host '=== Enable + start services (best-effort) ==='
-foreach ($n in 'HomeDnsService','HomeHttpService','HomeOidcService') {
+foreach ($n in 'HomeDnsService','HomeHttpService','HomeS3Service','HomeOidcService') {
   try { sc.exe config $n start= auto | Out-Null } catch {}
   try { sc.exe start  $n          | Out-Null } catch {}
 }
 
 Start-Sleep -Seconds 2
-Get-Service HomeDnsService, HomeHttpService, HomeOidcService -ErrorAction SilentlyContinue |
+Get-Service HomeDnsService, HomeHttpService, HomeS3Service, HomeOidcService -ErrorAction SilentlyContinue |
   Select Name,Status,StartType | Format-Table -AutoSize | Out-String | Write-Host
 
 # Tail logs for DNS
@@ -55,6 +55,14 @@ if (Test-Path $httpLog) {
   Get-Content $httpLog -Tail 120 | ForEach-Object { $_ }
 } else {
   Write-Host "Log file not found: $httpLog"
+}
+
+$s3Log = 'C:\ProgramData\home-s3\logs\home-s3_rCURRENT.log'
+if (Test-Path $s3Log) {
+  Write-Host '--- tail home-s3_rCURRENT.log ---'
+  Get-Content $s3Log -Tail 120 | ForEach-Object { $_ }
+} else {
+  Write-Host "Log file not found: $s3Log"
 }
 
 $oidcLog = 'C:\ProgramData\home-oidc\oidc\logs\home-oidc_rCURRENT.log'

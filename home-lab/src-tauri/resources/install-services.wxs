@@ -7,25 +7,29 @@
 
 <Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
   <!--
-    WiX fragment to install/uninstall and start the home-dns/home-http/home-oidc services.
+    WiX fragment to install/uninstall and start the home-dns/home-http/home-s3/home-oidc services.
     We invoke the bundled executables directly (install|uninstall),
     because tauri-bundler resource files do not have stable Ids we can reference via ServiceInstall.
   -->
 
   <Fragment>
-    <!-- Post-install: run "home-dns.exe install", "home-http.exe install" and "home-oidc.exe install", then start them -->
+    <!-- Post-install: run "home-dns.exe install", "home-http.exe install", "home-s3.exe install" and "home-oidc.exe install", then start them -->
     <CustomAction Id="InstallHomeLabRootCa" Directory="INSTALLDIR" Execute="deferred" Impersonate="no"
                   ExeCommand='"[SystemFolder]cmd.exe" /C ""[INSTALLDIR]bin\home-lab-cert.exe" install-root &gt;&gt; "[INSTALLDIR]installer-msi.log" 2&gt;&amp;1"' Return="check" />
     <CustomAction Id="InstallHomeDns" Directory="INSTALLDIR" Execute="deferred" Impersonate="no"
                   ExeCommand='"[SystemFolder]cmd.exe" /C ""[INSTALLDIR]bin\home-dns.exe" install &gt;&gt; "[INSTALLDIR]installer-msi.log" 2&gt;&amp;1"' Return="check" />
     <CustomAction Id="InstallHomeHttp" Directory="INSTALLDIR" Execute="deferred" Impersonate="no"
                   ExeCommand='"[SystemFolder]cmd.exe" /C ""[INSTALLDIR]bin\home-http.exe" install &gt;&gt; "[INSTALLDIR]installer-msi.log" 2&gt;&amp;1"' Return="check" />
+    <CustomAction Id="InstallHomeS3" Directory="INSTALLDIR" Execute="deferred" Impersonate="no"
+                  ExeCommand='"[SystemFolder]cmd.exe" /C ""[INSTALLDIR]bin\home-s3.exe" install &gt;&gt; "[INSTALLDIR]installer-msi.log" 2&gt;&amp;1"' Return="check" />
     <CustomAction Id="InstallHomeOidc" Directory="INSTALLDIR" Execute="deferred" Impersonate="no"
                   ExeCommand='"[SystemFolder]cmd.exe" /C ""[INSTALLDIR]bin\home-oidc.exe" install &gt;&gt; "[INSTALLDIR]installer-msi.log" 2&gt;&amp;1"' Return="check" />
     <CustomAction Id="StartHomeDns" Directory="INSTALLDIR" Execute="deferred" Impersonate="no"
                   ExeCommand='"[SystemFolder]cmd.exe" /C ""[SystemFolder]sc.exe" start HomeDnsService &gt;&gt; "[INSTALLDIR]installer-msi.log" 2&gt;&amp;1"' Return="ignore" />
     <CustomAction Id="StartHomeHttp" Directory="INSTALLDIR" Execute="deferred" Impersonate="no"
                   ExeCommand='"[SystemFolder]cmd.exe" /C ""[SystemFolder]sc.exe" start HomeHttpService &gt;&gt; "[INSTALLDIR]installer-msi.log" 2&gt;&amp;1"' Return="ignore" />
+    <CustomAction Id="StartHomeS3" Directory="INSTALLDIR" Execute="deferred" Impersonate="no"
+                  ExeCommand='"[SystemFolder]cmd.exe" /C ""[SystemFolder]sc.exe" start HomeS3Service &gt;&gt; "[INSTALLDIR]installer-msi.log" 2&gt;&amp;1"' Return="ignore" />
     <CustomAction Id="StartHomeOidc" Directory="INSTALLDIR" Execute="deferred" Impersonate="no"
                   ExeCommand='"[SystemFolder]cmd.exe" /C ""[SystemFolder]sc.exe" start HomeOidcService &gt;&gt; "[INSTALLDIR]installer-msi.log" 2&gt;&amp;1"' Return="ignore" />
     <!-- Uninstall: prefer binary uninstallers; rely on ServiceControl as safety net -->
@@ -33,6 +37,8 @@
                   ExeCommand='"[SystemFolder]cmd.exe" /C ""[INSTALLDIR]bin\home-dns.exe" uninstall &gt;&gt; "[INSTALLDIR]installer-msi.log" 2&gt;&amp;1"' Return="ignore" />
     <CustomAction Id="UninstallHomeHttp" Directory="INSTALLDIR" Execute="deferred" Impersonate="no"
                   ExeCommand='"[SystemFolder]cmd.exe" /C ""[INSTALLDIR]bin\home-http.exe" uninstall &gt;&gt; "[INSTALLDIR]installer-msi.log" 2&gt;&amp;1"' Return="ignore" />
+    <CustomAction Id="UninstallHomeS3" Directory="INSTALLDIR" Execute="deferred" Impersonate="no"
+                  ExeCommand='"[SystemFolder]cmd.exe" /C ""[INSTALLDIR]bin\home-s3.exe" uninstall &gt;&gt; "[INSTALLDIR]installer-msi.log" 2&gt;&amp;1"' Return="ignore" />
     <CustomAction Id="UninstallHomeOidc" Directory="INSTALLDIR" Execute="deferred" Impersonate="no"
                   ExeCommand='"[SystemFolder]cmd.exe" /C ""[INSTALLDIR]bin\home-oidc.exe" uninstall &gt;&gt; "[INSTALLDIR]installer-msi.log" 2&gt;&amp;1"' Return="ignore" />
 
@@ -54,11 +60,14 @@
       <Custom Action="InstallHomeLabRootCa" After="InstallFiles"><![CDATA[NOT (REMOVE = "ALL")]]></Custom>
       <Custom Action="InstallHomeDns" After="InstallHomeLabRootCa"><![CDATA[NOT (REMOVE = "ALL")]]></Custom>
       <Custom Action="InstallHomeHttp" After="InstallHomeDns"><![CDATA[NOT (REMOVE = "ALL")]]></Custom>
-      <Custom Action="InstallHomeOidc" After="InstallHomeHttp"><![CDATA[NOT (REMOVE = "ALL")]]></Custom>
+      <Custom Action="InstallHomeS3" After="InstallHomeHttp"><![CDATA[NOT (REMOVE = "ALL")]]></Custom>
+      <Custom Action="InstallHomeOidc" After="InstallHomeS3"><![CDATA[NOT (REMOVE = "ALL")]]></Custom>
       <Custom Action="StartHomeDns" After="InstallHomeOidc"><![CDATA[NOT (REMOVE = "ALL")]]></Custom>
       <Custom Action="StartHomeHttp" After="StartHomeDns"><![CDATA[NOT (REMOVE = "ALL")]]></Custom>
-      <Custom Action="StartHomeOidc" After="StartHomeHttp"><![CDATA[NOT (REMOVE = "ALL")]]></Custom>
+      <Custom Action="StartHomeS3" After="StartHomeHttp"><![CDATA[NOT (REMOVE = "ALL")]]></Custom>
+      <Custom Action="StartHomeOidc" After="StartHomeS3"><![CDATA[NOT (REMOVE = "ALL")]]></Custom>
       <Custom Action="UninstallHomeOidc" Before="RemoveFiles">(REMOVE = "ALL")</Custom>
+      <Custom Action="UninstallHomeS3" Before="RemoveFiles">(REMOVE = "ALL")</Custom>
       <Custom Action="UninstallHomeHttp" Before="RemoveFiles">(REMOVE = "ALL")</Custom>
       <Custom Action="UninstallHomeDns" Before="RemoveFiles">(REMOVE = "ALL")</Custom>
     </InstallExecuteSequence>
@@ -74,6 +83,7 @@
         <!-- Make sure uninstall always stops and deletes services, even if CAs did not run -->
         <ServiceControl Id="SvcCtl_StopDelete_HomeDns" Name="HomeDnsService" Stop="both" Remove="uninstall" Wait="yes" />
         <ServiceControl Id="SvcCtl_StopDelete_HomeHttp" Name="HomeHttpService" Stop="both" Remove="uninstall" Wait="yes" />
+        <ServiceControl Id="SvcCtl_StopDelete_HomeS3" Name="HomeS3Service" Stop="both" Remove="uninstall" Wait="yes" />
         <ServiceControl Id="SvcCtl_StopDelete_HomeOidc" Name="HomeOidcService" Stop="both" Remove="uninstall" Wait="yes" />
       </Component>
     </DirectoryRef>
@@ -90,12 +100,15 @@
     <CustomActionRef Id="InstallHomeLabRootCa" />
     <CustomActionRef Id="InstallHomeDns" />
     <CustomActionRef Id="InstallHomeHttp" />
+    <CustomActionRef Id="InstallHomeS3" />
     <CustomActionRef Id="InstallHomeOidc" />
     <CustomActionRef Id="StartHomeDns" />
     <CustomActionRef Id="StartHomeHttp" />
+    <CustomActionRef Id="StartHomeS3" />
     <CustomActionRef Id="StartHomeOidc" />
     <CustomActionRef Id="UninstallHomeDns" />
     <CustomActionRef Id="UninstallHomeHttp" />
+    <CustomActionRef Id="UninstallHomeS3" />
     <CustomActionRef Id="UninstallHomeOidc" />
     <CustomActionRef Id="TraceInstallServices" />
     <CustomActionRef Id="TraceAfterInstallFiles" />

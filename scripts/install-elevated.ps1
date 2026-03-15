@@ -105,10 +105,11 @@ if ($UseMsi) {
 $bin = 'C:\Program Files\home-lab\bin'
 Ensure-Service -Name 'HomeDnsService'  -Exe (Join-Path $bin 'home-dns.exe')  -Args 'install'
 Ensure-Service -Name 'HomeHttpService' -Exe (Join-Path $bin 'home-http.exe') -Args 'install'
+Ensure-Service -Name 'HomeS3Service'   -Exe (Join-Path $bin 'home-s3.exe')   -Args 'install'
 Ensure-Service -Name 'HomeOidcService' -Exe (Join-Path $bin 'home-oidc.exe') -Args 'install'
 
 Write-Host "--- Service status ---"
-Get-Service -Name HomeDnsService, HomeHttpService, HomeOidcService -ErrorAction SilentlyContinue |
+Get-Service -Name HomeDnsService, HomeHttpService, HomeS3Service, HomeOidcService -ErrorAction SilentlyContinue |
   Select-Object Name, Status, StartType | Format-Table -AutoSize
 
 Write-Host "--- Recent logs ---"
@@ -117,6 +118,9 @@ if (Test-Path 'C:\ProgramData\home-dns\logs\home-dns_rCURRENT.log') {
 }
 if (Test-Path 'C:\ProgramData\home-http\logs\home-http_rCURRENT.log') {
   Write-Host '[home-http]'; Get-Content 'C:\ProgramData\home-http\logs\home-http_rCURRENT.log' -Tail 20
+}
+if (Test-Path 'C:\ProgramData\home-s3\logs\home-s3_rCURRENT.log') {
+  Write-Host '[home-s3]'; Get-Content 'C:\ProgramData\home-s3\logs\home-s3_rCURRENT.log' -Tail 20
 }
 if (Test-Path 'C:\ProgramData\home-oidc\oidc\logs\home-oidc_rCURRENT.log') {
   Write-Host '[home-oidc]'; Get-Content 'C:\ProgramData\home-oidc\oidc\logs\home-oidc_rCURRENT.log' -Tail 20

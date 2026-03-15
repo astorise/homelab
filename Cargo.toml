@@ -3,6 +3,7 @@ members = [
   "home-pki",
   "home-dns",
   "home-http",
+  "home-s3",
   "home-oidc",
   "home-lab/src-tauri",
   "pipe-test",

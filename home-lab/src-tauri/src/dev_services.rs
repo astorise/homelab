@@ -21,7 +21,7 @@ fn cargo_bin() -> &'static str {
 
 fn fallback_rust_log() -> String {
     if cfg!(debug_assertions) {
-        "debug,home_dns=debug,home_http=debug,home_oidc=debug".to_string()
+        "debug,home_dns=debug,home_http=debug,home_s3=debug,home_oidc=debug".to_string()
     } else {
         "info".to_string()
     }
@@ -65,6 +65,7 @@ impl Drop for ProcGuard {
 pub struct DevServices {
     _dns: Option<ProcGuard>,
     _http: Option<ProcGuard>,
+    _s3: Option<ProcGuard>,
     _oidc: Option<ProcGuard>,
 }
 
@@ -120,7 +121,7 @@ pub fn spawn(app: &AppHandle<Wry>) -> Result<()> {
 
     #[cfg(all(debug_assertions, target_os = "windows"))]
     {
-        info!("Spawning dev services: home-dns, home-http & home-oidc (console)");
+        info!("Spawning dev services: home-dns, home-http, home-s3 & home-oidc (console)");
         // Essaye d'abord les binaires précompilés, puis fallback sur cargo run
         let bin_dir = workspace_root()
             .join("home-lab")
@@ -163,6 +164,24 @@ pub fn spawn(app: &AppHandle<Wry>) -> Result<()> {
         if http.is_none() {
             error!("Failed to spawn home-http (console)");
         }
+        let s3 = spawn_cargo_package("home-s3", &["console"])
+            .ok()
+            .or_else(|| {
+                if cfg!(target_os = "windows") {
+                    let exe = bin_dir.join("home-s3.exe");
+                    if exe.exists() {
+                        spawn_binary(exe, &["console"]).ok()
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            })
+            .map(|c| ProcGuard::new("home-s3", c));
+        if s3.is_none() {
+            error!("Failed to spawn home-s3 (console)");
+        }
         let oidc = spawn_cargo_package("home-oidc", &["console"])
             .ok()
             .or_else(|| {
@@ -184,6 +203,7 @@ pub fn spawn(app: &AppHandle<Wry>) -> Result<()> {
         app.manage(DevServices {
             _dns: dns,
             _http: http,
+            _s3: s3,
             _oidc: oidc,
         });
     }

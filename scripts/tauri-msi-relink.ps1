@@ -89,12 +89,12 @@ function Install-MsiWithLog($msiPath) {
 
 function Verify-Services {
   Write-Host '=== Service status ==='
-  $svcs = Get-Service -Name HomeDnsService, HomeHttpService, HomeOidcService -ErrorAction SilentlyContinue |
+  $svcs = Get-Service -Name HomeDnsService, HomeHttpService, HomeS3Service, HomeOidcService -ErrorAction SilentlyContinue |
     Select-Object Name, Status, StartType
   if ($svcs) { $svcs | Format-Table -AutoSize | Out-String | Write-Host } else { Write-Host '(no services found)' }
   return ($svcs -and ($svcs |
-    Where-Object { $_.Name -eq 'HomeDnsService' -or $_.Name -eq 'HomeHttpService' -or $_.Name -eq 'HomeOidcService' } |
-    Measure-Object).Count -eq 3)
+    Where-Object { $_.Name -eq 'HomeDnsService' -or $_.Name -eq 'HomeHttpService' -or $_.Name -eq 'HomeS3Service' -or $_.Name -eq 'HomeOidcService' } |
+    Measure-Object).Count -eq 4)
 }
 
 function Ensure-ServicesIfMissing {
@@ -102,13 +102,15 @@ function Ensure-ServicesIfMissing {
   $bin = Join-Path $InstallDir 'bin'
   $dnsExe = Join-Path $bin 'home-dns.exe'
   $httpExe = Join-Path $bin 'home-http.exe'
+  $s3Exe = Join-Path $bin 'home-s3.exe'
   $oidcExe = Join-Path $bin 'home-oidc.exe'
 
   $needDns = -not (Get-Service -Name HomeDnsService -ErrorAction SilentlyContinue)
   $needHttp = -not (Get-Service -Name HomeHttpService -ErrorAction SilentlyContinue)
+  $needS3 = -not (Get-Service -Name HomeS3Service -ErrorAction SilentlyContinue)
   $needOidc = -not (Get-Service -Name HomeOidcService -ErrorAction SilentlyContinue)
 
-  if (-not $needDns -and -not $needHttp -and -not $needOidc) { Write-Host 'Services already present.'; return }
+  if (-not $needDns -and -not $needHttp -and -not $needS3 -and -not $needOidc) { Write-Host 'Services already present.'; return }
 
   Write-Host '=== Fallback: installing missing services via bundled executables ==='
   if ($needDns -and (Test-Path $dnsExe)) {
@@ -119,6 +121,10 @@ function Ensure-ServicesIfMissing {
     Write-Host "Installing HTTP service: $httpExe install"
     & $httpExe install | Write-Host
   }
+  if ($needS3 -and (Test-Path $s3Exe)) {
+    Write-Host "Installing S3 service: $s3Exe install"
+    & $s3Exe install | Write-Host
+  }
   if ($needOidc -and (Test-Path $oidcExe)) {
     Write-Host "Installing OIDC service: $oidcExe install"
     & $oidcExe install | Write-Host
@@ -127,6 +133,7 @@ function Ensure-ServicesIfMissing {
   # Try starting them (best effort)
   try { sc.exe start HomeDnsService  | Out-Null } catch {}
   try { sc.exe start HomeHttpService | Out-Null } catch {}
+  try { sc.exe start HomeS3Service   | Out-Null } catch {}
   try { sc.exe start HomeOidcService | Out-Null } catch {}
 
   $ok = Verify-Services
@@ -145,6 +152,13 @@ function Ensure-ServicesIfMissing {
       Write-Host "New-Service -Name HomeHttpService -BinaryPathName $binArg2 -DisplayName 'Home HTTP Service' -StartupType Automatic"
       try { New-Service -Name HomeHttpService -BinaryPathName $binArg2 -DisplayName 'Home HTTP Service' -StartupType Automatic | Out-Null } catch { Write-Warning $_ }
       try { sc.exe start HomeHttpService | Out-Null } catch { Write-Warning $_ }
+    }
+    if (-not (Get-Service -Name HomeS3Service -ErrorAction SilentlyContinue)) {
+      $s3Path = Join-Path $bin 'home-s3.exe'
+      $binArgS3 = '"' + $s3Path + '" run'
+      Write-Host "New-Service -Name HomeS3Service -BinaryPathName $binArgS3 -DisplayName 'Home S3 Service' -StartupType Automatic"
+      try { New-Service -Name HomeS3Service -BinaryPathName $binArgS3 -DisplayName 'Home S3 Service' -StartupType Automatic | Out-Null } catch { Write-Warning $_ }
+      try { sc.exe start HomeS3Service | Out-Null } catch { Write-Warning $_ }
     }
     if (-not (Get-Service -Name HomeOidcService -ErrorAction SilentlyContinue)) {
       $oidcPath = Join-Path $bin 'home-oidc.exe'

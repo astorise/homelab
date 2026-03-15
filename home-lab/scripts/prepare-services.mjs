@@ -16,7 +16,7 @@ if (process.platform !== 'win32') {
   process.exit(0)
 }
 
-const services = ['home-dns', 'home-http', 'home-oidc']
+const services = ['home-dns', 'home-http', 'home-s3', 'home-oidc']
 const targetDir = join(repoRoot, 'target', 'release')
 const bundleBinDir = join(repoRoot, 'home-lab', 'src-tauri', 'resources', 'bin')
 

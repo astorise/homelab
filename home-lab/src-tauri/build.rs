@@ -31,6 +31,7 @@ fn main() {
         let services = [
             ("home-dns", "home-dns.exe"),
             ("home-http", "home-http.exe"),
+            ("home-s3", "home-s3.exe"),
             ("home-oidc", "home-oidc.exe"),
         ];
         let missing_initial: Vec<_> = services
@@ -64,7 +65,7 @@ fn main() {
                 .collect();
             let still_need = !still_missing.is_empty();
             if still_need {
-                println!("cargo:warning=Building service binaries (home-dns, home-http, home-oidc) for bundling...");
+                println!("cargo:warning=Building service binaries (home-dns, home-http, home-s3, home-oidc) for bundling...");
                 let mut cmd = std::process::Command::new("cargo");
                 cmd.arg("build");
                 for (pkg, _) in services.iter() {
@@ -109,7 +110,12 @@ fn main() {
 
     // Local developer override (opt-in in CI, default on locally)
     let src_bin = manifest_path.join("bin");
-    for name in ["home-dns.exe", "home-http.exe", "home-oidc.exe"] {
+    for name in [
+        "home-dns.exe",
+        "home-http.exe",
+        "home-s3.exe",
+        "home-oidc.exe",
+    ] {
         let src = src_bin.join(name);
         let dst = dst_bin.join(name);
         println!("cargo:rerun-if-changed={}", src.display());
@@ -129,6 +135,7 @@ fn main() {
     let files = [
         proto_dir.join("home_dns.proto"),
         proto_dir.join("home_http.proto"),
+        proto_dir.join("home_s3.proto"),
         proto_dir.join("home_oidc.proto"),
     ];
     let include_dirs = [proto_dir.clone()];

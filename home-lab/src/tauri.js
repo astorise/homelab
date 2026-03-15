@@ -50,6 +50,20 @@ const __MOCK = {
       { host: 'grafana.home', port: 3000 },
     ],
   },
+  s3: {
+    status: {
+      state: 'running',
+      log_level: 'INFO',
+      endpoint: 'http://127.0.0.1:9000',
+      region: 'us-east-1',
+      access_key_id: 'rustfsadmin',
+      force_path_style: true,
+    },
+    buckets: [
+      { name: 'media', created_at: '2026-03-15T08:15:00Z' },
+      { name: 'backups', created_at: '2026-03-15T08:30:00Z' },
+    ],
+  },
   oidc: {
     status: {
       state: 'running',
@@ -173,6 +187,86 @@ async function mockInvoke(cmd, args = {}) {
       __MOCK.http.routes = __MOCK.http.routes.filter((r) => r.host !== key);
       const removed = before !== __MOCK.http.routes.length;
       return { ok: removed, message: removed ? 'Route removed' : 'Not found' };
+    }
+
+    // S3
+    case 's3_get_status':
+      return { ...__MOCK.s3.status };
+    case 's3_reload_config':
+      return { ok: true, message: 'S3 config reloaded' };
+    case 's3_stop_service':
+      __MOCK.s3.status.state = 'stopped';
+      return { ok: true, message: 'S3 stopped' };
+    case 's3_list_buckets':
+      return { buckets: __MOCK.s3.buckets.map((bucket) => ({ ...bucket })) };
+    case 's3_create_bucket': {
+      const name = (args?.bucketName || args?.bucket_name || '').trim().toLowerCase();
+      const sourcePath = (args?.sourcePath || args?.source_path || '').trim();
+      if (!name) {
+        return { ok: false, message: 'Bucket name required' };
+      }
+      const existed = __MOCK.s3.buckets.some((bucket) => bucket.name === name);
+      if (!existed) {
+        __MOCK.s3.buckets.push({ name, created_at: new Date().toISOString() });
+      }
+      return {
+        ok: true,
+        message: existed
+          ? sourcePath
+            ? `Bucket ${name} existed already and source path was imported (mock).`
+            : `Bucket ${name} existed already (mock).`
+          : sourcePath
+            ? `Bucket ${name} created and source path imported (mock).`
+            : `Bucket ${name} created (mock).`,
+      };
+    }
+    case 's3_update_bucket': {
+      const currentName = (args?.currentBucketName || args?.current_bucket_name || '').trim().toLowerCase();
+      const newNameRaw = (args?.newBucketName || args?.new_bucket_name || '').trim().toLowerCase();
+      const sourcePath = (args?.sourcePath || args?.source_path || '').trim();
+      const replaceObjects = !!(args?.replaceObjects ?? args?.replace_objects);
+      const newName = newNameRaw || currentName;
+      if (!currentName) {
+        return { ok: false, message: 'Current bucket name required' };
+      }
+      const currentBucket = __MOCK.s3.buckets.find((bucket) => bucket.name === currentName);
+      if (!currentBucket) {
+        return { ok: false, message: `Bucket ${currentName} not found (mock).` };
+      }
+      if (replaceObjects && !sourcePath) {
+        return { ok: false, message: 'replace_objects requires a source path (mock).' };
+      }
+      if (newName !== currentName && __MOCK.s3.buckets.some((bucket) => bucket.name === newName)) {
+        return { ok: false, message: `Bucket ${newName} exists already (mock).` };
+      }
+      currentBucket.name = newName;
+      let message = newName !== currentName
+        ? `Bucket ${currentName} renamed to ${newName} (mock).`
+        : `Bucket ${currentName} updated (mock).`;
+      if (sourcePath) {
+        message += replaceObjects
+          ? ' Existing objects replaced from source path.'
+          : ' Source path imported.';
+      }
+      return { ok: true, message };
+    }
+    case 's3_delete_bucket': {
+      const name = (args?.bucketName || args?.bucket_name || '').trim().toLowerCase();
+      const deleteObjects = !!(args?.deleteObjects ?? args?.delete_objects);
+      if (!name) {
+        return { ok: false, message: 'Bucket name required' };
+      }
+      const before = __MOCK.s3.buckets.length;
+      __MOCK.s3.buckets = __MOCK.s3.buckets.filter((bucket) => bucket.name !== name);
+      const removed = before !== __MOCK.s3.buckets.length;
+      return {
+        ok: removed,
+        message: removed
+          ? deleteObjects
+            ? `Bucket ${name} and its objects deleted (mock).`
+            : `Bucket ${name} deleted (mock).`
+          : `Bucket ${name} not found (mock).`,
+      };
     }
 
     // OIDC
@@ -581,6 +675,72 @@ export async function http_remove_route(arg1) {
   const host = typeof arg1 === 'object' && arg1 !== null ? arg1.host || arg1.id : arg1;
   if (!host) throw new Error('L\'hôte est requis pour la suppression.');
   return safeInvoke('http_remove_route', { host });
+}
+
+export async function s3_get_status() { return safeInvoke('s3_get_status'); }
+
+export async function s3_reload_config() { return safeInvoke('s3_reload_config'); }
+
+export async function s3_stop_service() {
+  return safeInvoke('s3_stop_service');
+}
+
+export async function s3_list_buckets() {
+  const res = await safeInvoke('s3_list_buckets');
+  return Array.isArray(res) ? res : (res?.buckets ?? []);
+}
+
+export async function s3_create_bucket(bucketName, sourcePath = '') {
+  const name = typeof bucketName === 'object' && bucketName !== null
+    ? String(bucketName.bucket_name ?? bucketName.name ?? '').trim()
+    : String(bucketName ?? '').trim();
+  const pathValue = typeof bucketName === 'object' && bucketName !== null
+    ? String(bucketName.source_path ?? bucketName.sourcePath ?? '').trim()
+    : String(sourcePath ?? '').trim();
+  if (!name) throw new Error('Le nom du bucket est requis.');
+  return safeInvoke('s3_create_bucket', {
+    bucket_name: name,
+    source_path: pathValue,
+  });
+}
+
+export async function s3_update_bucket(payload = {}) {
+  const current_bucket_name = String(
+    payload.current_bucket_name ?? payload.currentBucketName ?? ''
+  ).trim();
+  const new_bucket_name = String(
+    payload.new_bucket_name ?? payload.newBucketName ?? ''
+  ).trim();
+  const source_path = String(
+    payload.source_path ?? payload.sourcePath ?? ''
+  ).trim();
+  const replace_objects = !!(payload.replace_objects ?? payload.replaceObjects);
+  if (!current_bucket_name) {
+    throw new Error('Le nom actuel du bucket est requis.');
+  }
+  if (replace_objects && !source_path) {
+    throw new Error('Un chemin source est requis pour remplacer le contenu du bucket.');
+  }
+  return safeInvoke('s3_update_bucket', {
+    current_bucket_name,
+    new_bucket_name,
+    source_path,
+    replace_objects,
+  });
+}
+
+export async function s3_delete_bucket(bucketName, deleteObjects = false) {
+  const name = typeof bucketName === 'object' && bucketName !== null
+    ? String(bucketName.bucket_name ?? bucketName.name ?? '').trim()
+    : String(bucketName ?? '').trim();
+  const delete_objects = typeof bucketName === 'object' && bucketName !== null
+    ? !!(bucketName.delete_objects ?? bucketName.deleteObjects)
+    : !!deleteObjects;
+  if (!name) throw new Error('Le nom du bucket est requis pour la suppression.');
+  return safeInvoke('s3_delete_bucket', {
+    bucket_name: name,
+    delete_objects,
+  });
 }
 
 export async function oidc_get_status() { return safeInvoke('oidc_get_status'); }

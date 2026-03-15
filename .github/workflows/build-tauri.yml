@@ -41,11 +41,13 @@ jobs:
         run: |
           cargo build -p home-dns   --release
           cargo build -p home-http --release
+          cargo build -p home-s3   --release
           cargo build -p home-oidc --release
           Get-ChildItem target/release -Filter 'home-*.exe'
           New-Item -ItemType Directory -Path services-win -Force | Out-Null
           Copy-Item target/release/home-dns.exe   services-win/ -Force
           Copy-Item target/release/home-http.exe  services-win/ -Force
+          Copy-Item target/release/home-s3.exe    services-win/ -Force
           Copy-Item target/release/home-oidc.exe services-win/ -Force
 
       - name: Upload services artifacts

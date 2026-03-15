@@ -3,6 +3,7 @@ Var LOG_FILE
 Var LOG_HANDLE
 Var UNINS_HTTP_OK
 Var UNINS_DNS_OK
+Var UNINS_S3_OK
 Var UNINS_OIDC_OK
 Var OIDC_DOMAIN
 
@@ -102,6 +103,15 @@ FunctionEnd
   ${EndIf}
   StrCmp $LOG_HANDLE "" +2
   FileWrite $LOG_HANDLE "home-http.exe install => rc=$0 out=$1$\r$\n"
+  nsExec::ExecToStack '"$INSTDIR\bin\home-s3.exe" install'
+  Pop $0
+  Pop $1
+  DetailPrint "home-s3.exe install => rc=$0 out=$1"
+  ${If} $0 != 0
+    DetailPrint "[WARN] home-s3.exe install returned $0"
+  ${EndIf}
+  StrCmp $LOG_HANDLE "" +2
+  FileWrite $LOG_HANDLE "home-s3.exe install => rc=$0 out=$1$\r$\n"
   nsExec::ExecToStack '"$INSTDIR\bin\home-oidc.exe" install'
   Pop $0
   Pop $1
@@ -124,6 +134,12 @@ FunctionEnd
   DetailPrint "sc start HomeHttpService => rc=$0 out=$1"
   StrCmp $LOG_HANDLE "" +2
   FileWrite $LOG_HANDLE "sc start HomeHttpService => rc=$0 out=$1$\r$\n"
+  nsExec::ExecToStack 'sc.exe start HomeS3Service'
+  Pop $0
+  Pop $1
+  DetailPrint "sc start HomeS3Service => rc=$0 out=$1"
+  StrCmp $LOG_HANDLE "" +2
+  FileWrite $LOG_HANDLE "sc start HomeS3Service => rc=$0 out=$1$\r$\n"
   nsExec::ExecToStack 'sc.exe start HomeOidcService'
   Pop $0
   Pop $1
@@ -170,6 +186,7 @@ FunctionEnd
   ; Track per-service uninstall success to avoid duplicate sc.exe calls
   StrCpy $UNINS_HTTP_OK 0
   StrCpy $UNINS_DNS_OK 0
+  StrCpy $UNINS_S3_OK 0
   StrCpy $UNINS_OIDC_OK 0
 
   DetailPrint "Invoking service uninstallers..."
@@ -193,6 +210,17 @@ FunctionEnd
     FileWrite $LOG_HANDLE "home-oidc.exe uninstall => rc=$0 out=$1$\r$\n"
     ${If} $0 == 0
       StrCpy $UNINS_OIDC_OK 1
+    ${EndIf}
+  ${EndIf}
+  ${If} ${FileExists} "$INSTDIR\bin\home-s3.exe"
+    nsExec::ExecToStack '"$INSTDIR\bin\home-s3.exe" uninstall'
+    Pop $0
+    Pop $1
+    DetailPrint "home-s3.exe uninstall => rc=$0 out=$1"
+    StrCmp $LOG_HANDLE "" +2
+    FileWrite $LOG_HANDLE "home-s3.exe uninstall => rc=$0 out=$1$\r$\n"
+    ${If} $0 == 0
+      StrCpy $UNINS_S3_OK 1
     ${EndIf}
   ${EndIf}
   ${If} ${FileExists} "$INSTDIR\bin\home-dns.exe"
@@ -226,6 +254,15 @@ FunctionEnd
     StrCmp $LOG_HANDLE "" +2
     FileWrite $LOG_HANDLE "sc stop HomeOidcService => rc=$0 out=$1$\r$\n"
   ${EndIf}
+  ${If} $UNINS_S3_OK != 1
+    DetailPrint "Stopping HomeS3Service (fallback)..."
+    nsExec::ExecToStack 'sc.exe stop HomeS3Service'
+    Pop $0
+    Pop $1
+    DetailPrint "sc stop HomeS3Service => rc=$0 out=$1"
+    StrCmp $LOG_HANDLE "" +2
+    FileWrite $LOG_HANDLE "sc stop HomeS3Service => rc=$0 out=$1$\r$\n"
+  ${EndIf}
   ${If} $UNINS_DNS_OK != 1
     DetailPrint "Stopping HomeDnsService (fallback)..."
     nsExec::ExecToStack 'sc.exe stop HomeDnsService'
@@ -241,6 +278,9 @@ FunctionEnd
     Sleep 400
   ${EndIf}
   ${If} $UNINS_OIDC_OK != 1
+    Sleep 400
+  ${EndIf}
+  ${If} $UNINS_S3_OK != 1
     Sleep 400
   ${EndIf}
   ${If} $UNINS_DNS_OK != 1
@@ -292,6 +332,15 @@ FunctionEnd
     DetailPrint "sc delete HomeOidcService => rc=$0 out=$1"
     StrCmp $LOG_HANDLE "" +2
     FileWrite $LOG_HANDLE "sc delete HomeOidcService => rc=$0 out=$1$\r$\n"
+  ${EndIf}
+  ${If} $UNINS_S3_OK != 1
+    DetailPrint "Deleting HomeS3Service (fallback)..."
+    nsExec::ExecToStack 'sc.exe delete HomeS3Service'
+    Pop $0
+    Pop $1
+    DetailPrint "sc delete HomeS3Service => rc=$0 out=$1"
+    StrCmp $LOG_HANDLE "" +2
+    FileWrite $LOG_HANDLE "sc delete HomeS3Service => rc=$0 out=$1$\r$\n"
   ${EndIf}
 
   ${If} $UNINS_DNS_OK != 1

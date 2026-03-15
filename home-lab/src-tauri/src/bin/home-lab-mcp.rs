@@ -4,6 +4,7 @@ use anyhow::Result;
 use home_lab_lib::{
     dns, http,
     oidc::{self, RegisterClientIn},
+    s3,
     wsl,
 };
 use rmcp::schemars;
@@ -91,6 +92,31 @@ struct OidcRemoveClientRequest {
     client_id: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+struct S3CreateBucketRequest {
+    bucket_name: String,
+    #[serde(default)]
+    source_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+struct S3UpdateBucketRequest {
+    current_bucket_name: String,
+    #[serde(default)]
+    new_bucket_name: Option<String>,
+    #[serde(default)]
+    source_path: Option<String>,
+    #[serde(default)]
+    replace_objects: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+struct S3DeleteBucketRequest {
+    bucket_name: String,
+    #[serde(default)]
+    delete_objects: Option<bool>,
+}
+
 impl From<OidcRegisterClientRequest> for RegisterClientIn {
     fn from(value: OidcRegisterClientRequest) -> Self {
         RegisterClientIn {
@@ -124,10 +150,10 @@ impl ServerHandler for HomeLabMcpServer {
             .with_server_info(
                 Implementation::new("home-lab-mcp", env!("CARGO_PKG_VERSION"))
                     .with_title("Home Lab MCP")
-                    .with_description("MCP bridge for Home Lab WSL, k3s, DNS, OIDC and HTTPS orchestration."),
+                    .with_description("MCP bridge for Home Lab WSL, k3s, DNS, S3, OIDC and HTTPS orchestration."),
             )
             .with_instructions(
-                "Use these tools to provision Home Lab WSL clusters, deploy manifests to k3s, and manage DNS, OIDC and HTTPS routes.",
+                "Use these tools to provision Home Lab WSL clusters, deploy manifests to k3s, and manage DNS, S3, OIDC and HTTPS routes.",
             )
     }
 }
@@ -293,6 +319,69 @@ impl HomeLabMcpServer {
         Parameters(request): Parameters<HttpRemoveRouteRequest>,
     ) -> Result<CallToolResult, McpError> {
         json_tool_result(http::http_remove_route(request.host).await)
+    }
+
+    #[tool(
+        name = "s3_get_status",
+        description = "Return the current Home S3 service status and RustFS endpoint configuration."
+    )]
+    async fn s3_get_status(&self) -> Result<CallToolResult, McpError> {
+        json_tool_result(s3::s3_get_status().await)
+    }
+
+    #[tool(
+        name = "s3_list_buckets",
+        description = "List S3 buckets managed through Home S3."
+    )]
+    async fn s3_list_buckets(&self) -> Result<CallToolResult, McpError> {
+        json_tool_result(s3::s3_list_buckets().await)
+    }
+
+    #[tool(
+        name = "s3_create_bucket",
+        description = "Create an S3 bucket, optionally importing a Windows filesystem path into it."
+    )]
+    async fn s3_create_bucket(
+        &self,
+        Parameters(request): Parameters<S3CreateBucketRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        json_tool_result(s3::s3_create_bucket(request.bucket_name, request.source_path).await)
+    }
+
+    #[tool(
+        name = "s3_update_bucket",
+        description = "Rename an S3 bucket and/or re-import content from a Windows filesystem path."
+    )]
+    async fn s3_update_bucket(
+        &self,
+        Parameters(request): Parameters<S3UpdateBucketRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        json_tool_result(
+            s3::s3_update_bucket(
+                request.current_bucket_name,
+                request.new_bucket_name,
+                request.source_path,
+                request.replace_objects.unwrap_or(false),
+            )
+            .await,
+        )
+    }
+
+    #[tool(
+        name = "s3_delete_bucket",
+        description = "Delete an S3 bucket, optionally removing all objects first."
+    )]
+    async fn s3_delete_bucket(
+        &self,
+        Parameters(request): Parameters<S3DeleteBucketRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        json_tool_result(
+            s3::s3_delete_bucket(
+                request.bucket_name,
+                request.delete_objects.unwrap_or(false),
+            )
+            .await,
+        )
     }
 
     #[tool(

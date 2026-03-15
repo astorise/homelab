@@ -15,6 +15,7 @@ pub mod http;
 mod icons;
 mod menu;
 pub mod oidc;
+pub mod s3;
 mod ui;
 pub mod wsl;
 
@@ -252,6 +253,13 @@ pub fn run() {
             http::http_list_routes,
             http::http_add_route,
             http::http_remove_route,
+            s3::s3_get_status,
+            s3::s3_reload_config,
+            s3::s3_stop_service,
+            s3::s3_list_buckets,
+            s3::s3_create_bucket,
+            s3::s3_update_bucket,
+            s3::s3_delete_bucket,
             oidc::oidc_get_status,
             oidc::oidc_list_clients,
             oidc::oidc_register_client,

@@ -1,0 +1,54 @@
+syntax = "proto3";
+package homes3.v1;
+
+message Empty {}
+
+message Acknowledge {
+  bool ok = 1;
+  string message = 2;
+}
+
+message StatusResponse {
+  string state = 1;
+  string log_level = 2;
+  string endpoint = 3;
+  string region = 4;
+  string access_key_id = 5;
+  bool force_path_style = 6;
+}
+
+message ListBucketsResponse {
+  message Bucket {
+    string name = 1;
+    string created_at = 2;
+  }
+
+  repeated Bucket buckets = 1;
+}
+
+message CreateBucketRequest {
+  string name = 1;
+  string source_path = 2;
+}
+
+message DeleteBucketRequest {
+  string name = 1;
+  bool delete_objects = 2;
+}
+
+message UpdateBucketRequest {
+  string current_name = 1;
+  string new_name = 2;
+  string source_path = 3;
+  bool replace_objects = 4;
+}
+
+service HomeS3 {
+  rpc GetStatus(Empty) returns (StatusResponse);
+  rpc ReloadConfig(Empty) returns (Acknowledge);
+  rpc StopService(Empty) returns (Acknowledge);
+  rpc ListBuckets(Empty) returns (ListBucketsResponse);
+  rpc CreateBucket(CreateBucketRequest) returns (Acknowledge);
+  rpc UpdateBucket(UpdateBucketRequest) returns (Acknowledge);
+  rpc DeleteBucket(DeleteBucketRequest) returns (Acknowledge);
+}
