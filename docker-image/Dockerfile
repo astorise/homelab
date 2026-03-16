@@ -1,6 +1,9 @@
+# syntax=docker/dockerfile:1
+
 # ---- glibc overlay stage ----
-# Debian 11 est dans les plateformes officiellement testées par NVIDIA Container Toolkit.
 FROM debian:bullseye-slim AS glibc-overlay
+
+ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libc6 \
@@ -22,22 +25,37 @@ RUN set -eux; \
       /glibc-overlay/usr/lib/x86_64-linux-gnu \
       /glibc-overlay/etc \
       /glibc-overlay/etc/ssl/certs; \
-    cp -av /lib/x86_64-linux-gnu/libc.so.6 /glibc-overlay/lib/x86_64-linux-gnu/; \
-    cp -av /lib/x86_64-linux-gnu/libdl.so.2 /glibc-overlay/lib/x86_64-linux-gnu/; \
-    cp -av /lib/x86_64-linux-gnu/libm.so.6 /glibc-overlay/lib/x86_64-linux-gnu/; \
-    cp -av /lib/x86_64-linux-gnu/libpthread.so.0 /glibc-overlay/lib/x86_64-linux-gnu/; \
-    cp -av /lib/x86_64-linux-gnu/librt.so.1 /glibc-overlay/lib/x86_64-linux-gnu/; \
-    cp -av /lib/x86_64-linux-gnu/libresolv.so.2 /glibc-overlay/lib/x86_64-linux-gnu/; \
-    cp -av /lib/x86_64-linux-gnu/libnss_dns.so.2 /glibc-overlay/lib/x86_64-linux-gnu/; \
-    cp -av /lib/x86_64-linux-gnu/libnss_files.so.2 /glibc-overlay/lib/x86_64-linux-gnu/; \
-    cp -av /lib/x86_64-linux-gnu/libgcc_s.so.1 /glibc-overlay/lib/x86_64-linux-gnu/; \
-    cp -av /lib/x86_64-linux-gnu/libz.so.1 /glibc-overlay/lib/x86_64-linux-gnu/; \
-    cp -av /lib/x86_64-linux-gnu/libcap.so.2 /glibc-overlay/lib/x86_64-linux-gnu/; \
-    cp -av /lib/x86_64-linux-gnu/libseccomp.so.2 /glibc-overlay/lib/x86_64-linux-gnu/; \
-    cp -av /lib/x86_64-linux-gnu/libtirpc.so.3 /glibc-overlay/lib/x86_64-linux-gnu/; \
-    cp -av /lib/x86_64-linux-gnu/libjansson.so.4 /glibc-overlay/lib/x86_64-linux-gnu/; \
-    cp -av /lib/x86_64-linux-gnu/libelf.so.1 /glibc-overlay/lib/x86_64-linux-gnu/; \
-    cp -av /usr/lib/x86_64-linux-gnu/libstdc++.so.6 /glibc-overlay/usr/lib/x86_64-linux-gnu/; \
+    copy_lib() { \
+      lib="$1"; \
+      path="$(ldconfig -p | awk -v lib="$lib" '$1 == lib { print $NF; exit }')"; \
+      if [ -z "$path" ]; then \
+        echo "Library not found: $lib" >&2; \
+        exit 1; \
+      fi; \
+      dest="/glibc-overlay$(dirname "$path")"; \
+      mkdir -p "$dest"; \
+      cp -av "$path" "$dest/"; \
+    }; \
+    for lib in \
+      libc.so.6 \
+      libdl.so.2 \
+      libm.so.6 \
+      libpthread.so.0 \
+      librt.so.1 \
+      libresolv.so.2 \
+      libnss_dns.so.2 \
+      libnss_files.so.2 \
+      libgcc_s.so.1 \
+      libz.so.1 \
+      libcap.so.2 \
+      libseccomp.so.2 \
+      libtirpc.so.3 \
+      libjansson.so.4 \
+      libelf.so.1 \
+      libstdc++.so.6; \
+    do \
+      copy_lib "$lib"; \
+    done; \
     cp -av /lib64/ld-linux-x86-64.so.2 /glibc-overlay/lib64/; \
     cp -av /etc/ssl/certs/ca-certificates.crt /glibc-overlay/etc/ssl/certs/; \
     printf 'passwd: files\n' > /glibc-overlay/etc/nsswitch.conf; \
@@ -48,10 +66,9 @@ RUN set -eux; \
     printf 'networks: files\n' >> /glibc-overlay/etc/nsswitch.conf
 
 # ---- NVIDIA toolkit stage ----
-# On prend une base Debian 11, compatible avec les instructions apt officielles NVIDIA.
 FROM debian:bullseye-slim AS nvidia-toolkit
 
-ARG NVIDIA_CONTAINER_TOOLKIT_VERSION=1.19.0-1
+ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
@@ -62,21 +79,22 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN set -eux; \
     curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey \
       | gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg; \
-    curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list \
+    curl -fsSL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list \
       | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' \
       > /etc/apt/sources.list.d/nvidia-container-toolkit.list; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
-      nvidia-container-toolkit=${NVIDIA_CONTAINER_TOOLKIT_VERSION} \
-      nvidia-container-toolkit-base=${NVIDIA_CONTAINER_TOOLKIT_VERSION} \
-      libnvidia-container-tools=${NVIDIA_CONTAINER_TOOLKIT_VERSION} \
-      libnvidia-container1=${NVIDIA_CONTAINER_TOOLKIT_VERSION}; \
+      nvidia-container-toolkit \
+      nvidia-container-toolkit-base \
+      libnvidia-container-tools \
+      libnvidia-container1; \
     rm -rf /var/lib/apt/lists/*
 
 RUN set -eux; \
     mkdir -p \
       /nvidia-overlay/usr/bin \
       /nvidia-overlay/usr/lib/x86_64-linux-gnu \
+      /nvidia-overlay/lib/x86_64-linux-gnu \
       /nvidia-overlay/etc/nvidia-container-runtime \
       /nvidia-overlay/etc/nvidia-container-toolkit \
       /nvidia-overlay/usr/share; \
@@ -86,7 +104,9 @@ RUN set -eux; \
       /usr/bin/nvidia-container-cli \
       /usr/bin/nvidia-ctk; \
     do \
-      [ -f "$bin" ] && cp -av "$bin" /nvidia-overlay/usr/bin/; \
+      if [ -f "$bin" ]; then \
+        cp -av "$bin" /nvidia-overlay/usr/bin/; \
+      fi; \
     done; \
     if [ -d /etc/nvidia-container-runtime ]; then \
       cp -a /etc/nvidia-container-runtime/. /nvidia-overlay/etc/nvidia-container-runtime/; \
@@ -99,7 +119,6 @@ RUN set -eux; \
       cp -a /usr/share/nvidia-container-toolkit/. /nvidia-overlay/usr/share/nvidia-container-toolkit/; \
     fi
 
-# Copie récursive des dépendances ELF réelles des binaires NVIDIA.
 RUN set -eux; \
     bins="/usr/bin/nvidia-container-runtime /usr/bin/nvidia-container-runtime-hook /usr/bin/nvidia-container-cli /usr/bin/nvidia-ctk"; \
     for bin in $bins; do \
@@ -126,14 +145,12 @@ FROM busybox:1.37.0-musl
 ENV WSL_ROLE=server
 ENV WSL_PORT_RANGE=6443-6550
 
-# Utilitaires réseau BusyBox nécessaires à k3s et à l'init.
-RUN mkdir -p /sbin /usr/local/bin /etc/ssl/certs /etc/profile.d \
+RUN mkdir -p /sbin /usr/local/bin /etc/ssl/certs /etc/profile.d /var/log \
  && ln -sf /bin/busybox /sbin/ip \
  && ln -sf /bin/busybox /sbin/iptables \
  && ln -sf /bin/busybox /sbin/iptables-save \
  && ln -sf /bin/busybox /sbin/iptables-restore
 
-# CA bundle
 COPY --from=ca-certs /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 RUN ln -sf /etc/ssl/certs/ca-certificates.crt /etc/ssl/cert.pem
 
@@ -147,59 +164,57 @@ COPY --from=glibc-overlay /glibc-overlay/etc/ssl/certs/ca-certificates.crt /etc/
 # ---- NVIDIA runtime minimal ----
 COPY --from=nvidia-toolkit /nvidia-overlay/usr/bin /usr/bin
 COPY --from=nvidia-toolkit /nvidia-overlay/usr/lib /usr/lib
+COPY --from=nvidia-toolkit /nvidia-overlay/lib /lib
 COPY --from=nvidia-toolkit /nvidia-overlay/etc/nvidia-container-runtime /etc/nvidia-container-runtime
 COPY --from=nvidia-toolkit /nvidia-overlay/etc/nvidia-container-toolkit /etc/nvidia-container-toolkit
 COPY --from=nvidia-toolkit /nvidia-overlay/usr/share /usr/share
 
 # Wrappers glibc pour les binaires NVIDIA
-RUN set -eux; \
-    cat > /usr/local/bin/nvidia-container-runtime <<'EOF' \
-#!/bin/sh
-exec /lib64/ld-linux-x86-64.so.2 \
-  --library-path /usr/lib/wsl/lib:/lib/x86_64-linux-gnu:/usr/lib/x86_64-linux-gnu:/lib64 \
-  /usr/bin/nvidia-container-runtime "$@"
-EOF
-RUN chmod +x /usr/local/bin/nvidia-container-runtime
+RUN printf '%s\n' \
+    '#!/bin/sh' \
+    'exec /lib64/ld-linux-x86-64.so.2 --library-path /usr/lib/wsl/lib:/lib/x86_64-linux-gnu:/usr/lib/x86_64-linux-gnu:/lib64 /usr/bin/nvidia-container-runtime "$@"' \
+    > /usr/local/bin/nvidia-container-runtime \
+ && chmod +x /usr/local/bin/nvidia-container-runtime
 
-RUN set -eux; \
-    cat > /usr/local/bin/nvidia-container-cli <<'EOF' \
-#!/bin/sh
-exec /lib64/ld-linux-x86-64.so.2 \
-  --library-path /usr/lib/wsl/lib:/lib/x86_64-linux-gnu:/usr/lib/x86_64-linux-gnu:/lib64 \
-  /usr/bin/nvidia-container-cli "$@"
-EOF
-RUN chmod +x /usr/local/bin/nvidia-container-cli
+RUN printf '%s\n' \
+    '#!/bin/sh' \
+    'exec /lib64/ld-linux-x86-64.so.2 --library-path /usr/lib/wsl/lib:/lib/x86_64-linux-gnu:/usr/lib/x86_64-linux-gnu:/lib64 /usr/bin/nvidia-container-cli "$@"' \
+    > /usr/local/bin/nvidia-container-cli \
+ && chmod +x /usr/local/bin/nvidia-container-cli
 
-RUN set -eux; \
-    cat > /usr/local/bin/nvidia-ctk <<'EOF' \
-#!/bin/sh
-exec /lib64/ld-linux-x86-64.so.2 \
-  --library-path /usr/lib/wsl/lib:/lib/x86_64-linux-gnu:/usr/lib/x86_64-linux-gnu:/lib64 \
-  /usr/bin/nvidia-ctk "$@"
-EOF
-RUN chmod +x /usr/local/bin/nvidia-ctk
+RUN printf '%s\n' \
+    '#!/bin/sh' \
+    'exec /lib64/ld-linux-x86-64.so.2 --library-path /usr/lib/wsl/lib:/lib/x86_64-linux-gnu:/usr/lib/x86_64-linux-gnu:/lib64 /usr/bin/nvidia-ctk "$@"' \
+    > /usr/local/bin/nvidia-ctk \
+ && chmod +x /usr/local/bin/nvidia-ctk
 
-RUN set -eux; \
-    cat > /usr/local/bin/nvidia-smi <<'EOF' \
-#!/bin/sh
-exec /usr/lib/wsl/lib/nvidia-smi "$@"
-EOF
-RUN chmod +x /usr/local/bin/nvidia-smi
+RUN printf '%s\n' \
+    '#!/bin/sh' \
+    'exec /usr/lib/wsl/lib/nvidia-smi "$@"' \
+    > /usr/local/bin/nvidia-smi \
+ && chmod +x /usr/local/bin/nvidia-smi
 
-# Alias simple pour que le runtime soit visible de façon évidente dans le PATH
+RUN printf '%s\n' \
+    '#!/bin/sh' \
+    'exit 0' \
+    > /usr/local/bin/nvidia-ldconfig-noop \
+ && chmod +x /usr/local/bin/nvidia-ldconfig-noop
+
 RUN ln -sf /usr/local/bin/nvidia-container-runtime /usr/local/bin/nvidia
 
-# S'assure que /usr/lib/wsl/lib est dans le PATH interactif
-RUN printf 'export PATH="/usr/lib/wsl/lib:$PATH"\n' > /etc/profile.d/wsl-nvidia.sh
+RUN printf '%s\n' \
+    'export PATH="/usr/lib/wsl/lib:$PATH"' \
+    > /etc/profile.d/wsl-nvidia.sh
 
 # Config NVIDIA runtime minimale
 RUN mkdir -p /etc/nvidia-container-runtime /etc/nvidia-container-toolkit
+
 RUN if [ ! -f /etc/nvidia-container-runtime/config.toml ]; then \
       printf '%s\n' \
         'disable-require = false' \
         '[nvidia-container-cli]' \
         'environment = []' \
-        'ldconfig = "@/sbin/ldconfig.real"' \
+        'ldconfig = "@/usr/local/bin/nvidia-ldconfig-noop"' \
         'load-kmods = false' \
         'debug = "/var/log/nvidia-container-toolkit.log"' \
         '' \
@@ -209,37 +224,37 @@ RUN if [ ! -f /etc/nvidia-container-runtime/config.toml ]; then \
       > /etc/nvidia-container-runtime/config.toml; \
     fi
 
-# K3s/containerd template v3 : on n'utilise pas nvidia-ctk pendant le build,
-# on prépare directement le runtime nvidia pour containerd embarqué par k3s.
+# Template K3s/containerd v3
 RUN mkdir -p /var/lib/rancher/k3s/agent/etc/containerd
-RUN cat > /var/lib/rancher/k3s/agent/etc/containerd/config-v3.toml.tmpl <<'EOF'
-{{ template "base" . }}
 
-[plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.'nvidia']
-  runtime_type = "io.containerd.runc.v2"
+RUN printf '%s\n' \
+    '{{ template "base" . }}' \
+    '' \
+    "[plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.'nvidia']" \
+    '  runtime_type = "io.containerd.runc.v2"' \
+    '' \
+    "[plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.'nvidia'.options]" \
+    '  BinaryName = "/usr/local/bin/nvidia-container-runtime"' \
+    '  SystemdCgroup = false' \
+    > /var/lib/rancher/k3s/agent/etc/containerd/config-v3.toml.tmpl
 
-[plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.'nvidia'.options]
-  BinaryName = "/usr/local/bin/nvidia-container-runtime"
-  SystemdCgroup = false
-EOF
+# Smoke test
+RUN printf '%s\n' \
+    '#!/bin/sh' \
+    'set -eu' \
+    'echo "== WSL GPU files =="' \
+    'ls -l /dev/dxg || true' \
+    'ls -l /usr/lib/wsl/lib || true' \
+    'echo "== nvidia-smi =="' \
+    '/usr/local/bin/nvidia-smi || true' \
+    'echo "== nvidia-container-cli info =="' \
+    '/usr/local/bin/nvidia-container-cli info || true' \
+    'echo "== K3s containerd template =="' \
+    'cat /var/lib/rancher/k3s/agent/etc/containerd/config-v3.toml.tmpl || true' \
+    > /usr/local/bin/nvidia-wsl-smoke.sh \
+ && chmod +x /usr/local/bin/nvidia-wsl-smoke.sh
 
-# Petit script de smoke test
-RUN cat > /usr/local/bin/nvidia-wsl-smoke.sh <<'EOF'
-#!/bin/sh
-set -eu
-echo "== WSL GPU files =="
-ls -l /dev/dxg || true
-ls -l /usr/lib/wsl/lib || true
-echo "== nvidia-smi =="
-/usr/local/bin/nvidia-smi || true
-echo "== nvidia-container-cli info =="
-/usr/local/bin/nvidia-container-cli info || true
-echo "== K3s containerd template =="
-cat /var/lib/rancher/k3s/agent/etc/containerd/config-v3.toml.tmpl || true
-EOF
-RUN chmod +x /usr/local/bin/nvidia-wsl-smoke.sh
-
-# Copy initialization scripts and environment
+# Init scripts
 COPY docker-image/k3s-env /etc/k3s-env
 COPY docker-image/wsl.conf /etc/wsl.conf
 COPY docker-image/fstab /etc/fstab
@@ -248,7 +263,6 @@ COPY docker-image/k3s-init.sh /usr/local/bin/k3s-init.sh
 
 RUN chmod +x /usr/local/bin/mount_all.sh /usr/local/bin/k3s-init.sh
 
-# Script de démarrage auto
 RUN mkdir -p /etc/local.d \
  && printf '#!/bin/sh\nexec sh /usr/local/bin/k3s-init.sh\n' > /etc/local.d/k3s.start \
  && chmod +x /etc/local.d/k3s.start
