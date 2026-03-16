@@ -98,8 +98,31 @@ pub(super) fn init_local_logging(
     if let Some(log_directory) = log_dir_str {
         init_file_logging_internal(config, log_directory, logger_level, is_production)
     } else {
-        Ok(init_stdout_only(config, logger_level, is_production))
+        init_stdout_only(config, logger_level, is_production)
     }
+}
+
+fn is_embedded_subscriber_conflict(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("setloggererror")
+        || message.contains("global default trace dispatcher has already been set")
+        || message.contains("a global default trace dispatcher has already been set")
+        || message.contains("logger already")
+        || message.contains("logging system was already initialized")
+        || message.contains("attempted to set a logger after the logging system was already initialized")
+}
+
+fn try_init_registry(
+    registry: impl tracing::Subscriber + Send + Sync,
+) -> Result<(), TelemetryError> {
+    if let Err(err) = registry.try_init() {
+        let message = err.to_string();
+        if !is_embedded_subscriber_conflict(&message) {
+            return Err(TelemetryError::SubscriberInit(message));
+        }
+    }
+
+    Ok(())
 }
 
 // ─── Stdout-only ─────────────────────────────────────────────────────────────
@@ -114,7 +137,7 @@ pub(super) fn init_local_logging(
 /// * `_config` - Unused at the moment; reserved for future configuration.
 /// * `logger_level` - Effective log level string.
 /// * `is_production` - Controls span event verbosity.
-fn init_stdout_only(_config: &OtelConfig, logger_level: &str, is_production: bool) -> OtelGuard {
+fn init_stdout_only(_config: &OtelConfig, logger_level: &str, is_production: bool) -> Result<OtelGuard, TelemetryError> {
     let env_filter = build_env_filter(logger_level, None);
     let (nb, guard) = tracing_appender::non_blocking(std::io::stdout());
 
@@ -134,17 +157,18 @@ fn init_stdout_only(_config: &OtelConfig, logger_level: &str, is_production: boo
         .with_span_list(true)
         .with_span_events(if is_production { FmtSpan::CLOSE } else { FmtSpan::FULL });
 
-    tracing_subscriber::registry()
+    try_init_registry(
+        tracing_subscriber::registry()
         .with(env_filter)
         .with(ErrorLayer::default())
-        .with(fmt_layer)
-        .init();
+        .with(fmt_layer),
+    )?;
 
     set_observability_metric_enabled(false);
     counter!("rustfs.start.total").increment(1);
     info!("Init stdout logging (level: {})", logger_level);
 
-    OtelGuard {
+    Ok(OtelGuard {
         tracer_provider: None,
         meter_provider: None,
         logger_provider: None,
@@ -153,7 +177,7 @@ fn init_stdout_only(_config: &OtelConfig, logger_level: &str, is_production: boo
         tracing_guard: Some(guard),
         stdout_guard: None,
         cleanup_handle: None,
-    }
+    })
 }
 
 // ─── File-rolling ─────────────────────────────────────────────────────────────
@@ -261,12 +285,13 @@ fn init_file_logging_internal(
         (None, None)
     };
 
-    tracing_subscriber::registry()
+    try_init_registry(
+        tracing_subscriber::registry()
         .with(env_filter)
         .with(ErrorLayer::default())
         .with(file_layer)
-        .with(stdout_layer)
-        .init();
+        .with(stdout_layer),
+    )?;
 
     set_observability_metric_enabled(false);
 

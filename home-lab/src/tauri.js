@@ -699,8 +699,8 @@ export async function s3_create_bucket(bucketName, sourcePath = '') {
     : String(sourcePath ?? '').trim();
   if (!name) throw new Error('Le nom du bucket est requis.');
   return safeInvoke('s3_create_bucket', {
-    bucket_name: name,
-    source_path: pathValue,
+    bucketName: name,
+    sourcePath: pathValue,
   });
 }
 
@@ -722,10 +722,10 @@ export async function s3_update_bucket(payload = {}) {
     throw new Error('Un chemin source est requis pour remplacer le contenu du bucket.');
   }
   return safeInvoke('s3_update_bucket', {
-    current_bucket_name,
-    new_bucket_name,
-    source_path,
-    replace_objects,
+    currentBucketName: current_bucket_name,
+    newBucketName: new_bucket_name,
+    sourcePath: source_path,
+    replaceObjects: replace_objects,
   });
 }
 
@@ -738,8 +738,8 @@ export async function s3_delete_bucket(bucketName, deleteObjects = false) {
     : !!deleteObjects;
   if (!name) throw new Error('Le nom du bucket est requis pour la suppression.');
   return safeInvoke('s3_delete_bucket', {
-    bucket_name: name,
-    delete_objects,
+    bucketName: name,
+    deleteObjects: delete_objects,
   });
 }
 

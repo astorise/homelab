@@ -73,6 +73,29 @@ use tracing_subscriber::{
     util::SubscriberInitExt,
 };
 
+fn is_embedded_subscriber_conflict(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("setloggererror")
+        || message.contains("global default trace dispatcher has already been set")
+        || message.contains("a global default trace dispatcher has already been set")
+        || message.contains("logger already")
+        || message.contains("logging system was already initialized")
+        || message.contains("attempted to set a logger after the logging system was already initialized")
+}
+
+fn try_init_registry(
+    registry: impl tracing::Subscriber + Send + Sync,
+) -> Result<(), TelemetryError> {
+    if let Err(err) = registry.try_init() {
+        let message = err.to_string();
+        if !is_embedded_subscriber_conflict(&message) {
+            return Err(TelemetryError::SubscriberInit(message));
+        }
+    }
+
+    Ok(())
+}
+
 /// Initialize the full OpenTelemetry HTTP pipeline (traces + metrics + logs).
 ///
 /// This function is invoked when at least one OTLP endpoint has been
@@ -287,15 +310,16 @@ pub(super) fn init_observability_http(
         );
     }
     let filter = build_env_filter(logger_level, None);
-    tracing_subscriber::registry()
+    try_init_registry(
+        tracing_subscriber::registry()
         .with(filter)
         .with(ErrorLayer::default())
         .with(file_layer_opt) // File
         .with(stdout_layer_opt) // Stdout (only if file logging enabled it)
         .with(tracer_layer)
         .with(otel_bridge)
-        .with(metrics_layer)
-        .init();
+        .with(metrics_layer),
+    )?;
 
     counter!("rustfs.start.total").increment(1);
     info!(

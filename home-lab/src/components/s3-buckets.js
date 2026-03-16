@@ -4,7 +4,7 @@ import {
   s3_list_buckets,
   s3_update_bucket,
 } from '../tauri.js';
-import { showError } from './toast.js';
+import { showError, showSuccess } from './toast.js';
 
 function formatDate(value) {
   if (!value) {
@@ -254,6 +254,7 @@ class S3Buckets extends HTMLElement {
       }
       form.reset();
       await this.load();
+      showSuccess(result?.message || `Bucket ${bucket_name} créé.`);
     } catch (err) {
       showError(err?.message || String(err));
     } finally {
@@ -306,6 +307,7 @@ class S3Buckets extends HTMLElement {
       }
       this._editingBucket = null;
       await this.load();
+      showSuccess(result?.message || 'Bucket mis à jour.');
     } catch (err) {
       showError(err?.message || String(err));
     } finally {
@@ -344,6 +346,7 @@ class S3Buckets extends HTMLElement {
         this._editingBucket = null;
       }
       await this.load();
+      showSuccess(result?.message || `Bucket ${bucket_name} supprimé.`);
     } catch (err) {
       button.disabled = false;
       button.textContent = 'Supprimer';
