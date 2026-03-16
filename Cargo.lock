@@ -7644,16 +7644,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pbkdf2"
-version = "0.13.0-rc.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c8dfa4e14084d963d35bfb4cdb38712cde78dcf83054c0e8b9b8e899150f374e"
-dependencies = [
- "digest 0.11.2",
- "hmac 0.13.0-rc.5",
-]
-
-[[package]]
 name = "pe-unwind-info"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9607,8 +9597,8 @@ dependencies = [
  "crc-fast",
  "http 1.4.0",
  "md-5 0.11.0-rc.5",
- "sha1 0.11.0-rc.5",
- "sha2 0.11.0-rc.5",
+ "sha1 0.10.6",
+ "sha2 0.10.9",
 ]
 
 [[package]]
@@ -9657,10 +9647,10 @@ dependencies = [
  "cfg-if",
  "chacha20poly1305",
  "jsonwebtoken",
- "pbkdf2 0.13.0-rc.9",
+ "pbkdf2",
  "rand 0.10.0",
  "serde_json",
- "sha2 0.11.0-rc.5",
+ "sha2 0.10.9",
  "thiserror 2.0.18",
 ]
 
@@ -9691,7 +9681,7 @@ dependencies = [
  "google-cloud-auth",
  "google-cloud-storage",
  "hex-simd",
- "hmac 0.13.0-rc.5",
+ "hmac 0.12.1",
  "http 1.4.0",
  "http-body 1.0.1",
  "http-body-util",
@@ -9732,8 +9722,8 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_urlencoded",
- "sha1 0.11.0-rc.5",
- "sha2 0.11.0-rc.5",
+ "sha1 0.10.6",
+ "sha2 0.10.9",
  "shadow-rs",
  "smallvec",
  "tempfile",
@@ -9863,7 +9853,7 @@ dependencies = [
  "reqwest 0.13.2",
  "serde",
  "serde_json",
- "sha2 0.11.0-rc.5",
+ "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -10059,8 +10049,8 @@ dependencies = [
  "s3s",
  "serde",
  "serde_json",
- "sha1 0.11.0-rc.5",
- "sha2 0.11.0-rc.5",
+ "sha1 0.10.6",
+ "sha2 0.10.9",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
@@ -10218,7 +10208,7 @@ dependencies = [
  "hashbrown 0.16.1",
  "hex-simd",
  "highway",
- "hmac 0.13.0-rc.5",
+ "hmac 0.12.1",
  "http 1.4.0",
  "hyper 1.8.1",
  "libc",
@@ -10233,8 +10223,8 @@ dependencies = [
  "rustls-pki-types",
  "s3s",
  "serde",
- "sha1 0.11.0-rc.5",
- "sha2 0.11.0-rc.5",
+ "sha1 0.10.6",
+ "sha2 0.10.9",
  "siphasher 1.0.2",
  "snap",
  "sysinfo",
@@ -14275,7 +14265,7 @@ dependencies = [
  "indexmap 2.13.0",
  "lzma-rust2",
  "memchr",
- "pbkdf2 0.12.2",
+ "pbkdf2",
  "ppmd-rust",
  "sha1 0.10.6",
  "time",
