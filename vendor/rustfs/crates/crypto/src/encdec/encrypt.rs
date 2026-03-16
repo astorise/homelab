@@ -35,15 +35,31 @@ pub fn encrypt_data(password: &[u8], data: &[u8]) -> Result<Vec<u8>, crate::Erro
 
     #[cfg(feature = "fips")]
     {
-        encrypt(Aes256Gcm::new_from_slice(&key)?, &salt, id, data)
+        encrypt(
+            Aes256Gcm::new_from_slice(&key).map_err(|_| crate::Error::ErrInvalidKeyLength)?,
+            &salt,
+            id,
+            data,
+        )
     }
 
     #[cfg(not(feature = "fips"))]
     {
         if native_aes() {
-            encrypt(Aes256Gcm::new_from_slice(&key)?, &salt, id, data)
+            encrypt(
+                Aes256Gcm::new_from_slice(&key).map_err(|_| crate::Error::ErrInvalidKeyLength)?,
+                &salt,
+                id,
+                data,
+            )
         } else {
-            encrypt(chacha20poly1305::ChaCha20Poly1305::new_from_slice(&key)?, &salt, id, data)
+            encrypt(
+                chacha20poly1305::ChaCha20Poly1305::new_from_slice(&key)
+                    .map_err(|_| crate::Error::ErrInvalidKeyLength)?,
+                &salt,
+                id,
+                data,
+            )
         }
     }
 }

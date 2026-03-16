@@ -30,11 +30,19 @@ pub fn decrypt_data(password: &[u8], data: &[u8]) -> Result<Vec<u8>, crate::Erro
     match id {
         ID::Argon2idChaCHa20Poly1305 => {
             let key = id.get_key(password, salt)?;
-            decrypt(ChaCha20Poly1305::new_from_slice(&key)?, nonce_slice, body)
+            decrypt(
+                ChaCha20Poly1305::new_from_slice(&key).map_err(|_| Error::ErrInvalidKeyLength)?,
+                nonce_slice,
+                body,
+            )
         }
         _ => {
             let key = id.get_key(password, salt)?;
-            decrypt(Aes256Gcm::new_from_slice(&key)?, nonce_slice, body)
+            decrypt(
+                Aes256Gcm::new_from_slice(&key).map_err(|_| Error::ErrInvalidKeyLength)?,
+                nonce_slice,
+                body,
+            )
         }
     }
 }
