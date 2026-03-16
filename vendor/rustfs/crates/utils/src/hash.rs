@@ -13,9 +13,9 @@
 // limitations under the License.
 
 use highway::{HighwayHash, HighwayHasher, Key};
-use md5::{Digest, Md5};
+use md5::{Digest as _, Md5};
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
+use sha2::{Digest as _, Sha256};
 
 /// The fixed key for HighwayHash256. DO NOT change for compatibility.
 const HIGHWAY_HASH256_KEY: [u64; 4] = [3, 4, 2, 1];

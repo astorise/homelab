@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use hex_simd::{AsOut, AsciiCase};
-use hmac::{Hmac, KeyInit, Mac};
+use hmac::{Hmac, Mac};
 use hyper::body::Bytes;
 use sha1::Sha1;
 use sha2::{Digest, Sha256};

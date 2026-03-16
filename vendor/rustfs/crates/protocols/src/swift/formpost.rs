@@ -80,7 +80,7 @@
 //! - `?status=400&message=Error+description`
 
 use super::{SwiftError, SwiftResult};
-use hmac::{Hmac, KeyInit, Mac};
+use hmac::{Hmac, Mac};
 use sha1::Sha1;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::debug;

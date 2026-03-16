@@ -277,7 +277,7 @@ pub fn extract_target_container(sync_to: &str) -> SwiftResult<String> {
 ///
 /// Uses HMAC-SHA1 of the request path with shared secret
 pub fn generate_sync_signature(path: &str, key: &str) -> SwiftResult<String> {
-    use hmac::{Hmac, KeyInit, Mac};
+    use hmac::{Hmac, Mac};
     use sha1::Sha1;
 
     type HmacSha1 = Hmac<Sha1>;

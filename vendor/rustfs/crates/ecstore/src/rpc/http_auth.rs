@@ -14,7 +14,7 @@
 
 use base64::Engine as _;
 use base64::engine::general_purpose;
-use hmac::{Hmac, KeyInit, Mac};
+use hmac::{Hmac, Mac};
 use http::{HeaderMap, HeaderValue, Method, Uri};
 use rustfs_credentials::{DEFAULT_SECRET_KEY, ENV_RPC_SECRET, get_global_secret_key_opt};
 use sha2::Sha256;

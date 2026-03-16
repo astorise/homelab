@@ -20,7 +20,7 @@
 //! Reference: https://docs.openstack.org/swift/latest/api/temporary_url_middleware.html
 
 use crate::swift::errors::SwiftError;
-use hmac::{Hmac, KeyInit, Mac};
+use hmac::{Hmac, Mac};
 use sha1::Sha1;
 use std::time::{SystemTime, UNIX_EPOCH};
 
