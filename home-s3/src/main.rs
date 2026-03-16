@@ -231,6 +231,36 @@ fn level_from_cfg(cfg: &ServiceConfig) -> LevelFilter {
         .unwrap_or_else(default_level_filter)
 }
 
+fn is_endpoint_unreachable(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("dispatch failure")
+        || lower.contains("connect error")
+        || lower.contains("connection refused")
+        || lower.contains("tcp connect error")
+        || lower.contains("timed out")
+        || lower.contains("dns error")
+}
+
+fn internal_status(operation: &str, err: anyhow::Error) -> Status {
+    let message = format!("{operation} failed: {err:#}");
+    error!("{message}");
+    Status::internal(message)
+}
+
+fn endpoint_status(operation: &str, endpoint: &str, err: anyhow::Error) -> Status {
+    let detail = format!("{err:#}");
+    let message = if is_endpoint_unreachable(&detail) {
+        format!(
+            "{operation} failed: the RustFS endpoint {endpoint} is unreachable. Start RustFS or update {}. details: {detail}",
+            config_path().display()
+        )
+    } else {
+        format!("{operation} failed against {endpoint}: {detail}")
+    };
+    error!("{message}");
+    Status::internal(message)
+}
+
 fn build_label() -> String {
     let raw = if BUILD_GIT_TAG.trim().is_empty() || BUILD_GIT_TAG == "unknown" {
         BUILD_GIT_SHA
@@ -683,7 +713,7 @@ impl HomeS3 for HomeS3GrpcService {
     ) -> Result<GrpcResponse<Acknowledge>, Status> {
         let cfg = reload_config(&self.shared)
             .await
-            .map_err(|err| Status::internal(err.to_string()))?;
+            .map_err(|err| internal_status("reload configuration", err))?;
         Ok(GrpcResponse::new(Acknowledge {
             ok: true,
             message: format!("configuration reloaded for endpoint {}", cfg.endpoint),
@@ -708,12 +738,13 @@ impl HomeS3 for HomeS3GrpcService {
         let cfg = current_config(&self.shared).await;
         let client = make_s3_client(&cfg)
             .await
-            .map_err(|err| Status::internal(err.to_string()))?;
+            .map_err(|err| internal_status("initialise S3 client", err))?;
         let output = client
             .list_buckets()
             .send()
             .await
-            .map_err(|err| Status::internal(err.to_string()))?;
+            .with_context(|| format!("list buckets via {}", cfg.endpoint))
+            .map_err(|err| endpoint_status("list buckets", &cfg.endpoint, err))?;
         let buckets = output
             .buckets()
             .iter()
@@ -741,11 +772,11 @@ impl HomeS3 for HomeS3GrpcService {
         let cfg = current_config(&self.shared).await;
         let client = make_s3_client(&cfg)
             .await
-            .map_err(|err| Status::internal(err.to_string()))?;
+            .map_err(|err| internal_status("initialise S3 client", err))?;
         let (created, imported) =
             create_bucket_and_import(&client, &bucket, source_path.as_deref())
                 .await
-                .map_err(|err| Status::internal(err.to_string()))?;
+                .map_err(|err| endpoint_status("create bucket", &cfg.endpoint, err))?;
 
         let message = match (created, imported) {
             (true, 0) => format!("bucket {bucket} created"),
@@ -779,7 +810,7 @@ impl HomeS3 for HomeS3GrpcService {
         let cfg = current_config(&self.shared).await;
         let client = make_s3_client(&cfg)
             .await
-            .map_err(|err| Status::internal(err.to_string()))?;
+            .map_err(|err| internal_status("initialise S3 client", err))?;
         let outcome = update_bucket(
             &client,
             &current_bucket,
@@ -788,7 +819,7 @@ impl HomeS3 for HomeS3GrpcService {
             request.replace_objects,
         )
         .await
-        .map_err(|err| Status::internal(err.to_string()))?;
+        .map_err(|err| endpoint_status("update bucket", &cfg.endpoint, err))?;
 
         let action = if outcome.renamed {
             format!("bucket {current_bucket} updated to {new_bucket}")
@@ -831,10 +862,10 @@ impl HomeS3 for HomeS3GrpcService {
         let cfg = current_config(&self.shared).await;
         let client = make_s3_client(&cfg)
             .await
-            .map_err(|err| Status::internal(err.to_string()))?;
+            .map_err(|err| internal_status("initialise S3 client", err))?;
         let deleted = delete_bucket(&client, &bucket, request.delete_objects)
             .await
-            .map_err(|err| Status::internal(err.to_string()))?;
+            .map_err(|err| endpoint_status("delete bucket", &cfg.endpoint, err))?;
         let message = if request.delete_objects {
             format!("bucket {bucket} deleted after removing {deleted} object(s)")
         } else {
