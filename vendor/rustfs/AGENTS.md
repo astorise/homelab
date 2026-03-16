@@ -1,0 +1,67 @@
+# RustFS Agent Instructions (Global)
+
+This root file keeps repository-wide rules only.
+Use the nearest subdirectory `AGENTS.md` for path-specific guidance.
+
+## Rule Precedence
+
+1. System/developer instructions.
+2. This file (global defaults).
+3. The nearest `AGENTS.md` in the current path (more specific scope wins).
+
+If repo-level instructions conflict, follow the nearest file and keep behavior aligned with CI.
+
+## Communication and Language
+
+- Respond in the same language used by the requester.
+- Keep source code, comments, commit messages, and PR title/body in English.
+
+## Sources of Truth
+
+- Workspace layout and crate membership: `Cargo.toml` (`[workspace].members`)
+- Local quality commands: `Makefile` and `.config/make/`
+- CI quality gates: `.github/workflows/ci.yml`
+- PR template: `.github/pull_request_template.md`
+
+Avoid duplicating long crate lists or command matrices in instruction files.
+Reference the source files above instead.
+
+## Mandatory Before Commit
+
+Run and pass:
+
+```bash
+make pre-commit
+```
+
+If `make` is unavailable, run the equivalent checks defined under `.config/make/`.
+Do not commit when required checks fail.
+
+## Git and PR Baseline
+
+- Use feature branches based on the latest `main`.
+- Follow Conventional Commits, with subject length <= 72 characters.
+- Keep PR title and description in English.
+- Use `.github/pull_request_template.md` and keep all section headings.
+- Use `N/A` for non-applicable template sections.
+- Include verification commands in the PR description.
+- When using `gh pr create`/`gh pr edit`, use `--body-file` instead of inline `--body` for multiline markdown.
+
+## Security Baseline
+
+- Never commit secrets, credentials, or key material.
+- Use environment variables or vault tooling for sensitive configuration.
+- For localhost-sensitive tests, verify proxy settings to avoid traffic leakage.
+
+## Scoped Guidance in This Repository
+
+- `.github/AGENTS.md`
+- `crates/AGENTS.md`
+- `crates/config/AGENTS.md`
+- `crates/ecstore/AGENTS.md`
+- `crates/e2e_test/AGENTS.md`
+- `crates/iam/AGENTS.md`
+- `crates/kms/AGENTS.md`
+- `crates/policy/AGENTS.md`
+- `rustfs/src/admin/AGENTS.md`
+- `rustfs/src/storage/AGENTS.md`
