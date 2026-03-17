@@ -58,6 +58,7 @@ jobs:
 
   build-tauri-helpers:
     runs-on: windows-latest
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v6
 
@@ -73,8 +74,7 @@ jobs:
       - name: Build MCP and certificate helpers (Windows MSVC)
         shell: pwsh
         run: |
-          cargo build --manifest-path home-lab/src-tauri/Cargo.toml --bin home-lab-mcp --release
-          cargo build --manifest-path home-lab/src-tauri/Cargo.toml --bin home-lab-cert --release
+          cargo build --manifest-path home-lab/src-tauri/Cargo.toml --release --bin home-lab-mcp --bin home-lab-cert
           New-Item -ItemType Directory -Path tauri-helpers-win -Force | Out-Null
           Copy-Item target/release/home-lab-mcp.exe tauri-helpers-win/ -Force
           Copy-Item target/release/home-lab-cert.exe tauri-helpers-win/ -Force
