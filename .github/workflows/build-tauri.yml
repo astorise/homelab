@@ -91,6 +91,18 @@ jobs:
           name: services-win
           path: home-lab/src-tauri/resources/bin
 
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Cache Rust (Tauri app)
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: tauri-app-x86_64-pc-windows-msvc
+          cache-on-failure: true
+
       - name: Build Tauri helper binaries into resources/bin
         shell: pwsh
         run: |
@@ -112,18 +124,6 @@ jobs:
           Move-Item -LiteralPath 'home-lab/src-tauri/resources/wsl/env-dev-image.tar' `
                     -Destination 'home-lab/src-tauri/resources/wsl/wsl-rootfs.tar' `
                     -Force
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
-
-      - name: Cache Rust (Tauri app)
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: tauri-app-x86_64-pc-windows-msvc
-          cache-on-failure: true
 
       - name: Setup Node.js
         uses: actions/setup-node@v6
