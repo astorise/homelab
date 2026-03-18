@@ -170,6 +170,8 @@ COPY --from=nvidia-toolkit /nvidia-overlay/etc/nvidia-container-toolkit /etc/nvi
 COPY --from=nvidia-toolkit /nvidia-overlay/usr/share /usr/share
 
 # Wrappers glibc pour les binaires NVIDIA
+# NOTE: Use printf instead of a heredoc here so every generated wrapper keeps its
+# shebang on the first line when Docker assembles the RUN instruction.
 RUN printf '%s\n' \
     '#!/bin/sh' \
     'exec /lib64/ld-linux-x86-64.so.2 --library-path /usr/lib/wsl/lib:/lib/x86_64-linux-gnu:/usr/lib/x86_64-linux-gnu:/lib64 /usr/bin/nvidia-container-runtime "$@"' \
@@ -199,6 +201,16 @@ RUN printf '%s\n' \
     'exit 0' \
     > /usr/local/bin/nvidia-ldconfig-noop \
  && chmod +x /usr/local/bin/nvidia-ldconfig-noop
+
+RUN set -eux; \
+    for wrapper in \
+      /usr/local/bin/nvidia-container-runtime \
+      /usr/local/bin/nvidia-container-cli \
+      /usr/local/bin/nvidia-ctk \
+      /usr/local/bin/nvidia-smi \
+      /usr/local/bin/nvidia-ldconfig-noop; do \
+      [ "$(head -n 1 "$wrapper")" = '#!/bin/sh' ]; \
+    done
 
 RUN ln -sf /usr/local/bin/nvidia-container-runtime /usr/local/bin/nvidia
 
