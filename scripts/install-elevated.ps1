@@ -22,6 +22,29 @@ function Get-RepoRoot {
   return (Resolve-Path (Join-Path $scriptDir '..'))
 }
 
+function Resolve-LatestBundleArtifact {
+  param(
+    [string]$RelativeDirectory,
+    [string]$Pattern
+  )
+
+  $dirs = @(
+    Join-Path $root $RelativeDirectory
+    Join-Path $root ('home-lab\' + $RelativeDirectory)
+  ) | Where-Object { Test-Path $_ }
+
+  $artifact = $dirs |
+    ForEach-Object { Get-ChildItem -Path $_ -Filter $Pattern -File -ErrorAction SilentlyContinue } |
+    Sort-Object LastWriteTime -Descending |
+    Select-Object -First 1
+
+  if (-not $artifact) {
+    throw "Artifact not found for pattern $Pattern under $RelativeDirectory"
+  }
+
+  return $artifact.FullName
+}
+
 function Install-With-NSIS {
   param($exe)
   if (-not (Test-Path $exe)) { throw "NSIS setup not found: $exe" }
@@ -91,8 +114,8 @@ function Ensure-Service {
 }
 
 $root = Get-RepoRoot
-$nsis = Join-Path $root 'target\release\bundle\nsis\home-lab_0.1.0_x64-setup.exe'
-$msi  = Join-Path $root 'target\release\bundle\msi\home-lab_0.1.0_x64_en-US.msi'
+$nsis = Resolve-LatestBundleArtifact -RelativeDirectory 'target\release\bundle\nsis' -Pattern 'home-lab_*_x64-setup.exe'
+$msi  = Resolve-LatestBundleArtifact -RelativeDirectory 'target\release\bundle\msi' -Pattern 'home-lab_*_x64_en-US*.msi'
 
 if ($UseMsi) {
   Uninstall-MSI-IfPresent
