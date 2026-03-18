@@ -104,8 +104,8 @@ mod proto {
 
 use proto::homes3::v1::home_s3_server::{HomeS3, HomeS3Server};
 use proto::homes3::v1::{
-    Acknowledge, CreateBucketRequest, DeleteBucketRequest, Empty, ListBucketsResponse,
-    StatusResponse, UpdateBucketRequest,
+    Acknowledge, CreateBucketRequest, DeleteBucketRequest, Empty, ListBucketObjectsRequest,
+    ListBucketObjectsResponse, ListBucketsResponse, StatusResponse, UpdateBucketRequest,
 };
 
 const SERVICE_NAME: &str = "HomeS3Service";
@@ -207,6 +207,10 @@ fn logs_dir() -> PathBuf {
 
 fn config_path() -> PathBuf {
     program_data_dir().join("s3-config.json")
+}
+
+fn bucket_metadata_path() -> PathBuf {
+    program_data_dir().join("bucket-metadata.json")
 }
 
 fn default_data_dir() -> String {
@@ -357,6 +361,54 @@ fn load_config_or_init() -> Result<ServiceConfig> {
     let cfg: ServiceConfig = serde_json::from_str(&raw).context("parse S3 config")?;
     ensure_data_dir(Path::new(&cfg.data_dir))?;
     Ok(cfg)
+}
+
+fn load_bucket_metadata() -> Result<std::collections::BTreeMap<String, String>> {
+    ensure_layout()?;
+    let path = bucket_metadata_path();
+    if !path.exists() {
+        return Ok(std::collections::BTreeMap::new());
+    }
+    let raw = std_fs::read_to_string(&path).context("read bucket metadata")?;
+    let metadata = serde_json::from_str(&raw).context("parse bucket metadata")?;
+    Ok(metadata)
+}
+
+fn save_bucket_metadata(metadata: &std::collections::BTreeMap<String, String>) -> Result<()> {
+    ensure_layout()?;
+    let path = bucket_metadata_path();
+    let json = serde_json::to_string_pretty(metadata)?;
+    std_fs::write(&path, format!("{json}\n")).context("write bucket metadata")?;
+    Ok(())
+}
+
+fn get_bucket_source_path(bucket: &str) -> Result<Option<String>> {
+    let metadata = load_bucket_metadata()?;
+    Ok(metadata.get(bucket).cloned())
+}
+
+fn set_bucket_source_path(bucket: &str, source_path: Option<&Path>) -> Result<()> {
+    let mut metadata = load_bucket_metadata()?;
+    match source_path {
+        Some(path) => {
+            metadata.insert(bucket.to_string(), path.display().to_string());
+        }
+        None => {
+            metadata.remove(bucket);
+        }
+    }
+    save_bucket_metadata(&metadata)
+}
+
+fn rename_bucket_source_path(current_bucket: &str, new_bucket: &str) -> Result<()> {
+    if current_bucket == new_bucket {
+        return Ok(());
+    }
+    let mut metadata = load_bucket_metadata()?;
+    if let Some(source_path) = metadata.remove(current_bucket) {
+        metadata.insert(new_bucket.to_string(), source_path);
+    }
+    save_bucket_metadata(&metadata)
 }
 
 fn init_logger(level: LevelFilter) -> Result<()> {
@@ -770,7 +822,11 @@ async fn list_bucket_object_keys(client: &Client, bucket: &str) -> Result<Vec<St
     Ok(keys)
 }
 
-async fn copy_bucket_contents(client: &Client, source_bucket: &str, target_bucket: &str) -> Result<usize> {
+async fn copy_bucket_contents(
+    client: &Client,
+    source_bucket: &str,
+    target_bucket: &str,
+) -> Result<usize> {
     let keys = list_bucket_object_keys(client, source_bucket).await?;
     for key in &keys {
         let object = client
@@ -794,7 +850,9 @@ async fn copy_bucket_contents(client: &Client, source_bucket: &str, target_bucke
             .body(ByteStream::from(body))
             .send()
             .await
-            .with_context(|| format!("copy s3://{source_bucket}/{key} to s3://{target_bucket}/{key}"))?;
+            .with_context(|| {
+                format!("copy s3://{source_bucket}/{key} to s3://{target_bucket}/{key}")
+            })?;
     }
     Ok(keys.len())
 }
@@ -835,7 +893,8 @@ async fn update_bucket(
         if replace_objects {
             outcome.cleared_objects = empty_bucket(client, new_bucket).await?;
         } else {
-            outcome.copied_objects = copy_bucket_contents(client, current_bucket, new_bucket).await?;
+            outcome.copied_objects =
+                copy_bucket_contents(client, current_bucket, new_bucket).await?;
         }
 
         if let Some(path) = source_path {
@@ -983,9 +1042,61 @@ impl HomeS3 for HomeS3GrpcService {
                     .creation_date()
                     .map(|value| format!("{value:?}"))
                     .unwrap_or_default(),
+                source_path: get_bucket_source_path(bucket.name().unwrap_or_default())
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default(),
             })
             .collect();
         Ok(GrpcResponse::new(ListBucketsResponse { buckets }))
+    }
+
+    async fn list_bucket_objects(
+        &self,
+        request: GrpcRequest<ListBucketObjectsRequest>,
+    ) -> Result<GrpcResponse<ListBucketObjectsResponse>, Status> {
+        let request = request.into_inner();
+        let bucket = request.bucket_name.trim().to_string();
+        validate_bucket_name(&bucket).map_err(|err| Status::invalid_argument(err.to_string()))?;
+
+        let cfg = current_config(&self.shared).await;
+        let client = make_s3_client(&cfg)
+            .await
+            .map_err(|err| internal_status("initialise S3 client", err))?;
+
+        let mut continuation_token = None::<String>;
+        let mut objects = Vec::new();
+
+        loop {
+            let mut list_request = client.list_objects_v2().bucket(&bucket);
+            if let Some(token) = &continuation_token {
+                list_request = list_request.continuation_token(token);
+            }
+
+            let output = list_request
+                .send()
+                .await
+                .with_context(|| format!("list objects in bucket {bucket} via {}", cfg.endpoint))
+                .map_err(|err| endpoint_status("list bucket objects", &cfg.endpoint, err))?;
+
+            objects.extend(output.contents().iter().map(|object| {
+                proto::homes3::v1::list_bucket_objects_response::ObjectEntry {
+                    key: object.key().unwrap_or_default().to_string(),
+                    size: object.size().unwrap_or_default(),
+                    last_modified: object
+                        .last_modified()
+                        .map(|value| format!("{value:?}"))
+                        .unwrap_or_default(),
+                }
+            }));
+
+            continuation_token = output.next_continuation_token().map(ToOwned::to_owned);
+            if continuation_token.is_none() {
+                break;
+            }
+        }
+
+        Ok(GrpcResponse::new(ListBucketObjectsResponse { objects }))
     }
 
     async fn create_bucket(
@@ -1006,6 +1117,10 @@ impl HomeS3 for HomeS3GrpcService {
             create_bucket_and_import(&client, &bucket, source_path.as_deref())
                 .await
                 .map_err(|err| endpoint_status("create bucket", &cfg.endpoint, err))?;
+        if source_path.is_some() {
+            set_bucket_source_path(&bucket, source_path.as_deref())
+                .map_err(|err| internal_status("persist bucket metadata", err))?;
+        }
 
         let message = match (created, imported) {
             (true, 0) => format!("bucket {bucket} created"),
@@ -1032,7 +1147,8 @@ impl HomeS3 for HomeS3GrpcService {
 
         validate_bucket_name(&current_bucket)
             .map_err(|err| Status::invalid_argument(err.to_string()))?;
-        validate_bucket_name(&new_bucket).map_err(|err| Status::invalid_argument(err.to_string()))?;
+        validate_bucket_name(&new_bucket)
+            .map_err(|err| Status::invalid_argument(err.to_string()))?;
         let source_path = normalize_source_path(&request.source_path)
             .map_err(|err| Status::invalid_argument(err.to_string()))?;
 
@@ -1049,6 +1165,15 @@ impl HomeS3 for HomeS3GrpcService {
         )
         .await
         .map_err(|err| endpoint_status("update bucket", &cfg.endpoint, err))?;
+
+        if outcome.renamed {
+            rename_bucket_source_path(&current_bucket, &new_bucket)
+                .map_err(|err| internal_status("persist bucket metadata", err))?;
+        }
+        if let Some(source_path) = source_path.as_deref() {
+            set_bucket_source_path(&new_bucket, Some(source_path))
+                .map_err(|err| internal_status("persist bucket metadata", err))?;
+        }
 
         let action = if outcome.renamed {
             format!("bucket {current_bucket} updated to {new_bucket}")
@@ -1095,6 +1220,8 @@ impl HomeS3 for HomeS3GrpcService {
         let deleted = delete_bucket(&client, &bucket, request.delete_objects)
             .await
             .map_err(|err| endpoint_status("delete bucket", &cfg.endpoint, err))?;
+        set_bucket_source_path(&bucket, None)
+            .map_err(|err| internal_status("persist bucket metadata", err))?;
         let message = if request.delete_objects {
             format!("bucket {bucket} deleted after removing {deleted} object(s)")
         } else {
