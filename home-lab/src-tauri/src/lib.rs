@@ -257,6 +257,7 @@ pub fn run() {
             s3::s3_reload_config,
             s3::s3_stop_service,
             s3::s3_list_buckets,
+            s3::s3_list_bucket_objects,
             s3::s3_create_bucket,
             s3::s3_update_bucket,
             s3::s3_delete_bucket,

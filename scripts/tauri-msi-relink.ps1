@@ -48,6 +48,30 @@ function Build-TauriMsi {
   } finally { Pop-Location }
 }
 
+function Resolve-LatestMsi {
+  $candidates = @(
+    Join-Path $PSScriptRoot '..\target\release\bundle\msi'
+    Join-Path $PSScriptRoot '..\home-lab\target\release\bundle\msi'
+  ) | ForEach-Object {
+    try {
+      Resolve-Path $_ -ErrorAction Stop
+    } catch {
+      $null
+    }
+  }
+
+  $msi = $candidates |
+    ForEach-Object { Get-ChildItem -Path $_ -Filter 'home-lab_*_x64_en-US*.msi' -File -ErrorAction SilentlyContinue } |
+    Sort-Object LastWriteTime -Descending |
+    Select-Object -First 1
+
+  if (-not $msi) {
+    throw 'No home-lab MSI artifact found under target\\release\\bundle\\msi.'
+  }
+
+  return $msi.FullName
+}
+
 function Relink-Msi {
   $wix = Get-WixTools
   $wixDir = Join-Path $PSScriptRoot '..\target\release\wix\x64' | Resolve-Path
@@ -60,8 +84,8 @@ function Relink-Msi {
     Write-Host '=== Compiling fragment (candle) ==='
     & $($wix.Candle) -nologo -v -ext WixUIExtension -out install-services.wixobj $frag | Write-Host
 
-    $outMsi = Resolve-Path '..\..\bundle\msi\home-lab_0.1.0_x64_en-US.msi'
-    $outRelinked = (Join-Path (Split-Path $outMsi -Parent) 'home-lab_0.1.0_x64_en-US_services.msi')
+    $outMsi = Resolve-LatestMsi
+    $outRelinked = Join-Path (Split-Path $outMsi -Parent) ("{0}_services.msi" -f [System.IO.Path]::GetFileNameWithoutExtension($outMsi))
 
     Write-Host '=== Linking (light) main.wixobj + install-services.wixobj ==='
     & $($wix.Light) -nologo -v -ext WixUIExtension -loc locale.wxl -out $outRelinked main.wixobj install-services.wixobj | Write-Host
@@ -178,11 +202,8 @@ $msiOut = $null
 if ($Build) { Build-TauriMsi }
 if ($Relink) { $msiOut = Relink-Msi }
 
-# Prefer the standard Tauri MSI artifact if we didn't relink or relink produced no path
-if (-not $msiOut) { $msiOut = Resolve-Path 'home-lab\\target\\release\\bundle\\msi\\home-lab_0.1.0_x64_en-US.msi' -ErrorAction SilentlyContinue }
-if (-not $msiOut) { $msiOut = Resolve-Path 'target\\release\\bundle\\msi\\home-lab_0.1.0_x64_en-US.msi' -ErrorAction SilentlyContinue }
 if ($Install) {
-  if (-not $msiOut) { $msiOut = Resolve-Path 'target\release\bundle\msi\home-lab_0.1.0_x64_en-US_services.msi' -ErrorAction SilentlyContinue }
+  if (-not $msiOut) { $msiOut = Resolve-LatestMsi }
   Install-MsiWithLog $msiOut
 }
 if ($Verify) {
