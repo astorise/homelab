@@ -1,5 +1,17 @@
 name: Build Tauri
 
+concurrency:
+  group: build-tauri-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  RUSTC_WRAPPER: sccache
+  SCCACHE_GHA_ENABLED: "true"
+  SCCACHE_CACHE_SIZE: 2G
+  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "8"
+  CARGO_PROFILE_RELEASE_LTO: "off"
+  CARGO_PROFILE_RELEASE_OPT_LEVEL: "2"
+
 on:
   push:
     branches-ignore: ['codex/*']
@@ -30,6 +42,9 @@ jobs:
         with:
           targets: x86_64-pc-windows-msvc
 
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
       - name: Cache Rust (workspace)
         uses: Swatinem/rust-cache@v2
         with:
@@ -39,10 +54,7 @@ jobs:
       - name: Build services (Windows MSVC)
         shell: pwsh
         run: |
-          cargo build -p home-dns   --release
-          cargo build -p home-http --release
-          cargo build -p home-s3   --release
-          cargo build -p home-oidc --release
+          cargo build --release -p home-dns -p home-http -p home-s3 -p home-oidc
           Get-ChildItem target/release -Filter 'home-*.exe'
           New-Item -ItemType Directory -Path services-win -Force | Out-Null
           Copy-Item target/release/home-dns.exe   services-win/ -Force
@@ -104,6 +116,9 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
       - name: Cache Rust (Tauri app)
         uses: Swatinem/rust-cache@v2
         with:
@@ -114,6 +129,8 @@ jobs:
         uses: actions/setup-node@v6
         with:
           node-version: '24'
+          cache: npm
+          cache-dependency-path: home-lab/package-lock.json
       
       - name: import windows certificate
         if: matrix.platform == 'windows-latest'
@@ -126,23 +143,15 @@ jobs:
           certutil -decode certificate/tempCert.txt certificate/certificate.pfx
           Remove-Item -path certificate -include tempCert.txt
           Import-PfxCertificate -FilePath certificate/certificate.pfx -CertStoreLocation Cert:\CurrentUser\My -Password (ConvertTo-SecureString -String $env:WINDOWS_CERTIFICATE_PASSWORD -Force -AsPlainText)
-      - name: Install frontend deps + Tauri CLI
+      - name: Install frontend deps
         working-directory: home-lab
         shell: pwsh
-        run: |
-          if (Test-Path package-lock.json) { npm ci } else { npm install }
-          $hasCli = (npm pkg get devDependencies.'@tauri-apps/cli' | Select-String -Quiet '@tauri-apps/cli')
-          if (-not $hasCli) { npm i -D @tauri-apps/cli@latest }
-          npx tauri -V
+        run: npm ci
 
-      # Optionnel : cache npm
-      - name: Enable npm cache
-        uses: actions/cache@v5
-        with:
-          path: ~/.npm
-          key: ${{ runner.os }}-node-${{ hashFiles('home-lab/**/package-lock.json') }}
-          restore-keys: |
-            ${{ runner.os }}-node-
+      - name: Verify Tauri CLI
+        working-directory: home-lab
+        shell: pwsh
+        run: npx tauri -V
 
       - name: Build Tauri (Windows - NSIS + MSI)
         uses: tauri-apps/tauri-action@v0.6.2
