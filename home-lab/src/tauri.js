@@ -60,9 +60,27 @@ const __MOCK = {
       force_path_style: true,
     },
     buckets: [
-      { name: 'media', created_at: '2026-03-15T08:15:00Z' },
-      { name: 'backups', created_at: '2026-03-15T08:30:00Z' },
+      {
+        name: 'media',
+        created_at: '2026-03-15T08:15:00Z',
+        source_path: 'C:\\Users\\demo\\Media Library',
+      },
+      {
+        name: 'backups',
+        created_at: '2026-03-15T08:30:00Z',
+        source_path: 'D:\\Backups\\Nightly',
+      },
     ],
+    objects: {
+      media: [
+        { key: 'movies/Inception.mkv', size: 4294967296, last_modified: '2026-03-17T22:15:00Z' },
+        { key: 'series/Dark/S01E01.mkv', size: 2147483648, last_modified: '2026-03-16T21:00:00Z' },
+      ],
+      backups: [
+        { key: 'postgres/2026-03-17.sql.gz', size: 15728640, last_modified: '2026-03-17T03:10:00Z' },
+        { key: 'photos/2026-03-17.tar.zst', size: 73400320, last_modified: '2026-03-17T03:12:00Z' },
+      ],
+    },
   },
   oidc: {
     status: {
@@ -199,6 +217,15 @@ async function mockInvoke(cmd, args = {}) {
       return { ok: true, message: 'S3 stopped' };
     case 's3_list_buckets':
       return { buckets: __MOCK.s3.buckets.map((bucket) => ({ ...bucket })) };
+    case 's3_list_bucket_objects': {
+      const name = (args?.bucketName || args?.bucket_name || '').trim().toLowerCase();
+      if (!name) {
+        return { ok: false, message: 'Bucket name required' };
+      }
+      return {
+        objects: (__MOCK.s3.objects[name] || []).map((object) => ({ ...object })),
+      };
+    }
     case 's3_create_bucket': {
       const name = (args?.bucketName || args?.bucket_name || '').trim().toLowerCase();
       const sourcePath = (args?.sourcePath || args?.source_path || '').trim();
@@ -207,7 +234,16 @@ async function mockInvoke(cmd, args = {}) {
       }
       const existed = __MOCK.s3.buckets.some((bucket) => bucket.name === name);
       if (!existed) {
-        __MOCK.s3.buckets.push({ name, created_at: new Date().toISOString() });
+        __MOCK.s3.buckets.push({
+          name,
+          created_at: new Date().toISOString(),
+          source_path: sourcePath,
+        });
+        __MOCK.s3.objects[name] = [];
+      } else if (sourcePath) {
+        __MOCK.s3.buckets = __MOCK.s3.buckets.map((bucket) => (
+          bucket.name === name ? { ...bucket, source_path: sourcePath } : bucket
+        ));
       }
       return {
         ok: true,
@@ -240,6 +276,23 @@ async function mockInvoke(cmd, args = {}) {
         return { ok: false, message: `Bucket ${newName} exists already (mock).` };
       }
       currentBucket.name = newName;
+      if (sourcePath) {
+        currentBucket.source_path = sourcePath;
+      }
+      if (newName !== currentName) {
+        __MOCK.s3.objects[newName] = __MOCK.s3.objects[currentName] || [];
+        delete __MOCK.s3.objects[currentName];
+      }
+      if (replaceObjects) {
+        __MOCK.s3.objects[newName] = sourcePath
+          ? [{ key: 'imported/mock-file.txt', size: 128, last_modified: new Date().toISOString() }]
+          : [];
+      } else if (sourcePath) {
+        __MOCK.s3.objects[newName] = [
+          ...(__MOCK.s3.objects[newName] || []),
+          { key: 'imported/mock-file.txt', size: 128, last_modified: new Date().toISOString() },
+        ];
+      }
       let message = newName !== currentName
         ? `Bucket ${currentName} renamed to ${newName} (mock).`
         : `Bucket ${currentName} updated (mock).`;
@@ -258,6 +311,7 @@ async function mockInvoke(cmd, args = {}) {
       }
       const before = __MOCK.s3.buckets.length;
       __MOCK.s3.buckets = __MOCK.s3.buckets.filter((bucket) => bucket.name !== name);
+      delete __MOCK.s3.objects[name];
       const removed = before !== __MOCK.s3.buckets.length;
       return {
         ok: removed,
@@ -688,6 +742,17 @@ export async function s3_stop_service() {
 export async function s3_list_buckets() {
   const res = await safeInvoke('s3_list_buckets');
   return Array.isArray(res) ? res : (res?.buckets ?? []);
+}
+
+export async function s3_list_bucket_objects(bucketName) {
+  const name = typeof bucketName === 'object' && bucketName !== null
+    ? String(bucketName.bucket_name ?? bucketName.bucketName ?? bucketName.name ?? '').trim()
+    : String(bucketName ?? '').trim();
+  if (!name) throw new Error('Le nom du bucket est requis pour lister son contenu.');
+  const res = await safeInvoke('s3_list_bucket_objects', {
+    bucketName: name,
+  });
+  return Array.isArray(res) ? res : (res?.objects ?? []);
 }
 
 export async function s3_create_bucket(bucketName, sourcePath = '') {
