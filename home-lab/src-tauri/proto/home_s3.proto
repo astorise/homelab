@@ -21,9 +21,24 @@ message ListBucketsResponse {
   message Bucket {
     string name = 1;
     string created_at = 2;
+    string source_path = 3;
   }
 
   repeated Bucket buckets = 1;
+}
+
+message ListBucketObjectsRequest {
+  string bucket_name = 1;
+}
+
+message ListBucketObjectsResponse {
+  message ObjectEntry {
+    string key = 1;
+    int64 size = 2;
+    string last_modified = 3;
+  }
+
+  repeated ObjectEntry objects = 1;
 }
 
 message CreateBucketRequest {
@@ -48,6 +63,7 @@ service HomeS3 {
   rpc ReloadConfig(Empty) returns (Acknowledge);
   rpc StopService(Empty) returns (Acknowledge);
   rpc ListBuckets(Empty) returns (ListBucketsResponse);
+  rpc ListBucketObjects(ListBucketObjectsRequest) returns (ListBucketObjectsResponse);
   rpc CreateBucket(CreateBucketRequest) returns (Acknowledge);
   rpc UpdateBucket(UpdateBucketRequest) returns (Acknowledge);
   rpc DeleteBucket(DeleteBucketRequest) returns (Acknowledge);

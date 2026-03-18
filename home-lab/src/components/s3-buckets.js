@@ -1,10 +1,11 @@
 import {
   s3_create_bucket,
   s3_delete_bucket,
+  s3_list_bucket_objects,
   s3_list_buckets,
   s3_update_bucket,
 } from '../tauri.js';
-import { showError } from './toast.js';
+import { showError, showSuccess } from './toast.js';
 
 function formatDate(value) {
   if (!value) {
@@ -17,6 +18,24 @@ function formatDate(value) {
   return parsed.toLocaleString();
 }
 
+function formatBytes(value) {
+  const size = Number(value);
+  if (!Number.isFinite(size) || size < 0) {
+    return 'taille inconnue';
+  }
+  if (size < 1024) {
+    return `${size} B`;
+  }
+  const units = ['Ko', 'Mo', 'Go', 'To'];
+  let current = size / 1024;
+  let unitIndex = 0;
+  while (current >= 1024 && unitIndex < units.length - 1) {
+    current /= 1024;
+    unitIndex += 1;
+  }
+  return `${current.toFixed(current >= 10 ? 0 : 1)} ${units[unitIndex]}`;
+}
+
 class S3Buckets extends HTMLElement {
   constructor() {
     super();
@@ -25,6 +44,9 @@ class S3Buckets extends HTMLElement {
     this._lastError = null;
     this._buckets = [];
     this._editingBucket = null;
+    this._objectsByBucket = {};
+    this._loadingObjects = {};
+    this._expandedBuckets = {};
   }
 
   connectedCallback() {
@@ -73,7 +95,30 @@ class S3Buckets extends HTMLElement {
       return '<li class="text-sm text-gray-600">Aucun bucket.</li>';
     }
     return this._buckets
-      .map((bucket) => `
+      .map((bucket) => {
+        const isExpanded = !!this._expandedBuckets[bucket.name];
+        const isLoadingObjects = !!this._loadingObjects[bucket.name];
+        const objects = this._objectsByBucket[bucket.name];
+        const sourcePath = bucket.source_path?.trim()
+          ? `<p class="text-xs text-gray-500 break-all">Dossier Windows monté: <code>${bucket.source_path}</code></p>`
+          : '<p class="text-xs text-gray-400">Aucun dossier Windows source enregistré.</p>';
+        const objectsPanel = !isExpanded
+          ? ''
+          : `
+            <div class="mt-3 rounded border border-gray-200 bg-white p-3">
+              <div class="flex items-center justify-between gap-2">
+                <h4 class="font-medium text-sm">Contenu du bucket</h4>
+                <button
+                  type="button"
+                  class="s3-reload-objects text-xs text-blue-600 hover:text-blue-800"
+                  data-name="${bucket.name}"
+                >Actualiser le contenu</button>
+              </div>
+              ${isLoadingObjects
+                ? '<p class="mt-2 text-sm text-gray-500">Chargement des objets...</p>'
+                : this.renderObjectsList(bucket.name, objects)}
+            </div>`;
+        return `
         <li
           class="border-b border-gray-200 pb-3 mb-3 last:pb-0 last:mb-0 last:border-none"
           data-bucket-row
@@ -83,8 +128,14 @@ class S3Buckets extends HTMLElement {
             <div>
               <span class="font-semibold">${bucket.name}</span>
               <p class="text-xs text-gray-500">Créé le: ${formatDate(bucket.created_at)}</p>
+              ${sourcePath}
             </div>
             <div class="flex items-center gap-2">
+              <button
+                type="button"
+                class="s3-toggle-objects text-xs text-slate-700 hover:text-slate-900"
+                data-name="${bucket.name}"
+              >${isExpanded ? 'Masquer le contenu' : 'Voir le contenu'}</button>
               <button
                 type="button"
                 class="s3-edit-bucket text-xs text-blue-600 hover:text-blue-800"
@@ -101,8 +152,41 @@ class S3Buckets extends HTMLElement {
             <input type="checkbox" class="s3-delete-objects" />
             Supprimer aussi les objets du bucket
           </label>
-        </li>`)
+          ${objectsPanel}
+        </li>`;
+      })
       .join('');
+  }
+
+  renderObjectsList(bucketName, objects) {
+    if (!Array.isArray(objects)) {
+      return '<p class="mt-2 text-sm text-gray-500">Cliquez sur “Actualiser le contenu” pour charger les objets.</p>';
+    }
+    if (!objects.length) {
+      return `<p class="mt-2 text-sm text-gray-500">Le bucket <code>${bucketName}</code> est vide.</p>`;
+    }
+    return `
+      <div class="mt-2 overflow-x-auto">
+        <table class="min-w-full text-sm">
+          <thead>
+            <tr class="text-left text-gray-500">
+              <th class="py-1 pr-4 font-medium">Clé objet</th>
+              <th class="py-1 pr-4 font-medium">Taille</th>
+              <th class="py-1 font-medium">Dernière modification</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${objects
+              .map((object) => `
+                <tr class="border-t border-gray-100 align-top">
+                  <td class="py-2 pr-4"><code class="break-all">${object.key}</code></td>
+                  <td class="py-2 pr-4 whitespace-nowrap">${formatBytes(object.size)}</td>
+                  <td class="py-2 whitespace-nowrap">${formatDate(object.last_modified)}</td>
+                </tr>`)
+              .join('')}
+          </tbody>
+        </table>
+      </div>`;
   }
 
   renderCreateForm() {
@@ -155,6 +239,7 @@ class S3Buckets extends HTMLElement {
           <input
             name="source_path"
             type="text"
+            value="${bucket.source_path || ''}"
             placeholder="Chemin Windows à importer (optionnel)"
             class="rounded border border-gray-300 px-2 py-1"
           />
@@ -173,6 +258,22 @@ class S3Buckets extends HTMLElement {
 
   renderSuccess(buckets) {
     this._buckets = Array.isArray(buckets) ? buckets : [];
+    const knownBuckets = new Set(this._buckets.map((bucket) => bucket.name));
+    Object.keys(this._objectsByBucket).forEach((bucketName) => {
+      if (!knownBuckets.has(bucketName)) {
+        delete this._objectsByBucket[bucketName];
+      }
+    });
+    Object.keys(this._loadingObjects).forEach((bucketName) => {
+      if (!knownBuckets.has(bucketName)) {
+        delete this._loadingObjects[bucketName];
+      }
+    });
+    Object.keys(this._expandedBuckets).forEach((bucketName) => {
+      if (!knownBuckets.has(bucketName)) {
+        delete this._expandedBuckets[bucketName];
+      }
+    });
     if (this._editingBucket && !this.editingBucket) {
       this._editingBucket = null;
     }
@@ -230,6 +331,12 @@ class S3Buckets extends HTMLElement {
     this.querySelectorAll('.s3-delete-bucket').forEach((button) => {
       button.addEventListener('click', (event) => this.handleDelete(event));
     });
+    this.querySelectorAll('.s3-toggle-objects').forEach((button) => {
+      button.addEventListener('click', (event) => this.handleToggleObjects(event));
+    });
+    this.querySelectorAll('.s3-reload-objects').forEach((button) => {
+      button.addEventListener('click', (event) => this.handleReloadObjects(event));
+    });
   }
 
   async handleCreate(event) {
@@ -254,6 +361,7 @@ class S3Buckets extends HTMLElement {
       }
       form.reset();
       await this.load();
+      showSuccess(result?.message || `Bucket ${bucket_name} créé.`);
     } catch (err) {
       showError(err?.message || String(err));
     } finally {
@@ -306,6 +414,7 @@ class S3Buckets extends HTMLElement {
       }
       this._editingBucket = null;
       await this.load();
+      showSuccess(result?.message || 'Bucket mis à jour.');
     } catch (err) {
       showError(err?.message || String(err));
     } finally {
@@ -343,12 +452,53 @@ class S3Buckets extends HTMLElement {
       if (this._editingBucket === bucket_name) {
         this._editingBucket = null;
       }
+      delete this._expandedBuckets[bucket_name];
+      delete this._objectsByBucket[bucket_name];
+      delete this._loadingObjects[bucket_name];
       await this.load();
+      showSuccess(result?.message || `Bucket ${bucket_name} supprimé.`);
     } catch (err) {
       button.disabled = false;
       button.textContent = 'Supprimer';
       showError(err?.message || String(err));
     }
+  }
+
+  async fetchBucketObjects(bucketName, { silent = false } = {}) {
+    if (!bucketName) {
+      return;
+    }
+    this._loadingObjects[bucketName] = true;
+    this.renderSuccess(this._buckets);
+    try {
+      const objects = await s3_list_bucket_objects({ bucket_name: bucketName });
+      this._objectsByBucket[bucketName] = Array.isArray(objects) ? objects : [];
+    } catch (err) {
+      if (!silent) {
+        showError(err?.message || String(err));
+      }
+    } finally {
+      this._loadingObjects[bucketName] = false;
+      this.renderSuccess(this._buckets);
+    }
+  }
+
+  async handleToggleObjects(event) {
+    const bucketName = event.currentTarget?.dataset?.name;
+    if (!bucketName) {
+      return;
+    }
+    const willExpand = !this._expandedBuckets[bucketName];
+    this._expandedBuckets[bucketName] = willExpand;
+    this.renderSuccess(this._buckets);
+    if (willExpand && !Array.isArray(this._objectsByBucket[bucketName])) {
+      await this.fetchBucketObjects(bucketName);
+    }
+  }
+
+  async handleReloadObjects(event) {
+    const bucketName = event.currentTarget?.dataset?.name;
+    await this.fetchBucketObjects(bucketName);
   }
 
   async load() {

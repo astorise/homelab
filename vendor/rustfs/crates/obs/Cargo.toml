@@ -1,0 +1,73 @@
+# Copyright 2024 RustFS Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+[package]
+name = "rustfs-obs"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+homepage.workspace = true
+description = "Observability and monitoring tools for RustFS, providing metrics, logging, and tracing capabilities."
+keywords = ["observability", "metrics", "logging", "tracing", "RustFS"]
+categories = ["web-programming", "development-tools::profiling", "asynchronous", "api-bindings", "development-tools::debugging"]
+documentation = "https://docs.rs/rustfs-obs/latest/rustfs_obs/"
+
+[lints]
+workspace = true
+
+[features]
+default = []
+gpu = ["dep:nvml-wrapper"]
+full = ["gpu"]
+
+[dependencies]
+rustfs-config = { workspace = true, features = ["constants", "observability"] }
+rustfs-utils = { workspace = true, features = ["ip", "path"] }
+flate2 = { workspace = true }
+glob = { workspace = true }
+jiff = { workspace = true }
+metrics = { workspace = true }
+crossbeam-channel = { workspace = true }
+crossbeam-deque = { workspace = true }
+crossbeam-utils = { workspace = true }
+num_cpus = { workspace = true }
+nvml-wrapper = { workspace = true, optional = true }
+opentelemetry = { workspace = true }
+opentelemetry-appender-tracing = { workspace = true, features = ["experimental_use_tracing_span_context", "experimental_metadata_attributes"] }
+opentelemetry_sdk = { workspace = true, features = ["rt-tokio"] }
+opentelemetry-stdout = { workspace = true }
+opentelemetry-otlp = { workspace = true }
+opentelemetry-semantic-conventions = { workspace = true, features = ["semconv_experimental"] }
+serde = { workspace = true }
+tracing = { workspace = true, features = ["std", "attributes"] }
+tracing-appender = { workspace = true }
+tracing-error = { workspace = true }
+tracing-opentelemetry = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["registry", "std", "fmt", "env-filter", "tracing-log", "time", "local-time", "json"] }
+tokio = { workspace = true, features = ["sync", "fs", "rt-multi-thread", "rt", "time", "macros"] }
+sysinfo = { workspace = true }
+thiserror = { workspace = true }
+zstd = { workspace = true, features = ["zstdmt"] }
+
+[target.'cfg(unix)'.dependencies]
+pyroscope = { workspace = true, features = ["backend-pprof-rs"] }
+
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }
+tempfile = { workspace = true }
+temp-env = { workspace = true }
+serde_json = { workspace = true }

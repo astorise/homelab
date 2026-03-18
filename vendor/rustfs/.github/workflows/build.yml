@@ -1,0 +1,857 @@
+# Copyright 2024 RustFS Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Build and Release Workflow
+#
+# This workflow builds RustFS binaries and automatically triggers Docker image builds.
+#
+# Flow:
+# 1. Build binaries for multiple platforms
+# 2. Upload binaries to OSS storage
+# 3. Trigger docker.yml to build and push images using the uploaded binaries
+#
+# Manual Parameters:
+# - build_docker: Build and push Docker images (default: true)
+# - platforms: Comma-separated platform IDs or 'all' (default: all)
+
+name: Build and Release
+
+on:
+  push:
+    tags: [ "*.*.*" ]
+    branches: [ main ]
+    paths-ignore:
+      - "**.md"
+      - "**.txt"
+      - ".github/**"
+      - "docs/**"
+      - "deploy/**"
+      - "scripts/dev_*.sh"
+      - "LICENSE*"
+      - "README*"
+      - "**/*.png"
+      - "**/*.jpg"
+      - "**/*.svg"
+      - ".gitignore"
+      - ".dockerignore"
+  schedule:
+    - cron: "0 0 * * 0" # Weekly on Sunday at midnight UTC
+  workflow_dispatch:
+    inputs:
+      build_docker:
+        description: "Build and push Docker images after binary build"
+        required: false
+        default: true
+        type: boolean
+      platforms:
+        description: "Comma-separated targets or 'all' (e.g. linux-x86_64-musl,macos-aarch64)"
+        required: false
+        default: "all"
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # Optimize build performance
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  # Build strategy check - determine build type based on trigger
+  build-check:
+    name: Build Strategy Check
+    runs-on: ubicloud-standard-2
+    outputs:
+      should_build: ${{ steps.check.outputs.should_build }}
+      build_type: ${{ steps.check.outputs.build_type }}
+      version: ${{ steps.check.outputs.version }}
+      short_sha: ${{ steps.check.outputs.short_sha }}
+      is_prerelease: ${{ steps.check.outputs.is_prerelease }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Determine build strategy
+        id: check
+        run: |
+          should_build=false
+          build_type="none"
+          version=""
+          short_sha=""
+          is_prerelease=false
+
+          # Get short SHA for all builds
+          short_sha=$(git rev-parse --short HEAD)
+
+          # Determine build type based on trigger
+          if [[ "${{ startsWith(github.ref, 'refs/tags/') }}" == "true" ]]; then
+            # Tag push - release or prerelease
+            should_build=true
+            tag_name="${GITHUB_REF#refs/tags/}"
+            version="${tag_name}"
+
+            # Check if this is a prerelease
+            if [[ "$tag_name" == *"alpha"* ]] || [[ "$tag_name" == *"beta"* ]] || [[ "$tag_name" == *"rc"* ]]; then
+              build_type="prerelease"
+              is_prerelease=true
+              echo "🚀 Prerelease build detected: $tag_name"
+            else
+              build_type="release"
+              echo "📦 Release build detected: $tag_name"
+            fi
+          elif [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
+            # Main branch push - development build
+            should_build=true
+            build_type="development"
+            version="dev-${short_sha}"
+            echo "🛠️  Development build detected"
+          elif [[ "${{ github.event_name }}" == "schedule" ]] || \
+               [[ "${{ github.event_name }}" == "workflow_dispatch" ]] || \
+               [[ "${{ contains(github.event.head_commit.message, '--build') }}" == "true" ]]; then
+            # Scheduled or manual build
+            should_build=true
+            build_type="development"
+            version="dev-${short_sha}"
+            echo "⚡ Manual/scheduled build detected"
+          fi
+
+          echo "should_build=$should_build" >> $GITHUB_OUTPUT
+          echo "build_type=$build_type" >> $GITHUB_OUTPUT
+          echo "version=$version" >> $GITHUB_OUTPUT
+          echo "short_sha=$short_sha" >> $GITHUB_OUTPUT
+          echo "is_prerelease=$is_prerelease" >> $GITHUB_OUTPUT
+
+          echo "📊 Build Summary:"
+          echo "  - Should build: $should_build"
+          echo "  - Build type: $build_type"
+          echo "  - Version: $version"
+          echo "  - Short SHA: $short_sha"
+          echo "  - Is prerelease: $is_prerelease"
+
+  # Build RustFS binaries
+  prepare-platform-matrix:
+    name: Prepare Platform Matrix
+    runs-on: ubicloud-standard-2
+    outputs:
+      matrix: ${{ steps.select.outputs.matrix }}
+      selected: ${{ steps.select.outputs.selected }}
+    steps:
+      - name: Select target platforms
+        id: select
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          selected="${{ github.event_name == 'workflow_dispatch' && github.event.inputs.platforms || 'all' }}"
+          selected="$(echo "${selected}" | tr -d '[:space:]')"
+          if [[ -z "${selected}" ]]; then
+            selected="all"
+          fi
+
+          all='{"include":[
+            {"target_id":"linux-x86_64-musl","os":"ubicloud-standard-2","target":"x86_64-unknown-linux-musl","cross":false,"platform":"linux","rustflags":""},
+            {"target_id":"linux-aarch64-musl","os":"ubicloud-standard-2","target":"aarch64-unknown-linux-musl","cross":true,"platform":"linux","rustflags":""},
+            {"target_id":"linux-x86_64-gnu","os":"ubicloud-standard-2","target":"x86_64-unknown-linux-gnu","cross":false,"platform":"linux","rustflags":""},
+            {"target_id":"linux-aarch64-gnu","os":"ubicloud-standard-2","target":"aarch64-unknown-linux-gnu","cross":true,"platform":"linux","rustflags":""},
+            {"target_id":"macos-aarch64","os":"macos-latest","target":"aarch64-apple-darwin","cross":false,"platform":"macos","rustflags":""},
+            {"target_id":"macos-x86_64","os":"macos-latest","target":"x86_64-apple-darwin","cross":false,"platform":"macos","rustflags":""},
+            {"target_id":"windows-x86_64","os":"windows-latest","target":"x86_64-pc-windows-msvc","cross":false,"platform":"windows","rustflags":""}
+          ]}'
+
+          if [[ "${selected}" == "all" ]]; then
+            matrix="$(jq -c . <<<"${all}")"
+          else
+            unknown="$(jq -rn --arg selected "${selected}" --argjson all "${all}" '
+              ($selected | split(",") | map(select(length > 0))) as $req
+              | ($all.include | map(.target_id)) as $known
+              | [$req[] | select(( $known | index(.) ) == null)]
+            ')"
+            if [[ "$(jq 'length' <<<"${unknown}")" -gt 0 ]]; then
+              echo "Unknown platforms: $(jq -r 'join(\",\")' <<<"${unknown}")" >&2
+              echo "Allowed: $(jq -r '.include[].target_id' <<<"${all}" | paste -sd ',' -)" >&2
+              exit 1
+            fi
+
+            matrix="$(jq -c --arg selected "${selected}" '
+              ($selected | split(",") | map(select(length > 0))) as $req
+              | .include |= map(select(.target_id as $id | ($req | index($id))))
+            ' <<<"${all}")"
+          fi
+
+          echo "selected=${selected}" >> "$GITHUB_OUTPUT"
+          echo "matrix=${matrix}" >> "$GITHUB_OUTPUT"
+          echo "Selected platforms: ${selected}"
+
+  build-rustfs:
+    name: Build RustFS
+    needs: [ build-check, prepare-platform-matrix ]
+    if: needs.build-check.outputs.should_build == 'true' && needs.prepare-platform-matrix.result == 'success'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    env:
+      RUSTFLAGS: ${{ matrix.rustflags }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.prepare-platform-matrix.outputs.matrix) }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Setup Rust environment
+        uses: ./.github/actions/setup
+        with:
+          rust-version: stable
+          target: ${{ matrix.target }}
+          cache-shared-key: build-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          cache-save-if: ${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/') }}
+          install-cross-tools: ${{ matrix.cross }}
+
+      - name: Download static console assets
+        shell: bash
+        run: |
+          mkdir -p ./rustfs/static
+          if [[ "${{ matrix.platform }}" == "windows" ]]; then
+            curl.exe -L "https://dl.rustfs.com/artifacts/console/rustfs-console-latest.zip" -o console.zip --retry 3 --retry-delay 5 --max-time 300
+            if [[ $? -eq 0 ]]; then
+              unzip -o console.zip -d ./rustfs/static
+              rm console.zip
+            else
+              echo "Warning: Failed to download console assets, continuing without them"
+              echo "// Static assets not available" > ./rustfs/static/empty.txt
+            fi
+          else
+            chmod +w ./rustfs/static/LICENSE || true
+            curl -L "https://dl.rustfs.com/artifacts/console/rustfs-console-latest.zip" \
+              -o console.zip --retry 3 --retry-delay 5 --max-time 300
+            if [[ $? -eq 0 ]]; then
+              unzip -o console.zip -d ./rustfs/static
+              rm console.zip
+            else
+              echo "Warning: Failed to download console assets, continuing without them"
+              echo "// Static assets not available" > ./rustfs/static/empty.txt
+            fi
+          fi
+
+      - name: Build RustFS
+        shell: bash
+        run: |
+          # Force rebuild by touching build.rs
+          touch rustfs/build.rs
+
+          if [[ "${{ matrix.cross }}" == "true" ]]; then
+            if [[ "${{ matrix.platform }}" == "windows" ]]; then
+              # Use cross for Windows ARM64
+              cargo install cross --git https://github.com/cross-rs/cross
+              cross build --release --target ${{ matrix.target }} -p rustfs --bins
+            else
+              # Use zigbuild for other cross-compilation
+              cargo zigbuild --release --target ${{ matrix.target }} -p rustfs --bins
+            fi
+          else
+            cargo build --release --target ${{ matrix.target }} -p rustfs --bins
+          fi
+
+      - name: Create release package
+        id: package
+        shell: bash
+        run: |
+          BUILD_TYPE="${{ needs.build-check.outputs.build_type }}"
+          VERSION="${{ needs.build-check.outputs.version }}"
+          SHORT_SHA="${{ needs.build-check.outputs.short_sha }}"
+
+          # Extract platform and arch from target
+          TARGET="${{ matrix.target }}"
+          PLATFORM="${{ matrix.platform }}"
+          # Map target to architecture and variant
+          case "$TARGET" in
+            *x86_64*musl*)
+              ARCH="x86_64"
+              VARIANT="musl"
+              ;;
+            *x86_64*gnu*)
+              ARCH="x86_64"
+              VARIANT="gnu"
+              ;;
+            *x86_64*)
+              ARCH="x86_64"
+              VARIANT=""
+              ;;
+            *aarch64*musl*|*arm64*musl*)
+              ARCH="aarch64"
+              VARIANT="musl"
+              ;;
+            *aarch64*gnu*|*arm64*gnu*)
+              ARCH="aarch64"
+              VARIANT="gnu"
+              ;;
+            *aarch64*|*arm64*)
+              ARCH="aarch64"
+              VARIANT=""
+              ;;
+            *armv7*)
+              ARCH="armv7"
+              VARIANT=""
+              ;;
+            *)
+              ARCH="unknown"
+              VARIANT=""
+              ;;
+          esac
+
+          # Generate package name based on build type
+          if [[ -n "$VARIANT" ]]; then
+            ARCH_WITH_VARIANT="${ARCH}-${VARIANT}"
+          else
+            ARCH_WITH_VARIANT="${ARCH}"
+          fi
+
+          if [[ "$BUILD_TYPE" == "development" ]]; then
+            # Development build: rustfs-${platform}-${arch}-${variant}-dev-${short_sha}.zip
+            PACKAGE_NAME="rustfs-${PLATFORM}-${ARCH_WITH_VARIANT}-dev-${SHORT_SHA}"
+          else
+            # Release/Prerelease build: rustfs-${platform}-${arch}-${variant}-v${version}.zip
+            PACKAGE_NAME="rustfs-${PLATFORM}-${ARCH_WITH_VARIANT}-v${VERSION}"
+          fi
+
+          # Create zip packages for all platforms
+          # Ensure zip is available
+          if ! command -v zip &> /dev/null; then
+            if [[ "${{ matrix.os }}" == "ubuntu-latest" ]]; then
+              sudo apt-get update && sudo apt-get install -y zip
+            fi
+          fi
+
+          cd target/${{ matrix.target }}/release
+          # Determine the binary name based on platform
+          if [[ "${{ matrix.platform }}" == "windows" ]]; then
+            BINARY_NAME="rustfs.exe"
+          else
+            BINARY_NAME="rustfs"
+          fi
+
+          # Verify the binary exists before packaging
+          if [[ ! -f "$BINARY_NAME" ]]; then
+            echo "❌ Binary $BINARY_NAME not found in $(pwd)"
+            if [[ "${{ matrix.platform }}" == "windows" ]]; then
+              dir
+            else
+              ls -la
+            fi
+            exit 1
+          fi
+
+          # Universal packaging function
+          package_zip() {
+            local src=$1
+            local dst=$2
+            if [[ "${{ matrix.platform }}" == "windows" ]]; then
+              # Windows uses PowerShell Compress-Archive
+              powershell -Command "Compress-Archive -Path '$src' -DestinationPath '$dst' -Force"
+            elif command -v zip &> /dev/null; then
+              # Unix systems use zip command
+              zip "$dst" "$src"
+            else
+              echo "❌ No zip utility available"
+              exit 1
+            fi
+          }
+
+          # Create the zip package
+          echo "Start packaging: $BINARY_NAME -> ../../../${PACKAGE_NAME}.zip"
+          package_zip "$BINARY_NAME" "../../../${PACKAGE_NAME}.zip"
+
+          cd ../../..
+
+          # Verify the package was created
+          if [[ -f "${PACKAGE_NAME}.zip" ]]; then
+            echo "✅ Package created successfully: ${PACKAGE_NAME}.zip"
+            if [[ "${{ matrix.platform }}" == "windows" ]]; then
+              dir
+            else
+              ls -lh ${PACKAGE_NAME}.zip
+            fi
+          else
+            echo "❌ Failed to create package: ${PACKAGE_NAME}.zip"
+            exit 1
+          fi
+
+          # Create latest version files right after the main package
+          LATEST_FILES=""
+          if [[ "$BUILD_TYPE" == "release" ]] || [[ "$BUILD_TYPE" == "prerelease" ]]; then
+            # Create latest version filename
+            # Convert from rustfs-linux-x86_64-musl-v1.0.0 to rustfs-linux-x86_64-musl-latest
+            LATEST_FILE="${PACKAGE_NAME%-v*}-latest.zip"
+
+            echo "🔄 Creating latest version: ${PACKAGE_NAME}.zip -> $LATEST_FILE"
+            cp "${PACKAGE_NAME}.zip" "$LATEST_FILE"
+
+            if [[ -f "$LATEST_FILE" ]]; then
+              echo "✅ Latest version created: $LATEST_FILE"
+              LATEST_FILES="$LATEST_FILE"
+            fi
+          elif [[ "$BUILD_TYPE" == "development" ]]; then
+            # Development builds (only main branch triggers development builds)
+            # Create main-latest version filename
+            # Convert from rustfs-linux-x86_64-dev-abc123 to rustfs-linux-x86_64-main-latest
+            MAIN_LATEST_FILE="${PACKAGE_NAME%-dev-*}-main-latest.zip"
+
+            echo "🔄 Creating main-latest version: ${PACKAGE_NAME}.zip -> $MAIN_LATEST_FILE"
+            cp "${PACKAGE_NAME}.zip" "$MAIN_LATEST_FILE"
+
+            if [[ -f "$MAIN_LATEST_FILE" ]]; then
+              echo "✅ Main-latest version created: $MAIN_LATEST_FILE"
+              LATEST_FILES="$MAIN_LATEST_FILE"
+
+              # Also create a generic main-latest for Docker builds (Linux only)
+              if [[ "${{ matrix.platform }}" == "linux" ]]; then
+                DOCKER_MAIN_LATEST_FILE="rustfs-linux-${ARCH_WITH_VARIANT}-main-latest.zip"
+
+                echo "🔄 Creating Docker main-latest version: ${PACKAGE_NAME}.zip -> $DOCKER_MAIN_LATEST_FILE"
+                cp "${PACKAGE_NAME}.zip" "$DOCKER_MAIN_LATEST_FILE"
+
+                if [[ -f "$DOCKER_MAIN_LATEST_FILE" ]]; then
+                  echo "✅ Docker main-latest version created: $DOCKER_MAIN_LATEST_FILE"
+                  LATEST_FILES="$LATEST_FILES $DOCKER_MAIN_LATEST_FILE"
+                fi
+              fi
+            fi
+          fi
+
+          echo "package_name=${PACKAGE_NAME}" >> $GITHUB_OUTPUT
+          echo "package_file=${PACKAGE_NAME}.zip" >> $GITHUB_OUTPUT
+          echo "latest_files=${LATEST_FILES}" >> $GITHUB_OUTPUT
+          echo "build_type=${BUILD_TYPE}" >> $GITHUB_OUTPUT
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+
+          echo "📦 Package created: ${PACKAGE_NAME}.zip"
+          if [[ -n "$LATEST_FILES" ]]; then
+            echo "📦 Latest files created: $LATEST_FILES"
+          fi
+          echo "🔧 Build type: ${BUILD_TYPE}"
+          echo "📊 Version: ${VERSION}"
+
+      - name: Upload to GitHub artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ steps.package.outputs.package_name }}
+          path: "rustfs-*.zip"
+          retention-days: ${{ startsWith(github.ref, 'refs/tags/') && 30 || 7 }}
+
+      - name: Upload to Aliyun OSS
+        if: env.OSS_ACCESS_KEY_ID != '' && (needs.build-check.outputs.build_type == 'release' || needs.build-check.outputs.build_type == 'prerelease' || needs.build-check.outputs.build_type == 'development')
+        env:
+          OSS_ACCESS_KEY_ID: ${{ secrets.ALICLOUDOSS_KEY_ID }}
+          OSS_ACCESS_KEY_SECRET: ${{ secrets.ALICLOUDOSS_KEY_SECRET }}
+          OSS_REGION: cn-beijing
+          OSS_ENDPOINT: https://oss-accelerate.aliyuncs.com
+        shell: bash
+        run: |
+          BUILD_TYPE="${{ needs.build-check.outputs.build_type }}"
+
+          # Install ossutil (platform-specific)
+          OSSUTIL_VERSION="2.1.1"
+          case "${{ matrix.platform }}" in
+            linux)
+              if [[ "$(uname -m)" == "arm64" ]]; then
+                ARCH="arm64"
+              else
+                ARCH="amd64"
+              fi
+              OSSUTIL_ZIP="ossutil-${OSSUTIL_VERSION}-linux-${ARCH}.zip"
+              OSSUTIL_DIR="ossutil-${OSSUTIL_VERSION}-linux-${ARCH}"
+
+              curl -o "$OSSUTIL_ZIP" "https://gosspublic.alicdn.com/ossutil/v2/${OSSUTIL_VERSION}/${OSSUTIL_ZIP}"
+              unzip "$OSSUTIL_ZIP"
+              mv "${OSSUTIL_DIR}/ossutil" /usr/local/bin/
+              rm -rf "$OSSUTIL_DIR" "$OSSUTIL_ZIP"
+              chmod +x /usr/local/bin/ossutil
+              OSSUTIL_BIN=ossutil
+              ;;
+            macos)
+              if [[ "$(uname -m)" == "arm64" ]]; then
+                ARCH="arm64"
+              else
+                ARCH="amd64"
+              fi
+              OSSUTIL_ZIP="ossutil-${OSSUTIL_VERSION}-mac-${ARCH}.zip"
+              OSSUTIL_DIR="ossutil-${OSSUTIL_VERSION}-mac-${ARCH}"
+
+              curl -o "$OSSUTIL_ZIP" "https://gosspublic.alicdn.com/ossutil/v2/${OSSUTIL_VERSION}/${OSSUTIL_ZIP}"
+              unzip "$OSSUTIL_ZIP"
+              mv "${OSSUTIL_DIR}/ossutil" /usr/local/bin/
+              rm -rf "$OSSUTIL_DIR" "$OSSUTIL_ZIP"
+              chmod +x /usr/local/bin/ossutil
+              OSSUTIL_BIN=ossutil
+              ;;
+            windows)
+              OSSUTIL_ZIP="ossutil-${OSSUTIL_VERSION}-windows-amd64.zip"
+              OSSUTIL_DIR="ossutil-${OSSUTIL_VERSION}-windows-amd64"
+
+              curl -o "$OSSUTIL_ZIP" "https://gosspublic.alicdn.com/ossutil/v2/${OSSUTIL_VERSION}/${OSSUTIL_ZIP}"
+              unzip "$OSSUTIL_ZIP"
+              mv "${OSSUTIL_DIR}/ossutil.exe" ./ossutil.exe
+              rm -rf "$OSSUTIL_DIR" "$OSSUTIL_ZIP"
+              OSSUTIL_BIN=./ossutil.exe
+              ;;
+          esac
+
+          # Determine upload path based on build type
+          if [[ "$BUILD_TYPE" == "development" ]]; then
+            OSS_PATH="oss://rustfs-artifacts/artifacts/rustfs/dev/"
+            echo "📤 Uploading development build to OSS dev directory"
+          else
+            OSS_PATH="oss://rustfs-artifacts/artifacts/rustfs/release/"
+            echo "📤 Uploading release build to OSS release directory"
+          fi
+
+          # Upload all rustfs zip files to OSS using glob pattern
+          echo "📤 Uploading all rustfs-*.zip files to $OSS_PATH..."
+          for zip_file in rustfs-*.zip; do
+            if [[ -f "$zip_file" ]]; then
+              echo "Uploading: $zip_file to $OSS_PATH..."
+              $OSSUTIL_BIN cp "$zip_file" "$OSS_PATH" --force
+              echo "✅ Uploaded: $zip_file"
+            fi
+          done
+
+          echo "✅ Upload completed successfully"
+
+  # Build summary
+  build-summary:
+    name: Build Summary
+    needs: [ build-check, build-rustfs ]
+    if: always() && needs.build-check.outputs.should_build == 'true'
+    runs-on: ubicloud-standard-2
+    steps:
+      - name: Build completion summary
+        shell: bash
+        run: |
+          BUILD_TYPE="${{ needs.build-check.outputs.build_type }}"
+          VERSION="${{ needs.build-check.outputs.version }}"
+
+          echo "🎉 Build completed successfully!"
+          echo "📦 Build type: $BUILD_TYPE"
+          echo "🔢 Version: $VERSION"
+          echo ""
+
+          # Check build status
+          BUILD_STATUS="${{ needs.build-rustfs.result }}"
+
+          echo "📊 Build Results:"
+          echo "  📦 All platforms: $BUILD_STATUS"
+          echo ""
+
+          case "$BUILD_TYPE" in
+            "development")
+              echo "🛠️  Development build artifacts have been uploaded to OSS dev directory"
+              echo "⚠️  This is a development build - not suitable for production use"
+              ;;
+            "release")
+              echo "🚀 Release build artifacts have been uploaded to OSS release directory"
+              echo "✅ This build is ready for production use"
+              echo "🏷️  GitHub Release will be created in this workflow"
+              ;;
+            "prerelease")
+              echo "🧪 Prerelease build artifacts have been uploaded to OSS release directory"
+              echo "⚠️  This is a prerelease build - use with caution"
+              echo "🏷️  GitHub Release will be created in this workflow"
+              ;;
+          esac
+
+          echo ""
+          echo "🐳 Docker Images:"
+          if [[ "${{ github.event.inputs.build_docker }}" == "false" ]]; then
+            echo "⏭️  Docker image build was skipped (binary only build)"
+          elif [[ "$BUILD_STATUS" == "success" ]]; then
+            echo "🔄 Docker images will be built and pushed automatically via workflow_run event"
+          else
+            echo "❌ Docker image build will be skipped due to build failure"
+          fi
+
+  # Create GitHub Release (only for tag pushes)
+  create-release:
+    name: Create GitHub Release
+    needs: [ build-check, build-rustfs ]
+    if: startsWith(github.ref, 'refs/tags/') && needs.build-check.outputs.build_type != 'development'
+    runs-on: ubicloud-standard-2
+    permissions:
+      contents: write
+    outputs:
+      release_id: ${{ steps.create.outputs.release_id }}
+      release_url: ${{ steps.create.outputs.release_url }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Create GitHub Release
+        id: create
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          TAG="${{ needs.build-check.outputs.version }}"
+          VERSION="${{ needs.build-check.outputs.version }}"
+          IS_PRERELEASE="${{ needs.build-check.outputs.is_prerelease }}"
+          BUILD_TYPE="${{ needs.build-check.outputs.build_type }}"
+
+          # Determine release type for title
+          if [[ "$BUILD_TYPE" == "prerelease" ]]; then
+            if [[ "$TAG" == *"alpha"* ]]; then
+              RELEASE_TYPE="alpha"
+            elif [[ "$TAG" == *"beta"* ]]; then
+              RELEASE_TYPE="beta"
+            elif [[ "$TAG" == *"rc"* ]]; then
+              RELEASE_TYPE="rc"
+            else
+              RELEASE_TYPE="prerelease"
+            fi
+          else
+            RELEASE_TYPE="release"
+          fi
+
+          # Check if release already exists
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists"
+            RELEASE_ID=$(gh release view "$TAG" --json databaseId --jq '.databaseId')
+            RELEASE_URL=$(gh release view "$TAG" --json url --jq '.url')
+          else
+            # Get release notes from tag message
+            RELEASE_NOTES=$(git tag -l --format='%(contents)' "${TAG}")
+            if [[ -z "$RELEASE_NOTES" || "$RELEASE_NOTES" =~ ^[[:space:]]*$ ]]; then
+              if [[ "$IS_PRERELEASE" == "true" ]]; then
+                RELEASE_NOTES="Pre-release ${VERSION} (${RELEASE_TYPE})"
+              else
+                RELEASE_NOTES="Release ${VERSION}"
+              fi
+            fi
+
+            # Create release title
+            if [[ "$IS_PRERELEASE" == "true" ]]; then
+              TITLE="RustFS $VERSION (${RELEASE_TYPE})"
+            else
+              TITLE="RustFS $VERSION"
+            fi
+
+            # Create the release
+            PRERELEASE_FLAG=""
+            if [[ "$IS_PRERELEASE" == "true" ]]; then
+              PRERELEASE_FLAG="--prerelease"
+            fi
+
+            gh release create "$TAG" \
+              --title "$TITLE" \
+              --notes "$RELEASE_NOTES" \
+              $PRERELEASE_FLAG \
+              --draft
+
+            RELEASE_ID=$(gh release view "$TAG" --json databaseId --jq '.databaseId')
+            RELEASE_URL=$(gh release view "$TAG" --json url --jq '.url')
+          fi
+
+          echo "release_id=$RELEASE_ID" >> $GITHUB_OUTPUT
+          echo "release_url=$RELEASE_URL" >> $GITHUB_OUTPUT
+          echo "Created release: $RELEASE_URL"
+
+  # Prepare and upload release assets
+  upload-release-assets:
+    name: Upload Release Assets
+    needs: [ build-check, build-rustfs, create-release ]
+    if: startsWith(github.ref, 'refs/tags/') && needs.build-check.outputs.build_type != 'development'
+    runs-on: ubicloud-standard-2
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v7
+        with:
+          path: ./artifacts
+          pattern: rustfs-*
+          merge-multiple: true
+
+      - name: Prepare release assets
+        id: prepare
+        shell: bash
+        run: |
+          VERSION="${{ needs.build-check.outputs.version }}"
+          TAG="${{ needs.build-check.outputs.version }}"
+
+          mkdir -p ./release-assets
+
+          # Copy and verify artifacts (including latest files created during build)
+          ASSETS_COUNT=0
+          for file in ./artifacts/*.zip; do
+            if [[ -f "$file" ]]; then
+              cp "$file" ./release-assets/
+              ASSETS_COUNT=$((ASSETS_COUNT + 1))
+            fi
+          done
+
+          if [[ $ASSETS_COUNT -eq 0 ]]; then
+            echo "❌ No artifacts found!"
+            exit 1
+          fi
+
+          cd ./release-assets
+
+          # Generate checksums for all files (including latest versions)
+          if ls *.zip >/dev/null 2>&1; then
+            sha256sum *.zip > SHA256SUMS
+            sha512sum *.zip > SHA512SUMS
+          fi
+
+          # Create signature placeholder files
+          for file in *.zip; do
+            echo "# Signature for $file" > "${file}.asc"
+            echo "# GPG signature will be added in future versions" >> "${file}.asc"
+          done
+
+          echo "📦 Prepared assets:"
+          ls -la
+
+          echo "🔢 Total asset count: $ASSETS_COUNT"
+
+      - name: Upload to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          TAG="${{ needs.build-check.outputs.version }}"
+
+          cd ./release-assets
+
+          # Upload all files
+          for file in *; do
+            if [[ -f "$file" ]]; then
+              echo "📤 Uploading $file..."
+              gh release upload "$TAG" "$file" --clobber
+            fi
+          done
+
+          echo "✅ All assets uploaded successfully"
+
+  # Update latest.json for stable releases only
+  update-latest-version:
+    name: Update Latest Version
+    needs: [ build-check, upload-release-assets ]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubicloud-standard-2
+    steps:
+      - name: Update latest.json
+        env:
+          OSS_ACCESS_KEY_ID: ${{ secrets.ALICLOUDOSS_KEY_ID }}
+          OSS_ACCESS_KEY_SECRET: ${{ secrets.ALICLOUDOSS_KEY_SECRET }}
+          OSS_REGION: cn-beijing
+          OSS_ENDPOINT: https://oss-cn-beijing.aliyuncs.com
+        shell: bash
+        run: |
+          if [[ -z "$OSS_ACCESS_KEY_ID" ]]; then
+            echo "⚠️ OSS credentials not available, skipping latest.json update"
+            exit 0
+          fi
+
+          VERSION="${{ needs.build-check.outputs.version }}"
+          TAG="${{ needs.build-check.outputs.version }}"
+
+          # Install ossutil
+          OSSUTIL_VERSION="2.1.1"
+          OSSUTIL_ZIP="ossutil-${OSSUTIL_VERSION}-linux-amd64.zip"
+          OSSUTIL_DIR="ossutil-${OSSUTIL_VERSION}-linux-amd64"
+
+          curl -o "$OSSUTIL_ZIP" "https://gosspublic.alicdn.com/ossutil/v2/${OSSUTIL_VERSION}/${OSSUTIL_ZIP}"
+          unzip "$OSSUTIL_ZIP"
+          mv "${OSSUTIL_DIR}/ossutil" /usr/local/bin/
+          rm -rf "$OSSUTIL_DIR" "$OSSUTIL_ZIP"
+          chmod +x /usr/local/bin/ossutil
+
+          # Create latest.json
+          cat > latest.json << EOF
+          {
+            "version": "${VERSION}",
+            "tag": "${TAG}",
+            "release_date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "release_type": "stable",
+            "download_url": "https://github.com/${{ github.repository }}/releases/tag/${TAG}"
+          }
+          EOF
+
+          # Upload to OSS
+          ossutil cp latest.json oss://rustfs-version/latest.json --force
+
+          echo "✅ Updated latest.json for stable release $VERSION"
+
+  # Publish release (remove draft status)
+  publish-release:
+    name: Publish Release
+    needs: [ build-check, create-release, upload-release-assets ]
+    if: startsWith(github.ref, 'refs/tags/') && needs.build-check.outputs.build_type != 'development'
+    runs-on: ubicloud-standard-2
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Update release notes and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          TAG="${{ needs.build-check.outputs.version }}"
+          VERSION="${{ needs.build-check.outputs.version }}"
+          IS_PRERELEASE="${{ needs.build-check.outputs.is_prerelease }}"
+          BUILD_TYPE="${{ needs.build-check.outputs.build_type }}"
+
+          # Determine release type
+          if [[ "$BUILD_TYPE" == "prerelease" ]]; then
+            if [[ "$TAG" == *"alpha"* ]]; then
+              RELEASE_TYPE="alpha"
+            elif [[ "$TAG" == *"beta"* ]]; then
+              RELEASE_TYPE="beta"
+            elif [[ "$TAG" == *"rc"* ]]; then
+              RELEASE_TYPE="rc"
+            else
+              RELEASE_TYPE="prerelease"
+            fi
+          else
+            RELEASE_TYPE="release"
+          fi
+
+          # Get original release notes from tag
+          ORIGINAL_NOTES=$(git tag -l --format='%(contents)' "${TAG}")
+          if [[ -z "$ORIGINAL_NOTES" || "$ORIGINAL_NOTES" =~ ^[[:space:]]*$ ]]; then
+            if [[ "$IS_PRERELEASE" == "true" ]]; then
+              ORIGINAL_NOTES="Pre-release ${VERSION} (${RELEASE_TYPE})"
+            else
+              ORIGINAL_NOTES="Release ${VERSION}"
+            fi
+          fi
+
+          # Publish the release (remove draft status)
+          gh release edit "$TAG" --draft=false
+
+          echo "🎉 Released $TAG successfully!"
+          echo "📄 Release URL: ${{ needs.create-release.outputs.release_url }}"

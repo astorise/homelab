@@ -1,0 +1,580 @@
+// Copyright 2024 RustFS Team
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use crate::storage::{process_lambda_configurations, process_queue_configurations, process_topic_configurations};
+use crate::{admin, config, version};
+use rustfs_config::{DEFAULT_UPDATE_CHECK, ENV_UPDATE_CHECK, RUSTFS_REGION};
+use rustfs_ecstore::bucket::metadata_sys;
+use rustfs_notify::notifier_global;
+use rustfs_targets::arn::{ARN, TargetIDError};
+use s3s::s3_error;
+use std::env;
+use std::io::Error;
+use tracing::{debug, error, info, instrument, warn};
+
+#[instrument]
+pub(crate) fn print_server_info() {
+    let current_year = jiff::Zoned::now().year();
+    // Use custom macros to print server information
+    info!("RustFS Object Storage Server");
+    info!("Copyright: 2024-{} RustFS, Inc", current_year);
+    info!("License: Apache-2.0 https://www.apache.org/licenses/LICENSE-2.0");
+    info!("Version: {}", version::get_version());
+    info!("Docs: https://rustfs.com/docs/");
+}
+
+/// Initialize the asynchronous update check system.
+/// This function checks if update checking is enabled via
+/// environment variable or default configuration. If enabled,
+/// it spawns an asynchronous task to check for updates with a timeout.
+pub(crate) fn init_update_check() {
+    let update_check_enable = env::var(ENV_UPDATE_CHECK)
+        .unwrap_or_else(|_| DEFAULT_UPDATE_CHECK.to_string())
+        .parse::<bool>()
+        .unwrap_or(DEFAULT_UPDATE_CHECK);
+
+    if !update_check_enable {
+        return;
+    }
+
+    // Async update check with timeout
+    tokio::spawn(async {
+        use crate::update::{UpdateCheckError, check_updates};
+
+        // Add timeout to prevent hanging network calls
+        match tokio::time::timeout(std::time::Duration::from_secs(30), check_updates()).await {
+            Ok(Ok(result)) => {
+                if result.update_available {
+                    if let Some(latest) = &result.latest_version {
+                        info!(
+                            "🚀 Version check: New version available: {} -> {} (current: {})",
+                            result.current_version, latest.version, result.current_version
+                        );
+                        if let Some(notes) = &latest.release_notes {
+                            info!("📝 Release notes: {}", notes);
+                        }
+                        if let Some(url) = &latest.download_url {
+                            info!("🔗 Download URL: {}", url);
+                        }
+                    }
+                } else {
+                    debug!("✅ Version check: Current version is up to date: {}", result.current_version);
+                }
+            }
+            Ok(Err(UpdateCheckError::HttpError(e))) => {
+                debug!("Version check: network error (this is normal): {}", e);
+            }
+            Ok(Err(e)) => {
+                debug!("Version check: failed (this is normal): {}", e);
+            }
+            Err(_) => {
+                debug!("Version check: timeout after 30 seconds (this is normal)");
+            }
+        }
+    });
+}
+
+/// Helper function to parse ARN string to target ID
+/// Converts an ARN string to a target ID, or returns an error if parsing fails
+fn arn_to_target_id(arn_str: &str) -> Result<rustfs_targets::arn::TargetID, TargetIDError> {
+    ARN::parse(arn_str)
+        .map(|arn| arn.target_id)
+        .map_err(|e| TargetIDError::InvalidFormat(e.to_string()))
+}
+
+/// Add existing bucket notification configurations to the global notifier system.
+/// This function retrieves notification configurations for each bucket
+/// and registers the corresponding event rules with the notifier system.
+///  It processes queue, topic, and lambda configurations and maps them to event rules.
+///  # Arguments
+/// * `buckets` - A vector of bucket names to process
+#[instrument(skip_all)]
+pub(crate) async fn add_bucket_notification_configuration(buckets: Vec<String>) {
+    let global_region = rustfs_ecstore::global::get_global_region();
+    let region = global_region
+        .as_ref()
+        .filter(|r| !r.as_str().is_empty())
+        .map(|r| r.as_str())
+        .unwrap_or_else(|| {
+            warn!(
+                "Global region is not set; attempting notification configuration for all buckets using default region '{}'.",
+                RUSTFS_REGION
+            );
+            RUSTFS_REGION
+        });
+    for bucket in buckets.iter() {
+        let has_notification_config = metadata_sys::get_notification_config(bucket).await.unwrap_or_else(|err| {
+            warn!("get_notification_config err {:?}", err);
+            None
+        });
+
+        match has_notification_config {
+            Some(cfg) => {
+                info!(
+                    target: "rustfs::main::add_bucket_notification_configuration",
+                    bucket = %bucket,
+                    "Bucket '{}' has existing notification configuration: {:?}", bucket, cfg);
+
+                let mut event_rules = Vec::new();
+                if let Err(e) = process_queue_configurations(&mut event_rules, cfg.queue_configurations.clone(), arn_to_target_id)
+                {
+                    error!("Failed to parse queue notification config for bucket '{}': {:?}", bucket, e);
+                }
+                if let Err(e) = process_topic_configurations(&mut event_rules, cfg.topic_configurations.clone(), arn_to_target_id)
+                {
+                    error!("Failed to parse topic notification config for bucket '{}': {:?}", bucket, e);
+                }
+                if let Err(e) =
+                    process_lambda_configurations(&mut event_rules, cfg.lambda_function_configurations.clone(), arn_to_target_id)
+                {
+                    error!("Failed to parse lambda notification config for bucket '{}': {:?}", bucket, e);
+                }
+
+                if let Err(e) = notifier_global::add_event_specific_rules(bucket, region, &event_rules)
+                    .await
+                    .map_err(|e| s3_error!(InternalError, "Failed to add rules: {e}"))
+                {
+                    error!("Failed to add rules for bucket '{}': {:?}", bucket, e);
+                }
+            }
+            None => {
+                info!(
+                    target: "rustfs::main::add_bucket_notification_configuration",
+                    bucket = %bucket,
+                    "Bucket '{}' has no existing notification configuration.", bucket);
+            }
+        }
+    }
+}
+
+/// Build KMS configuration for local backend
+fn build_local_kms_config(cfg: &config::Config) -> std::io::Result<rustfs_kms::config::KmsConfig> {
+    let key_dir = cfg
+        .kms_key_dir
+        .as_ref()
+        .ok_or_else(|| Error::other("KMS key directory is required for local backend"))?;
+
+    Ok(rustfs_kms::config::KmsConfig {
+        backend: rustfs_kms::config::KmsBackend::Local,
+        backend_config: rustfs_kms::config::BackendConfig::Local(rustfs_kms::config::LocalConfig {
+            key_dir: std::path::PathBuf::from(key_dir),
+            master_key: None,
+            file_permissions: Some(0o600),
+        }),
+        default_key_id: cfg.kms_default_key_id.clone(),
+        timeout: std::time::Duration::from_secs(30),
+        retry_attempts: 3,
+        enable_cache: true,
+        cache_config: rustfs_kms::config::CacheConfig::default(),
+    })
+}
+
+/// Build KMS configuration for Vault backend
+fn build_vault_kms_config(cfg: &config::Config) -> std::io::Result<rustfs_kms::config::KmsConfig> {
+    let vault_address = cfg
+        .kms_vault_address
+        .as_ref()
+        .ok_or_else(|| Error::other("Vault address is required for vault backend"))?;
+    let vault_token = cfg
+        .kms_vault_token
+        .as_ref()
+        .ok_or_else(|| Error::other("Vault token is required for vault backend"))?;
+
+    Ok(rustfs_kms::config::KmsConfig {
+        backend: rustfs_kms::config::KmsBackend::Vault,
+        backend_config: rustfs_kms::config::BackendConfig::Vault(Box::new(rustfs_kms::config::VaultConfig {
+            address: vault_address.clone(),
+            auth_method: rustfs_kms::config::VaultAuthMethod::Token {
+                token: vault_token.clone(),
+            },
+            namespace: None,
+            mount_path: "transit".to_string(),
+            kv_mount: "secret".to_string(),
+            key_path_prefix: "rustfs/kms/keys".to_string(),
+            tls: None,
+        })),
+        default_key_id: cfg.kms_default_key_id.clone(),
+        timeout: std::time::Duration::from_secs(30),
+        retry_attempts: 3,
+        enable_cache: true,
+        cache_config: rustfs_kms::config::CacheConfig::default(),
+    })
+}
+
+/// Configure and start KMS service
+async fn configure_and_start_kms(
+    service_manager: &std::sync::Arc<rustfs_kms::KmsServiceManager>,
+    kms_config: rustfs_kms::config::KmsConfig,
+    config_source: &str,
+) -> std::io::Result<()> {
+    service_manager
+        .configure(kms_config)
+        .await
+        .map_err(|e| Error::other(format!("Failed to configure KMS: {e}")))?;
+
+    service_manager
+        .start()
+        .await
+        .map_err(|e| Error::other(format!("Failed to start KMS: {e}")))?;
+
+    info!("KMS service configured and started successfully from {}", config_source);
+    Ok(())
+}
+
+/// Initialize KMS system and configure if enabled
+///
+/// This function initializes the global KMS service manager. If KMS is enabled
+/// via command line options, it configures and starts the service accordingly.
+/// If not enabled, it attempts to load any persisted KMS configuration from
+/// cluster storage and starts the service if found.
+/// # Arguments
+/// * `config` - The application configuration options
+///
+/// Returns `std::io::Result<()>` indicating success or failure
+#[instrument(skip(config))]
+pub(crate) async fn init_kms_system(config: &config::Config) -> std::io::Result<()> {
+    // Initialize global KMS service manager (starts in NotConfigured state)
+    let service_manager = rustfs_kms::init_global_kms_service_manager();
+
+    // If KMS is enabled in configuration, configure and start the service
+    if config.kms_enable {
+        info!("KMS is enabled via command line, configuring and starting service...");
+
+        // Create KMS configuration from command line options
+        let kms_config = match config.kms_backend.as_str() {
+            "local" => build_local_kms_config(config)?,
+            "vault" => build_vault_kms_config(config)?,
+            _ => return Err(Error::other(format!("Unsupported KMS backend: {}", config.kms_backend))),
+        };
+
+        configure_and_start_kms(&service_manager, kms_config, "command line options").await?;
+    } else {
+        // Try to load persisted KMS configuration from cluster storage
+        info!("Attempting to load persisted KMS configuration from cluster storage...");
+
+        if let Some(persisted_config) = admin::handlers::kms_dynamic::load_kms_config().await {
+            info!("Found persisted KMS configuration, attempting to configure and start service...");
+
+            // Configure the KMS service with persisted config
+            match configure_and_start_kms(&service_manager, persisted_config, "persisted configuration").await {
+                Ok(()) => {
+                    info!("KMS service configured and started successfully from persisted configuration");
+                }
+                Err(e) => {
+                    warn!("Failed to configure KMS with persisted configuration: {}", e);
+                }
+            }
+        } else {
+            info!("No persisted KMS configuration found. KMS is ready for dynamic configuration via API.");
+        }
+    }
+
+    Ok(())
+}
+
+/// Initialize the adaptive buffer sizing system with workload profile configuration.
+///
+/// This system provides intelligent buffer size selection based on file size and workload type.
+/// Workload-aware buffer sizing is enabled by default with the GeneralPurpose profile,
+/// which provides the same buffer sizes as the original implementation for compatibility.
+///
+/// # Configuration
+/// - Default: Enabled with GeneralPurpose profile
+/// - Opt-out: Use `--buffer-profile-disable` flag
+/// - Custom profile: Set via `--buffer-profile` or `RUSTFS_BUFFER_PROFILE` environment variable
+///
+/// # Arguments
+/// * `config` - The application configuration options
+pub(crate) fn init_buffer_profile_system(config: &config::Config) {
+    use crate::config::workload_profiles::{
+        RustFSBufferConfig, WorkloadProfile, init_global_buffer_config, set_buffer_profile_enabled,
+    };
+
+    if config.buffer_profile_disable {
+        // User explicitly disabled buffer profiling - use GeneralPurpose profile in disabled mode
+        info!("Buffer profiling disabled via --buffer-profile-disable, using GeneralPurpose profile");
+        set_buffer_profile_enabled(false);
+    } else {
+        // Enabled by default: use configured workload profile
+        info!("Buffer profiling enabled with profile: {}", config.buffer_profile);
+
+        // Parse the workload profile from configuration string
+        let profile = WorkloadProfile::from_name(&config.buffer_profile);
+
+        // Log the selected profile for operational visibility
+        info!("Active buffer profile: {:?}", profile);
+
+        // Initialize the global buffer configuration
+        init_global_buffer_config(RustFSBufferConfig::new(profile));
+
+        // Enable buffer profiling globally
+        set_buffer_profile_enabled(true);
+
+        info!("Buffer profiling system initialized successfully");
+    }
+}
+
+/// Parse and normalize server address for FTP/FTPS
+/// Forces IPv4 binding to avoid libunftp IPv6 compatibility issues
+#[allow(dead_code)]
+async fn parse_and_normalize_server_address(
+    address_str: &str,
+) -> Result<std::net::SocketAddr, Box<dyn std::error::Error + Send + Sync>> {
+    let addr = rustfs_utils::net::parse_and_resolve_address(address_str)
+        .map_err(|e| format!("Invalid server address '{address_str}': {e}"))?;
+
+    // Force IPv4 binding to avoid libunftp IPv6 compatibility issues
+    let normalized_addr = if addr.is_ipv6() {
+        std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), addr.port())
+    } else {
+        addr
+    };
+
+    Ok(normalized_addr)
+}
+
+/// Start FTP/FTPS server in background with shutdown support
+/// # Arguments
+/// * `server` - The FTP/FTPS server instance
+/// * `protocol_name` - Name of the protocol (e.g., "FTP", "FTPS")
+#[allow(dead_code)]
+fn spawn_server<S>(server: S, protocol_name: &'static str) -> tokio::sync::broadcast::Sender<()>
+where
+    S: std::future::Future<Output = Result<(), Box<dyn std::error::Error>>> + Send + 'static,
+{
+    let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
+
+    tokio::spawn(async move {
+        if let Err(e) = server.await {
+            error!("{} server error: {}", protocol_name, e);
+        }
+        info!("{} server shutdown completed", protocol_name);
+    });
+
+    shutdown_tx
+}
+
+/// Initialize the FTP system
+///
+/// This function initializes the FTP server (non-encrypted) if enabled in the configuration.
+#[cfg(feature = "ftps")]
+#[instrument(skip_all)]
+pub async fn init_ftp_system() -> Result<Option<tokio::sync::broadcast::Sender<()>>, Box<dyn std::error::Error + Send + Sync>> {
+    {
+        use crate::protocols::ProtocolStorageClient;
+        use rustfs_config::{DEFAULT_FTP_ADDRESS, ENV_FTP_ADDRESS, ENV_FTP_ENABLE, ENV_FTP_EXTERNAL_IP, ENV_FTP_PASSIVE_PORTS};
+        use rustfs_protocols::constants::defaults::DEFAULT_FTPS_PASSIVE_PORTS;
+        use rustfs_protocols::{FtpsConfig, FtpsServer};
+        // Check if FTP is enabled
+        let ftp_enable = rustfs_utils::get_env_bool(ENV_FTP_ENABLE, false);
+        if !ftp_enable {
+            debug!("FTP system is disabled");
+            return Ok(None);
+        }
+
+        // Parse FTP address - force IPv4 for libunftp compatibility
+        let ftp_address_str = rustfs_utils::get_env_str(ENV_FTP_ADDRESS, DEFAULT_FTP_ADDRESS);
+        let addr = parse_and_normalize_server_address(&ftp_address_str).await?;
+
+        // Get FTP configuration from environment variables
+        let passive_ports =
+            rustfs_utils::get_env_opt_str(ENV_FTP_PASSIVE_PORTS).or_else(|| Some(DEFAULT_FTPS_PASSIVE_PORTS.to_string())); // Default passive ports range
+        let external_ip = rustfs_utils::get_env_opt_str(ENV_FTP_EXTERNAL_IP);
+
+        // Create FTP configuration (TLS disabled, FTPS not required)
+        let config = FtpsConfig {
+            bind_addr: addr,
+            passive_ports,
+            external_ip,
+            ftps_required: false,
+            tls_enabled: false,
+            cert_dir: None,
+            ca_file: None,
+        };
+
+        // Validate FTP configuration
+        config.validate().await?;
+
+        // Create FTP server with protocol storage client
+        let fs = crate::storage::ecfs::FS::new();
+        let storage_client = ProtocolStorageClient::new(fs);
+        let server: FtpsServer<ProtocolStorageClient> = FtpsServer::new(config, storage_client).await?;
+
+        // Log server configuration
+        info!(
+            "FTP server configured on {} with passive ports {:?}",
+            server.config().bind_addr,
+            server.config().passive_ports
+        );
+
+        // Start FTP server in background task with proper shutdown support
+        let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
+
+        tokio::spawn(async move {
+            if let Err(e) = server.start(shutdown_rx).await {
+                error!("FTP server error: {}", e);
+            }
+            info!("FTP server shutdown completed");
+        });
+
+        info!("FTP system initialized successfully");
+        Ok(Some(shutdown_tx))
+    }
+}
+
+/// Initialize the FTPS system
+///
+/// This function initializes the FTPS server if enabled in the configuration.
+/// It sets up the FTPS server with the appropriate configuration and starts
+/// the server in a background task.
+#[cfg(feature = "ftps")]
+#[instrument(skip_all)]
+pub async fn init_ftps_system() -> Result<Option<tokio::sync::broadcast::Sender<()>>, Box<dyn std::error::Error + Send + Sync>> {
+    {
+        use crate::protocols::ProtocolStorageClient;
+        use rustfs_config::{
+            DEFAULT_FTPS_ADDRESS, ENV_FTPS_ADDRESS, ENV_FTPS_CA_FILE, ENV_FTPS_CERTS_DIR, ENV_FTPS_ENABLE, ENV_FTPS_EXTERNAL_IP,
+            ENV_FTPS_PASSIVE_PORTS, ENV_FTPS_TLS_ENABLED,
+        };
+        use rustfs_protocols::constants::defaults::DEFAULT_FTPS_PASSIVE_PORTS;
+        use rustfs_protocols::{FtpsConfig, FtpsServer};
+        // Check if FTPS is enabled
+        let ftps_enable = rustfs_utils::get_env_bool(ENV_FTPS_ENABLE, false);
+        if !ftps_enable {
+            debug!("FTPS system is disabled");
+            return Ok(None);
+        }
+
+        // Parse FTPS address - force IPv4 for libunftp compatibility
+        let ftps_address_str = rustfs_utils::get_env_str(ENV_FTPS_ADDRESS, DEFAULT_FTPS_ADDRESS);
+        let addr = parse_and_normalize_server_address(&ftps_address_str).await?;
+
+        // Get FTPS configuration from environment variables
+        let tls_enabled = rustfs_utils::get_env_bool(ENV_FTPS_TLS_ENABLED, true);
+        let cert_dir = rustfs_utils::get_env_opt_str(ENV_FTPS_CERTS_DIR);
+        let ca_file = rustfs_utils::get_env_opt_str(ENV_FTPS_CA_FILE);
+        let passive_ports =
+            rustfs_utils::get_env_opt_str(ENV_FTPS_PASSIVE_PORTS).or_else(|| Some(DEFAULT_FTPS_PASSIVE_PORTS.to_string())); // Default passive ports range
+        let external_ip = rustfs_utils::get_env_opt_str(ENV_FTPS_EXTERNAL_IP);
+
+        // Create FTPS configuration
+        let config = FtpsConfig {
+            bind_addr: addr,
+            passive_ports,
+            external_ip,
+            ftps_required: true,
+            tls_enabled,
+            cert_dir,
+            ca_file,
+        };
+
+        // Validate FTPS configuration
+        config.validate().await?;
+
+        // Create FTPS server with protocol storage client
+        let fs = crate::storage::ecfs::FS::new();
+        let storage_client = ProtocolStorageClient::new(fs);
+        let server: FtpsServer<ProtocolStorageClient> = FtpsServer::new(config, storage_client).await?;
+
+        // Log server configuration
+        info!(
+            "FTPS server configured on {} with passive ports {:?}",
+            server.config().bind_addr,
+            server.config().passive_ports
+        );
+
+        // Start FTPS server in background task with proper shutdown support
+        let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
+
+        tokio::spawn(async move {
+            if let Err(e) = server.start(shutdown_rx).await {
+                error!("FTPS server error: {}", e);
+            }
+            info!("FTPS server shutdown completed");
+        });
+
+        info!("FTPS system initialized successfully");
+        Ok(Some(shutdown_tx))
+    }
+}
+
+/// Initialize the WebDAV system
+///
+/// This function initializes the WebDAV server if enabled in the configuration.
+/// It sets up the WebDAV server with the appropriate configuration and starts
+/// the server in a background task.
+#[cfg(feature = "webdav")]
+#[instrument(skip_all)]
+pub async fn init_webdav_system() -> Result<Option<tokio::sync::broadcast::Sender<()>>, Box<dyn std::error::Error + Send + Sync>>
+{
+    {
+        use crate::protocols::ProtocolStorageClient;
+        use rustfs_config::{
+            DEFAULT_WEBDAV_ADDRESS, ENV_WEBDAV_ADDRESS, ENV_WEBDAV_CA_FILE, ENV_WEBDAV_CERTS_DIR, ENV_WEBDAV_ENABLE,
+            ENV_WEBDAV_MAX_BODY_SIZE, ENV_WEBDAV_REQUEST_TIMEOUT, ENV_WEBDAV_TLS_ENABLED,
+        };
+        use rustfs_protocols::{WebDavConfig, WebDavServer};
+
+        // Check if WebDAV is enabled
+        let webdav_enable = rustfs_utils::get_env_bool(ENV_WEBDAV_ENABLE, false);
+        if !webdav_enable {
+            debug!("WebDAV system is disabled");
+            return Ok(None);
+        }
+
+        // Parse WebDAV address
+        let webdav_address_str = rustfs_utils::get_env_str(ENV_WEBDAV_ADDRESS, DEFAULT_WEBDAV_ADDRESS);
+        let addr = rustfs_utils::net::parse_and_resolve_address(&webdav_address_str)
+            .map_err(|e| format!("Invalid WebDAV address '{webdav_address_str}': {e}"))?;
+
+        // Get WebDAV configuration from environment variables
+        let tls_enabled = rustfs_utils::get_env_bool(ENV_WEBDAV_TLS_ENABLED, true);
+        let cert_dir = rustfs_utils::get_env_opt_str(ENV_WEBDAV_CERTS_DIR);
+        let ca_file = rustfs_utils::get_env_opt_str(ENV_WEBDAV_CA_FILE);
+        let max_body_size = rustfs_utils::get_env_u64(ENV_WEBDAV_MAX_BODY_SIZE, WebDavConfig::DEFAULT_MAX_BODY_SIZE);
+        let request_timeout_secs =
+            rustfs_utils::get_env_u64(ENV_WEBDAV_REQUEST_TIMEOUT, WebDavConfig::DEFAULT_REQUEST_TIMEOUT_SECS);
+
+        // Create WebDAV configuration
+        let config = WebDavConfig {
+            bind_addr: addr,
+            tls_enabled,
+            cert_dir,
+            ca_file,
+            max_body_size,
+            request_timeout_secs,
+        };
+
+        // Create WebDAV server with protocol storage client
+        let fs = crate::storage::ecfs::FS::new();
+        let storage_client = ProtocolStorageClient::new(fs);
+        let server: WebDavServer<crate::protocols::ProtocolStorageClient> = WebDavServer::new(config, storage_client).await?;
+
+        // Log server configuration
+        info!("WebDAV server configured on {}", server.config().bind_addr);
+
+        // Start WebDAV server in background task with proper shutdown support
+        let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
+
+        tokio::spawn(async move {
+            if let Err(e) = server.start(shutdown_rx).await {
+                error!("WebDAV server error: {}", e);
+            }
+            info!("WebDAV server shutdown completed");
+        });
+
+        info!("WebDAV system initialized successfully");
+        Ok(Some(shutdown_tx))
+    }
+}

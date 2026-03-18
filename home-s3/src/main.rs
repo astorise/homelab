@@ -15,6 +15,7 @@ use aws_sdk_s3::{
 use flexi_logger::{Age, Cleanup, Criterion, Duplicate, FileSpec, Logger, Naming};
 use log::{debug, error, info, warn, LevelFilter};
 use pin_project::pin_project;
+use rustfs::{CancellationToken as RustfsCancellationToken, Config as RustfsConfig};
 use serde::{Deserialize, Serialize};
 use std::ffi::{c_void, OsString};
 use std::fs as std_fs;
@@ -27,7 +28,7 @@ use std::sync::{
 };
 use std::task::{Context as TaskContext, Poll};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::fs;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
@@ -103,8 +104,8 @@ mod proto {
 
 use proto::homes3::v1::home_s3_server::{HomeS3, HomeS3Server};
 use proto::homes3::v1::{
-    Acknowledge, CreateBucketRequest, DeleteBucketRequest, Empty, ListBucketsResponse,
-    StatusResponse, UpdateBucketRequest,
+    Acknowledge, CreateBucketRequest, DeleteBucketRequest, Empty, ListBucketObjectsRequest,
+    ListBucketObjectsResponse, ListBucketsResponse, StatusResponse, UpdateBucketRequest,
 };
 
 const SERVICE_NAME: &str = "HomeS3Service";
@@ -118,7 +119,7 @@ const NAMED_PIPE_NAME: &str = r"\\.\pipe\home-s3";
 
 static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct ServiceConfig {
     #[serde(default = "default_endpoint")]
     endpoint: String,
@@ -130,6 +131,8 @@ struct ServiceConfig {
     secret_access_key: String,
     #[serde(default = "default_force_path_style")]
     force_path_style: bool,
+    #[serde(default = "default_data_dir")]
+    data_dir: String,
     #[serde(default)]
     log_level: Option<String>,
 }
@@ -142,14 +145,51 @@ impl Default for ServiceConfig {
             access_key_id: default_access_key_id(),
             secret_access_key: default_secret_access_key(),
             force_path_style: default_force_path_style(),
+            data_dir: default_data_dir(),
             log_level: Some(default_level_str().to_string()),
         }
     }
 }
 
+#[derive(Debug, Clone)]
+enum EmbeddedRustfsState {
+    Starting,
+    Running,
+    Stopping,
+    Stopped,
+    Error(String),
+}
+
+impl EmbeddedRustfsState {
+    fn as_status_str(&self) -> &'static str {
+        match self {
+            Self::Starting => "starting",
+            Self::Running => "running",
+            Self::Stopping => "stopping",
+            Self::Stopped => "stopped",
+            Self::Error(_) => "error",
+        }
+    }
+
+    fn error_message(&self) -> Option<&str> {
+        match self {
+            Self::Error(message) => Some(message),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Default)]
+struct EmbeddedRustfsRuntime {
+    state: Option<EmbeddedRustfsState>,
+    shutdown: Option<RustfsCancellationToken>,
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
 #[derive(Clone)]
 struct SharedState {
     cfg: Arc<Mutex<ServiceConfig>>,
+    embedded: Arc<Mutex<EmbeddedRustfsRuntime>>,
     stopping: Arc<AtomicBool>,
 }
 
@@ -167,6 +207,14 @@ fn logs_dir() -> PathBuf {
 
 fn config_path() -> PathBuf {
     program_data_dir().join("s3-config.json")
+}
+
+fn bucket_metadata_path() -> PathBuf {
+    program_data_dir().join("bucket-metadata.json")
+}
+
+fn default_data_dir() -> String {
+    program_data_dir().join("data").display().to_string()
 }
 
 fn default_endpoint() -> String {
@@ -251,7 +299,7 @@ fn endpoint_status(operation: &str, endpoint: &str, err: anyhow::Error) -> Statu
     let detail = format!("{err:#}");
     let message = if is_endpoint_unreachable(&detail) {
         format!(
-            "{operation} failed: the RustFS endpoint {endpoint} is unreachable. Start RustFS or update {}. details: {detail}",
+            "{operation} failed: the embedded RustFS instance bound to {endpoint} is unavailable. Check the home-s3 logs or update {}. details: {detail}",
             config_path().display()
         )
     } else {
@@ -294,6 +342,12 @@ fn ensure_layout() -> Result<()> {
     Ok(())
 }
 
+fn ensure_data_dir(path: &Path) -> Result<()> {
+    std_fs::create_dir_all(path)
+        .with_context(|| format!("create embedded RustFS data directory {}", path.display()))?;
+    Ok(())
+}
+
 fn load_config_or_init() -> Result<ServiceConfig> {
     ensure_layout()?;
     let path = config_path();
@@ -305,7 +359,56 @@ fn load_config_or_init() -> Result<ServiceConfig> {
     }
     let raw = std_fs::read_to_string(&path).context("read S3 config")?;
     let cfg: ServiceConfig = serde_json::from_str(&raw).context("parse S3 config")?;
+    ensure_data_dir(Path::new(&cfg.data_dir))?;
     Ok(cfg)
+}
+
+fn load_bucket_metadata() -> Result<std::collections::BTreeMap<String, String>> {
+    ensure_layout()?;
+    let path = bucket_metadata_path();
+    if !path.exists() {
+        return Ok(std::collections::BTreeMap::new());
+    }
+    let raw = std_fs::read_to_string(&path).context("read bucket metadata")?;
+    let metadata = serde_json::from_str(&raw).context("parse bucket metadata")?;
+    Ok(metadata)
+}
+
+fn save_bucket_metadata(metadata: &std::collections::BTreeMap<String, String>) -> Result<()> {
+    ensure_layout()?;
+    let path = bucket_metadata_path();
+    let json = serde_json::to_string_pretty(metadata)?;
+    std_fs::write(&path, format!("{json}\n")).context("write bucket metadata")?;
+    Ok(())
+}
+
+fn get_bucket_source_path(bucket: &str) -> Result<Option<String>> {
+    let metadata = load_bucket_metadata()?;
+    Ok(metadata.get(bucket).cloned())
+}
+
+fn set_bucket_source_path(bucket: &str, source_path: Option<&Path>) -> Result<()> {
+    let mut metadata = load_bucket_metadata()?;
+    match source_path {
+        Some(path) => {
+            metadata.insert(bucket.to_string(), path.display().to_string());
+        }
+        None => {
+            metadata.remove(bucket);
+        }
+    }
+    save_bucket_metadata(&metadata)
+}
+
+fn rename_bucket_source_path(current_bucket: &str, new_bucket: &str) -> Result<()> {
+    if current_bucket == new_bucket {
+        return Ok(());
+    }
+    let mut metadata = load_bucket_metadata()?;
+    if let Some(source_path) = metadata.remove(current_bucket) {
+        metadata.insert(new_bucket.to_string(), source_path);
+    }
+    save_bucket_metadata(&metadata)
 }
 
 fn init_logger(level: LevelFilter) -> Result<()> {
@@ -334,9 +437,183 @@ async fn current_config(shared: &SharedState) -> ServiceConfig {
 
 async fn reload_config(shared: &SharedState) -> Result<ServiceConfig> {
     let cfg = load_config_or_init()?;
-    let mut guard = shared.cfg.lock().await;
-    *guard = cfg.clone();
+    let active = current_config(shared).await;
+    if cfg != active {
+        warn!(
+            "home-s3 config file changed, but embedded RustFS uses the startup configuration until the service restarts"
+        );
+    }
     Ok(cfg)
+}
+
+async fn current_embedded_state(shared: &SharedState) -> EmbeddedRustfsState {
+    shared
+        .embedded
+        .lock()
+        .await
+        .state
+        .clone()
+        .unwrap_or(EmbeddedRustfsState::Stopped)
+}
+
+fn rustfs_address_from_endpoint(endpoint: &str) -> Result<String> {
+    let trimmed = endpoint.trim();
+    let without_scheme = trimmed
+        .strip_prefix("http://")
+        .or_else(|| trimmed.strip_prefix("https://"))
+        .unwrap_or(trimmed);
+    let without_path = without_scheme.trim_end_matches('/');
+    if without_path.is_empty() {
+        bail!("endpoint must not be empty");
+    }
+    if without_path.contains('/') || without_path.contains('?') || without_path.contains('#') {
+        bail!("endpoint must contain only scheme, host and port: {endpoint}");
+    }
+    if !without_path.contains(':') {
+        bail!("endpoint must include an explicit host and port: {endpoint}");
+    }
+    Ok(without_path.to_string())
+}
+
+fn build_embedded_rustfs_config(cfg: &ServiceConfig) -> Result<RustfsConfig> {
+    let data_dir = PathBuf::from(&cfg.data_dir);
+    ensure_data_dir(&data_dir)?;
+    Ok(RustfsConfig {
+        volumes: vec![data_dir.display().to_string()],
+        address: rustfs_address_from_endpoint(&cfg.endpoint)?,
+        server_domains: Vec::new(),
+        access_key: cfg.access_key_id.clone(),
+        secret_key: cfg.secret_access_key.clone(),
+        console_enable: false,
+        console_address: String::new(),
+        obs_endpoint: String::new(),
+        tls_path: None,
+        license: None,
+        region: Some(cfg.region.clone()),
+        kms_enable: false,
+        kms_backend: "local".to_string(),
+        kms_key_dir: None,
+        kms_vault_address: None,
+        kms_vault_token: None,
+        kms_default_key_id: None,
+        buffer_profile_disable: false,
+        buffer_profile: "GeneralPurpose".to_string(),
+    })
+}
+
+async fn wait_for_embedded_rustfs(shared: &SharedState, cfg: &ServiceConfig) -> Result<()> {
+    let client = make_s3_client(cfg).await?;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut last_error = None::<String>;
+
+    loop {
+        let state = current_embedded_state(shared).await;
+        if let Some(message) = state.error_message() {
+            bail!("embedded RustFS failed to start: {message}");
+        }
+
+        match client.list_buckets().send().await {
+            Ok(_) => return Ok(()),
+            Err(err) => {
+                last_error = Some(format!("{err:#}"));
+            }
+        }
+
+        if Instant::now() >= deadline {
+            let detail = last_error.unwrap_or_else(|| "no response received".to_string());
+            bail!(
+                "timed out waiting for embedded RustFS at {} to become ready: {detail}",
+                cfg.endpoint
+            );
+        }
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+async fn start_embedded_rustfs(shared: &SharedState) -> Result<()> {
+    let cfg = current_config(shared).await;
+    let rustfs_cfg = build_embedded_rustfs_config(&cfg)?;
+    let shutdown = RustfsCancellationToken::new();
+
+    {
+        let mut embedded = shared.embedded.lock().await;
+        if embedded.task.is_some() {
+            bail!("embedded RustFS is already running");
+        }
+        embedded.state = Some(EmbeddedRustfsState::Starting);
+        embedded.shutdown = Some(shutdown.clone());
+    }
+
+    let embedded_runtime = shared.embedded.clone();
+    let service_stopping = shared.stopping.clone();
+    let task = tokio::spawn(async move {
+        let result = rustfs::run_embedded(rustfs_cfg, shutdown.clone()).await;
+        let mut embedded = embedded_runtime.lock().await;
+        match result {
+            Ok(()) => {
+                if service_stopping.load(Ordering::SeqCst) {
+                    embedded.state = Some(EmbeddedRustfsState::Stopped);
+                } else if !matches!(embedded.state, Some(EmbeddedRustfsState::Error(_))) {
+                    embedded.state = Some(EmbeddedRustfsState::Stopped);
+                }
+            }
+            Err(err) => {
+                let message = format!("{err:#}");
+                error!("embedded RustFS stopped with an error: {message}");
+                embedded.state = Some(EmbeddedRustfsState::Error(message));
+            }
+        }
+        embedded.shutdown = None;
+    });
+
+    {
+        let mut embedded = shared.embedded.lock().await;
+        embedded.task = Some(task);
+    }
+
+    if let Err(err) = wait_for_embedded_rustfs(shared, &cfg).await {
+        let _ = stop_embedded_rustfs(shared).await;
+        return Err(err);
+    }
+
+    let mut embedded = shared.embedded.lock().await;
+    if !matches!(embedded.state, Some(EmbeddedRustfsState::Error(_))) {
+        embedded.state = Some(EmbeddedRustfsState::Running);
+    }
+
+    info!(
+        "embedded RustFS ready on {} with data directory {}",
+        cfg.endpoint, cfg.data_dir
+    );
+    Ok(())
+}
+
+async fn stop_embedded_rustfs(shared: &SharedState) -> Result<()> {
+    let task = {
+        let mut embedded = shared.embedded.lock().await;
+        if embedded.task.is_none() {
+            embedded.state = Some(EmbeddedRustfsState::Stopped);
+            embedded.shutdown = None;
+            return Ok(());
+        }
+        embedded.state = Some(EmbeddedRustfsState::Stopping);
+        if let Some(shutdown) = embedded.shutdown.take() {
+            shutdown.cancel();
+        }
+        embedded.task.take()
+    };
+
+    if let Some(task) = task {
+        if let Err(err) = task.await {
+            error!("failed to join embedded RustFS task: {err}");
+        }
+    }
+
+    let mut embedded = shared.embedded.lock().await;
+    embedded.state = Some(EmbeddedRustfsState::Stopped);
+    embedded.shutdown = None;
+    Ok(())
 }
 
 async fn make_s3_client(cfg: &ServiceConfig) -> Result<Client> {
@@ -545,7 +822,11 @@ async fn list_bucket_object_keys(client: &Client, bucket: &str) -> Result<Vec<St
     Ok(keys)
 }
 
-async fn copy_bucket_contents(client: &Client, source_bucket: &str, target_bucket: &str) -> Result<usize> {
+async fn copy_bucket_contents(
+    client: &Client,
+    source_bucket: &str,
+    target_bucket: &str,
+) -> Result<usize> {
     let keys = list_bucket_object_keys(client, source_bucket).await?;
     for key in &keys {
         let object = client
@@ -569,7 +850,9 @@ async fn copy_bucket_contents(client: &Client, source_bucket: &str, target_bucke
             .body(ByteStream::from(body))
             .send()
             .await
-            .with_context(|| format!("copy s3://{source_bucket}/{key} to s3://{target_bucket}/{key}"))?;
+            .with_context(|| {
+                format!("copy s3://{source_bucket}/{key} to s3://{target_bucket}/{key}")
+            })?;
     }
     Ok(keys.len())
 }
@@ -610,7 +893,8 @@ async fn update_bucket(
         if replace_objects {
             outcome.cleared_objects = empty_bucket(client, new_bucket).await?;
         } else {
-            outcome.copied_objects = copy_bucket_contents(client, current_bucket, new_bucket).await?;
+            outcome.copied_objects =
+                copy_bucket_contents(client, current_bucket, new_bucket).await?;
         }
 
         if let Some(path) = source_path {
@@ -689,11 +973,12 @@ impl HomeS3 for HomeS3GrpcService {
         _request: GrpcRequest<Empty>,
     ) -> Result<GrpcResponse<StatusResponse>, Status> {
         let cfg = current_config(&self.shared).await;
+        let embedded_state = current_embedded_state(&self.shared).await;
         let response = StatusResponse {
             state: if self.shared.stopping.load(Ordering::SeqCst) {
                 "stopping".to_string()
             } else {
-                "running".to_string()
+                embedded_state.as_status_str().to_string()
             },
             log_level: cfg
                 .log_level
@@ -716,7 +1001,10 @@ impl HomeS3 for HomeS3GrpcService {
             .map_err(|err| internal_status("reload configuration", err))?;
         Ok(GrpcResponse::new(Acknowledge {
             ok: true,
-            message: format!("configuration reloaded for endpoint {}", cfg.endpoint),
+            message: format!(
+                "configuration file validated for endpoint {}. Restart the service to apply embedded RustFS changes.",
+                cfg.endpoint
+            ),
         }))
     }
 
@@ -754,9 +1042,61 @@ impl HomeS3 for HomeS3GrpcService {
                     .creation_date()
                     .map(|value| format!("{value:?}"))
                     .unwrap_or_default(),
+                source_path: get_bucket_source_path(bucket.name().unwrap_or_default())
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default(),
             })
             .collect();
         Ok(GrpcResponse::new(ListBucketsResponse { buckets }))
+    }
+
+    async fn list_bucket_objects(
+        &self,
+        request: GrpcRequest<ListBucketObjectsRequest>,
+    ) -> Result<GrpcResponse<ListBucketObjectsResponse>, Status> {
+        let request = request.into_inner();
+        let bucket = request.bucket_name.trim().to_string();
+        validate_bucket_name(&bucket).map_err(|err| Status::invalid_argument(err.to_string()))?;
+
+        let cfg = current_config(&self.shared).await;
+        let client = make_s3_client(&cfg)
+            .await
+            .map_err(|err| internal_status("initialise S3 client", err))?;
+
+        let mut continuation_token = None::<String>;
+        let mut objects = Vec::new();
+
+        loop {
+            let mut list_request = client.list_objects_v2().bucket(&bucket);
+            if let Some(token) = &continuation_token {
+                list_request = list_request.continuation_token(token);
+            }
+
+            let output = list_request
+                .send()
+                .await
+                .with_context(|| format!("list objects in bucket {bucket} via {}", cfg.endpoint))
+                .map_err(|err| endpoint_status("list bucket objects", &cfg.endpoint, err))?;
+
+            objects.extend(output.contents().iter().map(|object| {
+                proto::homes3::v1::list_bucket_objects_response::ObjectEntry {
+                    key: object.key().unwrap_or_default().to_string(),
+                    size: object.size().unwrap_or_default(),
+                    last_modified: object
+                        .last_modified()
+                        .map(|value| format!("{value:?}"))
+                        .unwrap_or_default(),
+                }
+            }));
+
+            continuation_token = output.next_continuation_token().map(ToOwned::to_owned);
+            if continuation_token.is_none() {
+                break;
+            }
+        }
+
+        Ok(GrpcResponse::new(ListBucketObjectsResponse { objects }))
     }
 
     async fn create_bucket(
@@ -777,6 +1117,10 @@ impl HomeS3 for HomeS3GrpcService {
             create_bucket_and_import(&client, &bucket, source_path.as_deref())
                 .await
                 .map_err(|err| endpoint_status("create bucket", &cfg.endpoint, err))?;
+        if source_path.is_some() {
+            set_bucket_source_path(&bucket, source_path.as_deref())
+                .map_err(|err| internal_status("persist bucket metadata", err))?;
+        }
 
         let message = match (created, imported) {
             (true, 0) => format!("bucket {bucket} created"),
@@ -803,7 +1147,8 @@ impl HomeS3 for HomeS3GrpcService {
 
         validate_bucket_name(&current_bucket)
             .map_err(|err| Status::invalid_argument(err.to_string()))?;
-        validate_bucket_name(&new_bucket).map_err(|err| Status::invalid_argument(err.to_string()))?;
+        validate_bucket_name(&new_bucket)
+            .map_err(|err| Status::invalid_argument(err.to_string()))?;
         let source_path = normalize_source_path(&request.source_path)
             .map_err(|err| Status::invalid_argument(err.to_string()))?;
 
@@ -820,6 +1165,15 @@ impl HomeS3 for HomeS3GrpcService {
         )
         .await
         .map_err(|err| endpoint_status("update bucket", &cfg.endpoint, err))?;
+
+        if outcome.renamed {
+            rename_bucket_source_path(&current_bucket, &new_bucket)
+                .map_err(|err| internal_status("persist bucket metadata", err))?;
+        }
+        if let Some(source_path) = source_path.as_deref() {
+            set_bucket_source_path(&new_bucket, Some(source_path))
+                .map_err(|err| internal_status("persist bucket metadata", err))?;
+        }
 
         let action = if outcome.renamed {
             format!("bucket {current_bucket} updated to {new_bucket}")
@@ -866,6 +1220,8 @@ impl HomeS3 for HomeS3GrpcService {
         let deleted = delete_bucket(&client, &bucket, request.delete_objects)
             .await
             .map_err(|err| endpoint_status("delete bucket", &cfg.endpoint, err))?;
+        set_bucket_source_path(&bucket, None)
+            .map_err(|err| internal_status("persist bucket metadata", err))?;
         let message = if request.delete_objects {
             format!("bucket {bucket} deleted after removing {deleted} object(s)")
         } else {
@@ -916,10 +1272,12 @@ fn run_service() -> Result<()> {
 
     let shared = SharedState {
         cfg: Arc::new(Mutex::new(cfg)),
+        embedded: Arc::new(Mutex::new(EmbeddedRustfsRuntime::default())),
         stopping: Arc::new(AtomicBool::new(false)),
     };
 
     let rt = Runtime::new()?;
+    rt.block_on(start_embedded_rustfs(&shared))?;
     {
         let grpc_shared = shared.clone();
         rt.spawn(async move {
@@ -935,6 +1293,8 @@ fn run_service() -> Result<()> {
     }
 
     info!("home-s3 service stopping");
+    shared.stopping.store(true, Ordering::SeqCst);
+    rt.block_on(stop_embedded_rustfs(&shared))?;
     set_status(ServiceState::Stopped);
     Ok(())
 }
@@ -1056,10 +1416,12 @@ fn main() -> Result<()> {
             init_logger(level_from_cfg(&cfg))?;
             let shared = SharedState {
                 cfg: Arc::new(Mutex::new(cfg)),
+                embedded: Arc::new(Mutex::new(EmbeddedRustfsRuntime::default())),
                 stopping: Arc::new(AtomicBool::new(false)),
             };
             let rt = Runtime::new()?;
             rt.block_on(async move {
+                start_embedded_rustfs(&shared).await?;
                 let grpc_shared = shared.clone();
                 tokio::spawn(async move {
                     serve_grpc(grpc_shared).await;
@@ -1067,7 +1429,8 @@ fn main() -> Result<()> {
                 info!("home-s3 console mode running on {}", NAMED_PIPE_NAME);
                 let _ = tokio::signal::ctrl_c().await;
                 shared.stopping.store(true, Ordering::SeqCst);
-            });
+                stop_embedded_rustfs(&shared).await
+            })?;
             Ok(())
         }
         _ => {

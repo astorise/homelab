@@ -24,7 +24,8 @@ mod proto {
 
 use proto::homes3::v1::home_s3_client::HomeS3Client;
 use proto::homes3::v1::{
-    Acknowledge, CreateBucketRequest, DeleteBucketRequest, Empty, UpdateBucketRequest,
+    Acknowledge, CreateBucketRequest, DeleteBucketRequest, Empty, ListBucketObjectsRequest,
+    UpdateBucketRequest,
 };
 
 const PIPE_RELEASE: &str = r"\\.\pipe\home-s3";
@@ -242,11 +243,24 @@ pub struct StatusOut {
 pub struct BucketOut {
     pub name: String,
     pub created_at: String,
+    pub source_path: String,
 }
 
 #[derive(Serialize)]
 pub struct ListBucketsOut {
     pub buckets: Vec<BucketOut>,
+}
+
+#[derive(Serialize)]
+pub struct BucketObjectOut {
+    pub key: String,
+    pub size: i64,
+    pub last_modified: String,
+}
+
+#[derive(Serialize)]
+pub struct ListBucketObjectsOut {
+    pub objects: Vec<BucketObjectOut>,
 }
 
 impl From<Acknowledge> for AckOut {
@@ -314,9 +328,31 @@ pub async fn s3_list_buckets() -> Result<ListBucketsOut, String> {
         .map(|bucket| BucketOut {
             name: bucket.name,
             created_at: bucket.created_at,
+            source_path: bucket.source_path,
         })
         .collect();
     Ok(ListBucketsOut { buckets })
+}
+
+#[tauri::command]
+#[instrument(level = "debug")]
+pub async fn s3_list_bucket_objects(bucket_name: String) -> Result<ListBucketObjectsOut, String> {
+    let mut client = connect_client().await?;
+    let response = client
+        .list_bucket_objects(ListBucketObjectsRequest { bucket_name })
+        .await
+        .map_err(|err| err.to_string())?;
+    let list = response.into_inner();
+    let objects = list
+        .objects
+        .into_iter()
+        .map(|object| BucketObjectOut {
+            key: object.key,
+            size: object.size,
+            last_modified: object.last_modified,
+        })
+        .collect();
+    Ok(ListBucketObjectsOut { objects })
 }
 
 #[tauri::command]
