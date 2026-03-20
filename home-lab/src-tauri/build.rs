@@ -91,8 +91,8 @@ fn main() {
     }
 
     // Prefer local files from src-tauri/bin only when explicitly allowed.
-    // In CI we default to OFF to avoid overriding freshly downloaded artifacts.
-    let is_ci = std::env::var_os("CI").is_some();
+    // Default to OFF everywhere so stale developer binaries never override
+    // freshly built service executables copied into resources/bin.
     let local_override = std::env::var("HOME_LAB_PREFER_LOCAL_BIN")
         .ok()
         .map(|v| {
@@ -101,10 +101,10 @@ fn main() {
                 "1" | "true" | "yes" | "on"
             )
         })
-        .unwrap_or(!is_ci);
+        .unwrap_or(false);
     if !local_override {
         println!(
-            "cargo:warning=Skipping src-tauri/bin override (CI-safe mode). Set HOME_LAB_PREFER_LOCAL_BIN=1 to enable."
+            "cargo:warning=Skipping src-tauri/bin override. Set HOME_LAB_PREFER_LOCAL_BIN=1 to enable."
         );
     }
 
