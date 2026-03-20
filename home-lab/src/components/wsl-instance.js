@@ -1,4 +1,9 @@
-import { wsl_import_instance, wsl_list_instances, wsl_remove_instance } from '../tauri.js';
+import {
+  wsl_get_host_capabilities,
+  wsl_import_instance,
+  wsl_list_instances,
+  wsl_remove_instance,
+} from '../tauri.js';
 import { showError } from './toast.js';
 import { dispatchUiRefresh } from '../ui-refresh.js';
 
@@ -18,11 +23,14 @@ class WslInstanceManager extends HTMLElement {
     this._message = '';
     this._instances = [];
     this._loadingInstances = false;
+    this._hostCapabilities = { nvidia_available: false, nvidia_gpu_names: [] };
+    this._loadingHostCapabilities = false;
   }
 
   connectedCallback() {
     this.render();
     this.loadInstances();
+    this.loadHostCapabilities();
   }
 
   setMessage(state, message = '') {
@@ -60,6 +68,36 @@ class WslInstanceManager extends HTMLElement {
       this._loadingInstances = false;
       this.render();
     }
+  }
+
+  async loadHostCapabilities() {
+    this._loadingHostCapabilities = true;
+    this.render();
+    try {
+      const data = await wsl_get_host_capabilities();
+      this._hostCapabilities = data && typeof data === 'object'
+        ? data
+        : { nvidia_available: false, nvidia_gpu_names: [] };
+      return true;
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.warn('[WslInstanceManager] Detection capacites hote indisponible', err);
+      this._hostCapabilities = { nvidia_available: false, nvidia_gpu_names: [] };
+      return false;
+    } finally {
+      this._loadingHostCapabilities = false;
+      this.render();
+    }
+  }
+
+  hasHostNvidia() {
+    return !!this._hostCapabilities?.nvidia_available;
+  }
+
+  getHostNvidiaNames() {
+    return Array.isArray(this._hostCapabilities?.nvidia_gpu_names)
+      ? this._hostCapabilities.nvidia_gpu_names.filter((name) => String(name || '').trim().length > 0)
+      : [];
   }
 
   renderClusterDetails(cluster) {
@@ -151,14 +189,20 @@ class WslInstanceManager extends HTMLElement {
   render() {
     const busyAction = this._busyAction;
     const loading = this._loadingInstances;
+    const loadingHostCapabilities = this._loadingHostCapabilities;
     const isBusy = Boolean(busyAction);
     const deletingName = busyAction && busyAction.startsWith('delete:') ? busyAction.slice(7) : null;
-    const disableRefresh = isBusy || loading;
+    const disableRefresh = isBusy || loading || loadingHostCapabilities;
+    const disableActions = isBusy || loadingHostCapabilities;
     const refreshLabel = loading
       ? busyAction === 'refresh'
         ? 'Actualisation…'
         : 'Chargement…'
       : 'Actualiser la liste';
+    const hostNvidiaNames = this.getHostNvidiaNames();
+    const nvidiaHint = this.hasHostNvidia()
+      ? `<p class="text-xs text-amber-700 mb-3">GPU Nvidia detecte sur l'hote${hostNvidiaNames.length ? ` : ${escapeHtml(hostNvidiaNames.join(', '))}.` : '.'} Une option d'activation sera proposee pendant l'import.</p>`
+      : '';
     const message = this._message
       ? `<p class="mt-3 text-sm whitespace-pre-wrap ${
           this._messageState === 'error'
@@ -222,7 +266,7 @@ class WslInstanceManager extends HTMLElement {
             type="button"
             data-action="import"
             class="px-3 py-2 rounded bg-blue-600 text-white text-sm font-medium disabled:opacity-50 disabled:cursor-not-allowed"
-            ${isBusy ? 'disabled' : ''}
+            ${disableActions ? 'disabled' : ''}
           >
             ${busyAction === 'import' ? 'Import en cours…' : 'Ajouter une instance'}
           </button>
@@ -230,7 +274,7 @@ class WslInstanceManager extends HTMLElement {
             type="button"
             data-action="force"
             class="px-3 py-2 rounded border border-gray-400 text-sm font-medium text-gray-700 bg-white hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed"
-            ${isBusy ? 'disabled' : ''}
+            ${disableActions ? 'disabled' : ''}
           >
             ${busyAction === 'force' ? 'Réimport en cours…' : 'Réimporter (forcer)'}
           </button>
@@ -243,6 +287,7 @@ class WslInstanceManager extends HTMLElement {
             ${refreshLabel}
           </button>
         </div>
+        ${nvidiaHint}
         ${instancesContent}
         ${message}
       </div>
@@ -348,13 +393,32 @@ class WslInstanceManager extends HTMLElement {
     return trimmed;
   }
 
+  requestImportOptions(force) {
+    const name = this.requestInstanceName(force);
+    if (!name) {
+      return null;
+    }
+
+    let enableNvidia = false;
+    if (this.hasHostNvidia() && typeof window !== 'undefined' && typeof window.confirm === 'function') {
+      const names = this.getHostNvidiaNames();
+      const gpuLabel = names.length ? ` (${names.join(', ')})` : '';
+      enableNvidia = window.confirm(
+        `GPU Nvidia detecte sur l'hote${gpuLabel}.\n\nOK : activer le runtime Nvidia pour cette instance WSL.\nAnnuler : laisser l'option desactivee.`,
+      );
+    }
+
+    return { name, enableNvidia };
+  }
+
   async runImport(force) {
     if (this._busyAction) return;
 
-    const name = this.requestInstanceName(force);
-    if (!name) {
+    const importOptions = this.requestImportOptions(force);
+    if (!importOptions) {
       return;
     }
+    const { name, enableNvidia } = importOptions;
 
     this.setBusy(
       force ? 'force' : 'import',
@@ -362,8 +426,8 @@ class WslInstanceManager extends HTMLElement {
     );
     try {
       // eslint-disable-next-line no-console
-      console.info('[WslInstanceManager] Import WSL demande', { force, name });
-      const result = await wsl_import_instance({ force, name });
+      console.info('[WslInstanceManager] Import WSL demande', { force, name, enableNvidia });
+      const result = await wsl_import_instance({ force, name, enable_nvidia: enableNvidia });
       // eslint-disable-next-line no-console
       console.info('[WslInstanceManager] Import WSL termine', result);
       if (!result?.ok) {

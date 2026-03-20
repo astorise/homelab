@@ -38,8 +38,11 @@ K3S_KUBE_SCHEDULER_SECURE_PORT=${K3S_KUBE_SCHEDULER_SECURE_PORT:-}
 K3S_INGRESS_HTTP_PORT=${K3S_INGRESS_HTTP_PORT:-}
 K3S_INGRESS_HTTPS_PORT=${K3S_INGRESS_HTTPS_PORT:-}
 K3S_GIT_SSH_PORT=${K3S_GIT_SSH_PORT:-}
+ENABLE_NVIDIA_TOOLKIT=${ENABLE_NVIDIA_TOOLKIT:-0}
 K3S_RUNTIME_BIN_DIR=${K3S_RUNTIME_BIN_DIR:-/var/lib/rancher/k3s/data/current/bin}
 K3S_RUNTIME_AUX_BIN_DIR=${K3S_RUNTIME_AUX_BIN_DIR:-$K3S_RUNTIME_BIN_DIR/aux}
+NVIDIA_CONTAINERD_TEMPLATE_SOURCE=${NVIDIA_CONTAINERD_TEMPLATE_SOURCE:-/usr/share/home-lab/nvidia/config-v3.toml.tmpl}
+NVIDIA_CONTAINERD_TEMPLATE_TARGET=${NVIDIA_CONTAINERD_TEMPLATE_TARGET:-/var/lib/rancher/k3s/agent/etc/containerd/config-v3.toml.tmpl}
 CONTAINERD_STREAM_PATCH_PID=
 
 log_info "Role: $ROLE"
@@ -50,6 +53,9 @@ if [ -n "$K3S_LB_SERVER_PORT" ]; then
 fi
 if [ -n "$K3S_INGRESS_HTTP_PORT" ] || [ -n "$K3S_INGRESS_HTTPS_PORT" ] || [ -n "$K3S_GIT_SSH_PORT" ]; then
     log_info "Ingress port plan: http=$K3S_INGRESS_HTTP_PORT https=$K3S_INGRESS_HTTPS_PORT git-ssh=$K3S_GIT_SSH_PORT"
+fi
+if [ "$ENABLE_NVIDIA_TOOLKIT" = "1" ]; then
+    log_info "NVIDIA runtime requested for this instance."
 fi
 
 LOCK_HELD=0
@@ -287,7 +293,49 @@ ensure_k3s_runtime_path() {
     export PATH
 }
 
+remove_nvidia_containerd_templates() {
+    rm -f /var/lib/rancher/k3s/agent/etc/containerd/config-v3.toml.tmpl
+    rm -f /var/lib/rancher/k3s/agent/etc/containerd/config.toml.tmpl
+}
+
+ensure_nvidia_toolkit() {
+    if [ "$ENABLE_NVIDIA_TOOLKIT" != "1" ]; then
+        remove_nvidia_containerd_templates
+        return 0
+    fi
+
+    if [ ! -x /usr/local/bin/nvidia-container-runtime ]; then
+        log_error "NVIDIA runtime requested but /usr/local/bin/nvidia-container-runtime is missing."
+        return 0
+    fi
+
+    if [ ! -f "$NVIDIA_CONTAINERD_TEMPLATE_SOURCE" ]; then
+        log_error "NVIDIA runtime requested but template source is missing: $NVIDIA_CONTAINERD_TEMPLATE_SOURCE"
+        return 0
+    fi
+
+    mkdir -p "$(dirname "$NVIDIA_CONTAINERD_TEMPLATE_TARGET")"
+    if [ ! -f "$NVIDIA_CONTAINERD_TEMPLATE_TARGET" ] || ! cmp -s "$NVIDIA_CONTAINERD_TEMPLATE_SOURCE" "$NVIDIA_CONTAINERD_TEMPLATE_TARGET"; then
+        cp "$NVIDIA_CONTAINERD_TEMPLATE_SOURCE" "$NVIDIA_CONTAINERD_TEMPLATE_TARGET"
+    fi
+
+    if [ -d /usr/lib/wsl/lib ]; then
+        case ":$PATH:" in
+            *":/usr/lib/wsl/lib:"*) ;;
+            *) PATH="/usr/lib/wsl/lib:$PATH" ;;
+        esac
+        export PATH
+    fi
+
+    if [ -x /usr/local/bin/nvidia-smi ]; then
+        /usr/local/bin/nvidia-smi >/dev/null 2>&1 || true
+    fi
+
+    log_info "NVIDIA container runtime prepared for k3s/containerd."
+}
+
 run_k3s_server() {
+    ensure_nvidia_toolkit
     start_containerd_stream_patch_watcher
     ensure_k3s_runtime_path
     set -- /usr/local/bin/k3s server --https-listen-port "$API_PORT"

@@ -5,7 +5,8 @@ param(
     [string]$Rootfs     = '',
     [int]$ApiPort       = 0,
     [int]$NodePortSpan  = 57,
-    [switch]$ForceImport
+    [switch]$ForceImport,
+    [switch]$EnableNvidia
 )
 
 Set-StrictMode -Version Latest
@@ -354,7 +355,8 @@ function Configure-K3sEnv {
         [int]$ApiPort,
         [int]$NodePortSpan,
         [int]$StreamPort,
-        [psobject]$LocalPorts
+        [psobject]$LocalPorts,
+        [switch]$EnableNvidia
     )
 
     if ($ApiPort -lt 1 -or $ApiPort -gt 65535) {
@@ -386,6 +388,10 @@ K3S_INGRESS_HTTPS_PORT=$($ingressPorts.HttpsPort)
 K3S_GIT_SSH_PORT=$sshPort
 K3S_TLS_SANS=$tlsSans
 "@.Replace("`r`n", "`n").Replace("`r", "`n")
+
+    if ($EnableNvidia.IsPresent) {
+        $content += "ENABLE_NVIDIA_TOOLKIT=1`n"
+    }
 
     $uncPath = "\\wsl$\$Distro\etc\k3s-env"
     $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
@@ -620,6 +626,7 @@ try {
     Write-Info "  - Rootfs      = $Rootfs"
     Write-Info "  - ApiPort     = $ApiPort"
     Write-Info "  - NodePortSpan= $NodePortSpan"
+    Write-Info "  - EnableNvidia= $($EnableNvidia.IsPresent)"
     $streamPort = Get-ContainerdStreamPortForInstance -Name $DistroName
     $localPorts = Get-K3sLocalPortLayoutForInstance -Name $DistroName
     Write-Info "  - StreamPort  = $streamPort"
@@ -649,7 +656,7 @@ try {
     }
 
     Install-K3sInitScript -Distro $DistroName
-    Configure-K3sEnv -Distro $DistroName -ApiPort $ApiPort -NodePortSpan $NodePortSpan -StreamPort $streamPort -LocalPorts $localPorts
+    Configure-K3sEnv -Distro $DistroName -ApiPort $ApiPort -NodePortSpan $NodePortSpan -StreamPort $streamPort -LocalPorts $localPorts -EnableNvidia:$EnableNvidia
     Configure-K3sAutostart -Distro $DistroName
     Clear-K3sLocks -Distro $DistroName
     Invoke-K3sBootstrap -Distro $DistroName

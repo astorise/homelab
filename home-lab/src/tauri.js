@@ -118,6 +118,10 @@ const __MOCK = {
     ],
   },
   wsl: {
+    host_capabilities: {
+      nvidia_available: false,
+      nvidia_gpu_names: [],
+    },
     instances: [
       { name: 'home-lab', state: 'Running', version: '2', is_default: false },
       { name: 'Ubuntu-22.04', state: 'Stopped', version: '2', is_default: false },
@@ -390,6 +394,7 @@ async function mockInvoke(cmd, args = {}) {
 
     case 'wsl_import_instance': {
       const rawName = typeof args?.name === 'string' ? args.name.trim() : 'home-lab-k3s';
+      const enableNvidia = !!(args?.enable_nvidia ?? args?.enableNvidia);
       if (!rawName) {
         return { ok: false, message: "Nom d'instance invalide (mock)." };
       }
@@ -407,6 +412,7 @@ async function mockInvoke(cmd, args = {}) {
         state: 'Stopped',
         version: '2',
         is_default: false,
+        nvidia_enabled: enableNvidia,
       };
 
       if (existsIndex === -1) {
@@ -418,9 +424,13 @@ async function mockInvoke(cmd, args = {}) {
       return {
         ok: true,
         message: args?.force
-          ? `Instance ${rawName} réimportée (mock).`
-          : `Instance ${rawName} importée (mock).`,
+          ? `Instance ${rawName} réimportée (mock).${enableNvidia ? ' Nvidia active.' : ''}`
+          : `Instance ${rawName} importée (mock).${enableNvidia ? ' Nvidia active.' : ''}`,
       };
+    }
+
+    case 'wsl_get_host_capabilities': {
+      return { ...__MOCK.wsl.host_capabilities };
     }
 
     case 'wsl_list_instances': {
@@ -863,12 +873,23 @@ export async function wsl_import_instance(options = {}) {
       throw new Error("Le nom de l'instance WSL est requis.");
     }
   }
+  if (payload.enableNvidia !== undefined && payload.enable_nvidia === undefined) {
+    payload.enable_nvidia = !!payload.enableNvidia;
+  }
+  if (payload.enable_nvidia !== undefined) {
+    payload.enable_nvidia = !!payload.enable_nvidia;
+  }
+  delete payload.enableNvidia;
   // eslint-disable-next-line no-console
   console.info('[tauri.js] wsl_import_instance invoked', payload);
   const result = await safeInvoke('wsl_import_instance', payload);
   // eslint-disable-next-line no-console
   console.info('[tauri.js] wsl_import_instance result', result);
   return result;
+}
+
+export async function wsl_get_host_capabilities() {
+  return safeInvoke('wsl_get_host_capabilities');
 }
 
 export async function wsl_list_instances() {

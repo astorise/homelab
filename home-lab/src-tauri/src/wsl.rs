@@ -225,6 +225,12 @@ pub struct WslClusterStatus {
     oidc: ClusterOidcInfo,
 }
 
+#[derive(Serialize, Clone, Debug, Default)]
+pub struct WslHostCapabilities {
+    nvidia_available: bool,
+    nvidia_gpu_names: Vec<String>,
+}
+
 const DEFAULT_DOMAIN_TEMPLATE: &str = "{name}.wsl";
 const ENV_DOMAIN_TEMPLATES: &str = "HOME_LAB_WSL_DOMAIN_TEMPLATES";
 const DEFAULT_DNS_TARGET: &str = "127.0.0.1";
@@ -1788,6 +1794,82 @@ fn render_k3s_env_file_for_instance(instance: &str) -> Result<String> {
     ))
 }
 
+fn render_k3s_env_rewrite_script(env_file: &str) -> String {
+    format!(
+        r#"PRESERVE_ENABLE_NVIDIA_TOOLKIT=0
+if [ -f /etc/k3s-env ]; then
+    . /etc/k3s-env || true
+    PRESERVE_ENABLE_NVIDIA_TOOLKIT=${{ENABLE_NVIDIA_TOOLKIT:-0}}
+fi
+cat > /etc/k3s-env <<'EOF'
+{env_file}EOF
+if [ "$PRESERVE_ENABLE_NVIDIA_TOOLKIT" = "1" ]; then
+    printf '%s\n' 'ENABLE_NVIDIA_TOOLKIT=1' >> /etc/k3s-env
+fi
+"#
+    )
+}
+
+fn detect_host_nvidia_gpu_names() -> Result<Vec<String>> {
+    let detection_script = r#"
+$ErrorActionPreference = 'Stop'
+$gpus = @(
+    Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue |
+        Where-Object {
+            ($_.Name -match 'NVIDIA') -or
+            ($_.AdapterCompatibility -match 'NVIDIA') -or
+            ($_.PNPDeviceID -match 'VEN_10DE')
+        } |
+        ForEach-Object { $_.Name } |
+        Sort-Object -Unique
+)
+if ($gpus.Count -eq 0) {
+    Write-Output '[]'
+} else {
+    $gpus | ConvertTo-Json -Compress
+}
+"#;
+
+    let output = Command::new("powershell.exe")
+        .arg("-NoProfile")
+        .arg("-Command")
+        .arg(detection_script)
+        .stdin(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .context("Impossible d'executer la detection GPU Nvidia")?;
+
+    let stdout = decode_cli_output(&output.stdout);
+    let stderr = decode_cli_output(&output.stderr);
+    let stdout_trim = stdout.trim();
+    let stderr_trim = stderr.trim();
+
+    if !output.status.success() {
+        let message = if !stderr_trim.is_empty() {
+            stderr_trim.to_string()
+        } else if !stdout_trim.is_empty() {
+            stdout_trim.to_string()
+        } else {
+            "Detection GPU Nvidia echouee".to_string()
+        };
+        anyhow::bail!(message);
+    }
+
+    if stdout_trim.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let parsed = serde_json::from_str::<Vec<String>>(stdout_trim)
+        .or_else(|_| serde_json::from_str::<String>(stdout_trim).map(|value| vec![value]))
+        .with_context(|| format!("Impossible d'analyser la sortie GPU Nvidia: {stdout_trim}"))?;
+
+    Ok(parsed
+        .into_iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect())
+}
+
 fn render_k3s_config_yaml_for_instance(instance: &str) -> String {
     let plan = instance_port_plan(instance);
     let mut config = format!(
@@ -1813,6 +1895,7 @@ fn repair_k3s_runtime_for_instance(instance: &str) -> Result<()> {
         .replace("\r\n", "\n")
         .replace('\r', "\n");
     let env_file = render_k3s_env_file_for_instance(instance)?;
+    let rewrite_env_script = render_k3s_env_rewrite_script(&env_file);
     let k3s_config_yaml = render_k3s_config_yaml_for_instance(instance);
     let script = format!(
         r#"set -eu
@@ -1821,8 +1904,7 @@ cat > /usr/local/bin/k3s-init.sh <<'__HOME_LAB_K3S_INIT_EOF__'
 {k3s_init_script}
 __HOME_LAB_K3S_INIT_EOF__
 chmod +x /usr/local/bin/k3s-init.sh
-cat > /etc/k3s-env <<'EOF'
-{env_file}EOF
+{rewrite_env_script}
 mkdir -p /etc/local.d
 cat > /etc/wsl.conf <<'EOF'
 [boot]
@@ -1953,7 +2035,8 @@ fn instance_has_running_k3s_server(instance: &str) -> Result<bool> {
 async fn enforce_instance_api_port_range(instance: &str, _api_port: u16) -> Result<()> {
     let instance_owned = instance.to_string();
     let env_file = render_k3s_env_file_for_instance(instance)?;
-    let script = format!("set -eu; cat > /etc/k3s-env <<'EOF'\n{env_file}EOF");
+    let rewrite_env_script = render_k3s_env_rewrite_script(&env_file);
+    let script = format!("set -eu\n{rewrite_env_script}");
     let command_line = format_cli_command("wsl.exe", &["-d", instance, "--", "sh", "-c", &script]);
 
     let output = tauri::async_runtime::spawn_blocking(move || {
@@ -2339,8 +2422,10 @@ async fn wsl_import_instance_with_paths(
     paths: WslExecutionPaths,
     force: Option<bool>,
     name: Option<String>,
+    enable_nvidia: Option<bool>,
 ) -> Result<ProvisionResult, String> {
     let force_import = force.unwrap_or(false);
+    let enable_nvidia = enable_nvidia.unwrap_or(false);
     let provided_name = name.unwrap_or_else(|| "home-lab-k3s".to_string());
     let sanitized_name = sanitize_wsl_instance_name(&provided_name).map_err(|e| {
         error!(target: "wsl", error = %e, "Nom d'instance WSL invalide");
@@ -2351,19 +2436,20 @@ async fn wsl_import_instance_with_paths(
     let instance_name = sanitized_name.clone();
 
     log_wsl_event(format!(
-        "Demande d'import WSL (force={}, instance={})",
-        force_import, sanitized_debug
+        "Demande d'import WSL (force={}, instance={}, enable_nvidia={})",
+        force_import, sanitized_debug, enable_nvidia
     ));
     info!(
         target: "wsl",
         force = force_import,
+        enable_nvidia,
         instance = %sanitized_name,
         instance_debug = %sanitized_debug,
         "Demande d'import WSL recue"
     );
 
     let setup_result = tauri::async_runtime::spawn_blocking(move || {
-        run_wsl_setup_with_paths(&setup_paths, force_import, &instance_name)
+        run_wsl_setup_with_paths(&setup_paths, force_import, &instance_name, enable_nvidia)
     })
     .await
     .map_err(|e| {
@@ -2636,29 +2722,32 @@ pub async fn wsl_import_instance(
     app: AppHandle,
     force: Option<bool>,
     name: Option<String>,
+    enable_nvidia: Option<bool>,
 ) -> Result<ProvisionResult, String> {
     let paths = wsl_execution_paths_from_app(&app).map_err(|e| {
         error!(target: "wsl", error = %e, "Impossible de determiner les chemins WSL");
         e.to_string()
     })?;
-    wsl_import_instance_with_paths(paths, force, name).await
+    wsl_import_instance_with_paths(paths, force, name, enable_nvidia).await
 }
 
 pub async fn wsl_import_instance_headless(
     force: Option<bool>,
     name: Option<String>,
+    enable_nvidia: Option<bool>,
 ) -> Result<ProvisionResult, String> {
     let paths = wsl_execution_paths_headless().map_err(|e| {
         error!(target: "wsl", error = %e, "Impossible de determiner les chemins WSL headless");
         e.to_string()
     })?;
-    wsl_import_instance_with_paths(paths, force, name).await
+    wsl_import_instance_with_paths(paths, force, name, enable_nvidia).await
 }
 
 fn run_wsl_setup_with_paths(
     paths: &WslExecutionPaths,
     force_import: bool,
     instance_name: &str,
+    enable_nvidia: bool,
 ) -> Result<ProvisionResult> {
     let script_path = paths.resource_root.join("setup-wsl.ps1");
     if !script_path.exists() {
@@ -2685,6 +2774,7 @@ fn run_wsl_setup_with_paths(
         rootfs = %rootfs_path.display(),
         install = %install_dir.display(),
         force = force_import,
+        enable_nvidia,
         instance = %instance_name,
         instance_debug = %instance_debug,
         api_port,
@@ -2692,9 +2782,10 @@ fn run_wsl_setup_with_paths(
         "Lancement de setup-wsl.ps1"
     );
     log_wsl_event(format!(
-        "Lancement de setup-wsl.ps1 (force={}, instance={}, script={}, rootfs={}, install={}, api_port={} nodeport_end={})",
+        "Lancement de setup-wsl.ps1 (force={}, instance={}, enable_nvidia={}, script={}, rootfs={}, install={}, api_port={} nodeport_end={})",
         force_import,
         instance_debug,
+        enable_nvidia,
         script_path.display(),
         rootfs_path.display(),
         install_dir.display(),
@@ -2721,6 +2812,9 @@ fn run_wsl_setup_with_paths(
     if force_import {
         command.arg("-ForceImport");
     }
+    if enable_nvidia {
+        command.arg("-EnableNvidia");
+    }
 
     let mut command_preview = format!(
         "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"{}\" -InstallDir \"{}\" -Rootfs \"{}\" -DistroName \"{}\" -ApiPort {}",
@@ -2732,6 +2826,9 @@ fn run_wsl_setup_with_paths(
     );
     if force_import {
         command_preview.push_str(" -ForceImport");
+    }
+    if enable_nvidia {
+        command_preview.push_str(" -EnableNvidia");
     }
 
     info!(
@@ -3153,6 +3250,56 @@ pub async fn wsl_list_instances() -> Result<Vec<WslInstance>, String> {
     }
 
     Ok(instances)
+}
+
+#[tauri::command]
+pub async fn wsl_get_host_capabilities() -> Result<WslHostCapabilities, String> {
+    info!(target: "wsl", "Detection des capacites GPU de l'hote demandee");
+    log_wsl_event("Detection des capacites GPU de l'hote demandee");
+
+    let nvidia_gpu_names = tauri::async_runtime::spawn_blocking(detect_host_nvidia_gpu_names)
+        .await
+        .map_err(|e| format!("Erreur interne detection GPU Nvidia: {e}"));
+
+    match nvidia_gpu_names {
+        Ok(Ok(names)) => {
+            let capabilities = WslHostCapabilities {
+                nvidia_available: !names.is_empty(),
+                nvidia_gpu_names: names,
+            };
+            info!(
+                target: "wsl",
+                nvidia_available = capabilities.nvidia_available,
+                nvidia_gpu_count = capabilities.nvidia_gpu_names.len(),
+                "Detection des capacites GPU de l'hote terminee"
+            );
+            Ok(capabilities)
+        }
+        Ok(Err(err)) => {
+            warn!(
+                target: "wsl",
+                error = %err,
+                "Detection GPU Nvidia indisponible, retour des capacites par defaut"
+            );
+            log_wsl_event(format!(
+                "Detection GPU Nvidia indisponible, retour par defaut: {}",
+                escape_for_log(&err.to_string())
+            ));
+            Ok(WslHostCapabilities::default())
+        }
+        Err(err) => {
+            warn!(
+                target: "wsl",
+                error = %err,
+                "JoinHandle detection GPU Nvidia en echec, retour des capacites par defaut"
+            );
+            log_wsl_event(format!(
+                "JoinHandle detection GPU Nvidia en echec, retour par defaut: {}",
+                escape_for_log(&err.to_string())
+            ));
+            Ok(WslHostCapabilities::default())
+        }
+    }
 }
 
 #[tauri::command]
@@ -5388,6 +5535,7 @@ async fn sync_home_lab_k3s_runtime_files(instance: &str, trace_id: &str) -> Resu
         .replace("\r\n", "\n")
         .replace('\r', "\n");
     let env_file = render_k3s_env_file_for_instance(instance)?;
+    let rewrite_env_script = render_k3s_env_rewrite_script(&env_file);
     let script = format!(
         r#"set -eu
 mkdir -p /usr/local/bin /etc/local.d
@@ -5395,8 +5543,7 @@ cat > /usr/local/bin/k3s-init.sh <<'__HOME_LAB_K3S_INIT_EOF__'
 {k3s_init_script}
 __HOME_LAB_K3S_INIT_EOF__
 chmod +x /usr/local/bin/k3s-init.sh
-cat > /etc/k3s-env <<'EOF'
-{env_file}EOF
+{rewrite_env_script}
 cat > /etc/wsl.conf <<'EOF'
 [boot]
 command="sh /usr/local/bin/k3s-init.sh"

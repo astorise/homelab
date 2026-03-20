@@ -4,8 +4,7 @@ use anyhow::Result;
 use home_lab_lib::{
     dns, http,
     oidc::{self, RegisterClientIn},
-    s3,
-    wsl,
+    s3, wsl,
 };
 use rmcp::schemars;
 use rmcp::{
@@ -26,6 +25,8 @@ struct WslImportRequest {
     force: Option<bool>,
     #[serde(default)]
     name: Option<String>,
+    #[serde(default)]
+    enable_nvidia: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -169,6 +170,14 @@ impl HomeLabMcpServer {
     }
 
     #[tool(
+        name = "wsl_get_host_capabilities",
+        description = "Detect host-side WSL capabilities such as Nvidia GPU availability."
+    )]
+    async fn wsl_get_host_capabilities(&self) -> Result<CallToolResult, McpError> {
+        json_tool_result(wsl::wsl_get_host_capabilities().await)
+    }
+
+    #[tool(
         name = "wsl_import_instance",
         description = "Provision a Home Lab WSL instance and bootstrap k3s, DNS, HTTP routing, OIDC and kubeconfig sync."
     )]
@@ -176,7 +185,10 @@ impl HomeLabMcpServer {
         &self,
         Parameters(request): Parameters<WslImportRequest>,
     ) -> Result<CallToolResult, McpError> {
-        json_tool_result(wsl::wsl_import_instance_headless(request.force, request.name).await)
+        json_tool_result(
+            wsl::wsl_import_instance_headless(request.force, request.name, request.enable_nvidia)
+                .await,
+        )
     }
 
     #[tool(
@@ -376,11 +388,8 @@ impl HomeLabMcpServer {
         Parameters(request): Parameters<S3DeleteBucketRequest>,
     ) -> Result<CallToolResult, McpError> {
         json_tool_result(
-            s3::s3_delete_bucket(
-                request.bucket_name,
-                request.delete_objects.unwrap_or(false),
-            )
-            .await,
+            s3::s3_delete_bucket(request.bucket_name, request.delete_objects.unwrap_or(false))
+                .await,
         )
     }
 

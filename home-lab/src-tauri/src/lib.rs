@@ -266,6 +266,7 @@ pub fn run() {
             oidc::oidc_register_client,
             oidc::oidc_remove_client,
             wsl::wsl_import_instance,
+            wsl::wsl_get_host_capabilities,
             wsl::wsl_list_instances,
             wsl::wsl_sync_windows_kubeconfig,
             wsl::wsl_remove_instance,
