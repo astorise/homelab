@@ -33,6 +33,10 @@ function useMock() {
 
 // --- Mock helpers (navigateur) ---
 const delay = (ms) => new Promise((r) => setTimeout(r, ms));
+const mockDefaultS3SourcePath = (bucketName) => `C:\\ProgramData\\home-s3\\sources\\${bucketName}`;
+const isMockDefaultS3SourcePath = (bucketName, sourcePath) => (
+  sourcePath === mockDefaultS3SourcePath(bucketName)
+);
 
 const __MOCK = {
   dns: {
@@ -228,7 +232,8 @@ async function mockInvoke(cmd, args = {}) {
     }
     case 's3_create_bucket': {
       const name = (args?.bucketName || args?.bucket_name || '').trim().toLowerCase();
-      const sourcePath = (args?.sourcePath || args?.source_path || '').trim();
+      const requestedSourcePath = (args?.sourcePath || args?.source_path || '').trim();
+      const sourcePath = requestedSourcePath || mockDefaultS3SourcePath(name);
       if (!name) {
         return { ok: false, message: 'Bucket name required' };
       }
@@ -248,12 +253,12 @@ async function mockInvoke(cmd, args = {}) {
       return {
         ok: true,
         message: existed
-          ? sourcePath
+          ? requestedSourcePath
             ? `Bucket ${name} existed already and source path was imported (mock).`
-            : `Bucket ${name} existed already (mock).`
-          : sourcePath
+            : `Bucket ${name} existed already; default Windows folder ${sourcePath} ready (mock).`
+          : requestedSourcePath
             ? `Bucket ${name} created and source path imported (mock).`
-            : `Bucket ${name} created (mock).`,
+            : `Bucket ${name} created; default Windows folder ${sourcePath} ready (mock).`,
       };
     }
     case 's3_update_bucket': {
@@ -278,6 +283,11 @@ async function mockInvoke(cmd, args = {}) {
       currentBucket.name = newName;
       if (sourcePath) {
         currentBucket.source_path = sourcePath;
+      } else if (
+        newName !== currentName
+        && isMockDefaultS3SourcePath(currentName, currentBucket.source_path)
+      ) {
+        currentBucket.source_path = mockDefaultS3SourcePath(newName);
       }
       if (newName !== currentName) {
         __MOCK.s3.objects[newName] = __MOCK.s3.objects[currentName] || [];

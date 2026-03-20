@@ -205,6 +205,14 @@ fn logs_dir() -> PathBuf {
     program_data_dir().join("logs")
 }
 
+fn bucket_sources_dir() -> PathBuf {
+    program_data_dir().join("sources")
+}
+
+fn default_bucket_source_path(bucket: &str) -> PathBuf {
+    bucket_sources_dir().join(bucket)
+}
+
 fn config_path() -> PathBuf {
     program_data_dir().join("s3-config.json")
 }
@@ -339,6 +347,7 @@ fn build_log_basename(prefix: &str) -> String {
 fn ensure_layout() -> Result<()> {
     std_fs::create_dir_all(program_data_dir()).context("create ProgramData directory")?;
     std_fs::create_dir_all(logs_dir()).context("create logs directory")?;
+    std_fs::create_dir_all(bucket_sources_dir()).context("create bucket sources directory")?;
     Ok(())
 }
 
@@ -400,13 +409,52 @@ fn set_bucket_source_path(bucket: &str, source_path: Option<&Path>) -> Result<()
     save_bucket_metadata(&metadata)
 }
 
+fn ensure_default_bucket_source_path(bucket: &str) -> Result<PathBuf> {
+    let path = default_bucket_source_path(bucket);
+    std_fs::create_dir_all(&path)
+        .with_context(|| format!("create default source path {}", path.display()))?;
+    Ok(path)
+}
+
 fn rename_bucket_source_path(current_bucket: &str, new_bucket: &str) -> Result<()> {
     if current_bucket == new_bucket {
         return Ok(());
     }
     let mut metadata = load_bucket_metadata()?;
     if let Some(source_path) = metadata.remove(current_bucket) {
-        metadata.insert(new_bucket.to_string(), source_path);
+        let current_default = default_bucket_source_path(current_bucket)
+            .display()
+            .to_string();
+        if source_path == current_default {
+            let new_default = default_bucket_source_path(new_bucket);
+            let updated_source_path = match std_fs::rename(&source_path, &new_default) {
+                Ok(()) => new_default.display().to_string(),
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                    if let Err(create_err) = std_fs::create_dir_all(&new_default) {
+                        warn!(
+                            "unable to create renamed default source path {}: {}",
+                            new_default.display(),
+                            create_err
+                        );
+                        source_path.clone()
+                    } else {
+                        new_default.display().to_string()
+                    }
+                }
+                Err(err) => {
+                    warn!(
+                        "unable to rename default source path {} to {}: {}",
+                        source_path,
+                        new_default.display(),
+                        err
+                    );
+                    source_path.clone()
+                }
+            };
+            metadata.insert(new_bucket.to_string(), updated_source_path);
+        } else {
+            metadata.insert(new_bucket.to_string(), source_path);
+        }
     }
     save_bucket_metadata(&metadata)
 }
@@ -1106,29 +1154,41 @@ impl HomeS3 for HomeS3GrpcService {
         let request = request.into_inner();
         let bucket = request.name.trim().to_string();
         validate_bucket_name(&bucket).map_err(|err| Status::invalid_argument(err.to_string()))?;
-        let source_path = normalize_source_path(&request.source_path)
+        let provided_source_path = normalize_source_path(&request.source_path)
             .map_err(|err| Status::invalid_argument(err.to_string()))?;
+        let (source_path, created_default_source_path) = match provided_source_path.as_ref() {
+            Some(path) => (path.to_path_buf(), false),
+            None => (
+                ensure_default_bucket_source_path(&bucket)
+                    .map_err(|err| internal_status("create default source path", err))?,
+                true,
+            ),
+        };
 
         let cfg = current_config(&self.shared).await;
         let client = make_s3_client(&cfg)
             .await
             .map_err(|err| internal_status("initialise S3 client", err))?;
         let (created, imported) =
-            create_bucket_and_import(&client, &bucket, source_path.as_deref())
+            create_bucket_and_import(&client, &bucket, provided_source_path.as_deref())
                 .await
                 .map_err(|err| endpoint_status("create bucket", &cfg.endpoint, err))?;
-        if source_path.is_some() {
-            set_bucket_source_path(&bucket, source_path.as_deref())
-                .map_err(|err| internal_status("persist bucket metadata", err))?;
-        }
+        set_bucket_source_path(&bucket, Some(source_path.as_path()))
+            .map_err(|err| internal_status("persist bucket metadata", err))?;
 
-        let message = match (created, imported) {
+        let mut message = match (created, imported) {
             (true, 0) => format!("bucket {bucket} created"),
             (false, 0) => format!("bucket {bucket} already existed"),
             (true, count) => format!("bucket {bucket} created and {count} file(s) imported"),
             (false, count) => {
                 format!("bucket {bucket} already existed and {count} file(s) imported")
             }
+        };
+        if created_default_source_path {
+            message.push_str(&format!(
+                "; default Windows folder {} ready",
+                source_path.display()
+            ));
         };
         Ok(GrpcResponse::new(Acknowledge { ok: true, message }))
     }

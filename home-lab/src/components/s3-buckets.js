@@ -204,11 +204,11 @@ class S3Buckets extends HTMLElement {
           <input
             name="source_path"
             type="text"
-            placeholder="Chemin Windows à importer (optionnel)"
+            placeholder="Chemin Windows à importer (laisser vide pour auto-création)"
             class="rounded border border-gray-300 px-2 py-1"
           />
         </div>
-        <p class="text-xs text-gray-500">Si un chemin est fourni, son contenu est importé dans le bucket.</p>
+        <p class="text-xs text-gray-500">Si aucun chemin n'est fourni, un dossier Windows par défaut est créé pour le bucket.</p>
         <button
           type="submit"
           class="bg-blue-600 text-white px-3 py-1 rounded hover:bg-blue-700 text-sm"
