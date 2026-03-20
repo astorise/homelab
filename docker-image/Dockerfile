@@ -236,20 +236,6 @@ RUN if [ ! -f /etc/nvidia-container-runtime/config.toml ]; then \
       > /etc/nvidia-container-runtime/config.toml; \
     fi
 
-# Template K3s/containerd v3 (activated on demand by k3s-init.sh)
-RUN mkdir -p /usr/share/home-lab/nvidia
-
-RUN printf '%s\n' \
-    '{{ template "base" . }}' \
-    '' \
-    "[plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.'nvidia']" \
-    '  runtime_type = "io.containerd.runc.v2"' \
-    '' \
-    "[plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.'nvidia'.options]" \
-    '  BinaryName = "/usr/local/bin/nvidia-container-runtime"' \
-    '  SystemdCgroup = false' \
-    > /usr/share/home-lab/nvidia/config-v3.toml.tmpl
-
 # Smoke test
 RUN printf '%s\n' \
     '#!/bin/sh' \
@@ -261,8 +247,6 @@ RUN printf '%s\n' \
     '/usr/local/bin/nvidia-smi || true' \
     'echo "== nvidia-container-cli info =="' \
     '/usr/local/bin/nvidia-container-cli info || true' \
-    'echo "== K3s containerd template =="' \
-    'cat /usr/share/home-lab/nvidia/config-v3.toml.tmpl || true' \
     > /usr/local/bin/nvidia-wsl-smoke.sh \
  && chmod +x /usr/local/bin/nvidia-wsl-smoke.sh
 

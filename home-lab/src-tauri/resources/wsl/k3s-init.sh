@@ -47,8 +47,6 @@ K3S_TLS_SANS=${K3S_TLS_SANS:-}
 ENABLE_NVIDIA_TOOLKIT=${ENABLE_NVIDIA_TOOLKIT:-0}
 K3S_RUNTIME_BIN_DIR=${K3S_RUNTIME_BIN_DIR:-/var/lib/rancher/k3s/data/current/bin}
 K3S_RUNTIME_AUX_BIN_DIR=${K3S_RUNTIME_AUX_BIN_DIR:-$K3S_RUNTIME_BIN_DIR/aux}
-NVIDIA_CONTAINERD_TEMPLATE_SOURCE=${NVIDIA_CONTAINERD_TEMPLATE_SOURCE:-/usr/share/home-lab/nvidia/config-v3.toml.tmpl}
-NVIDIA_CONTAINERD_TEMPLATE_TARGET=${NVIDIA_CONTAINERD_TEMPLATE_TARGET:-/var/lib/rancher/k3s/agent/etc/containerd/config-v3.toml.tmpl}
 CONTAINERD_STREAM_PATCH_PID=
 
 log_info "Role: $ROLE"
@@ -301,10 +299,6 @@ rewrite_internal_server_kubeconfigs() {
 }
 
 start_containerd_stream_patch_watcher() {
-    if [ -z "$CONTAINERD_STREAM_PORT" ]; then
-        return 0
-    fi
-
     (
         config_file="/var/lib/rancher/k3s/agent/etc/containerd/config.toml"
         deadline=$(( $(date +%s) + CONTAINERD_STREAM_PATCH_TIMEOUT ))
@@ -318,8 +312,11 @@ start_containerd_stream_patch_watcher() {
         done
 
         while [ -f "$config_file" ]; do
-            sed -i "s#^  stream_server_address = .*#  stream_server_address = \"$CONTAINERD_STREAM_ADDRESS\"#" "$config_file" 2>/dev/null || true
-            sed -i "s#^  stream_server_port = .*#  stream_server_port = \"$CONTAINERD_STREAM_PORT\"#" "$config_file" 2>/dev/null || true
+            if [ -n "$CONTAINERD_STREAM_PORT" ]; then
+                sed -i "s#^  stream_server_address = .*#  stream_server_address = \"$CONTAINERD_STREAM_ADDRESS\"#" "$config_file" 2>/dev/null || true
+                sed -i "s#^  stream_server_port = .*#  stream_server_port = \"$CONTAINERD_STREAM_PORT\"#" "$config_file" 2>/dev/null || true
+            fi
+            patch_containerd_nvidia_runtime "$config_file"
             sleep 0.05
         done
     ) &
@@ -351,25 +348,58 @@ remove_nvidia_containerd_templates() {
     rm -f /var/lib/rancher/k3s/agent/etc/containerd/config.toml.tmpl
 }
 
+patch_containerd_nvidia_runtime() {
+    config_file="$1"
+    if [ ! -f "$config_file" ]; then
+        return 0
+    fi
+
+    tmp_file=$(mktemp)
+    awk -v enable_nvidia="$ENABLE_NVIDIA_TOOLKIT" -v runtime_bin="/usr/local/bin/nvidia-container-runtime" '
+        function is_nvidia_header(line) {
+            return line == "[plugins.\047io.containerd.cri.v1.runtime\047.containerd.runtimes.\047nvidia\047]" ||
+                   line == "[plugins.\047io.containerd.cri.v1.runtime\047.containerd.runtimes.\047nvidia\047.options]"
+        }
+
+        {
+            if (enable_nvidia != "1" && is_nvidia_header($0)) {
+                skip_nvidia = 1
+                next
+            }
+
+            if (skip_nvidia) {
+                if ($0 ~ /^\[/) {
+                    skip_nvidia = 0
+                } else {
+                    next
+                }
+            }
+
+            if (enable_nvidia == "1" && $0 ~ /^  BinaryName = ".*nvidia-container-runtime"$/) {
+                print "  BinaryName = \"" runtime_bin "\""
+                next
+            }
+
+            print
+        }
+    ' "$config_file" > "$tmp_file"
+
+    if ! cmp -s "$tmp_file" "$config_file"; then
+        cat "$tmp_file" > "$config_file"
+    fi
+    rm -f "$tmp_file"
+}
+
 ensure_nvidia_toolkit() {
+    remove_nvidia_containerd_templates
+
     if [ "$ENABLE_NVIDIA_TOOLKIT" != "1" ]; then
-        remove_nvidia_containerd_templates
         return 0
     fi
 
     if [ ! -x /usr/local/bin/nvidia-container-runtime ]; then
         log_error "NVIDIA runtime requested but /usr/local/bin/nvidia-container-runtime is missing."
         return 0
-    fi
-
-    if [ ! -f "$NVIDIA_CONTAINERD_TEMPLATE_SOURCE" ]; then
-        log_error "NVIDIA runtime requested but template source is missing: $NVIDIA_CONTAINERD_TEMPLATE_SOURCE"
-        return 0
-    fi
-
-    mkdir -p "$(dirname "$NVIDIA_CONTAINERD_TEMPLATE_TARGET")"
-    if [ ! -f "$NVIDIA_CONTAINERD_TEMPLATE_TARGET" ] || ! cmp -s "$NVIDIA_CONTAINERD_TEMPLATE_SOURCE" "$NVIDIA_CONTAINERD_TEMPLATE_TARGET"; then
-        cp "$NVIDIA_CONTAINERD_TEMPLATE_SOURCE" "$NVIDIA_CONTAINERD_TEMPLATE_TARGET"
     fi
 
     if [ -d /usr/lib/wsl/lib ]; then
@@ -384,7 +414,7 @@ ensure_nvidia_toolkit() {
         /usr/local/bin/nvidia-smi >/dev/null 2>&1 || true
     fi
 
-    log_info "NVIDIA container runtime prepared for k3s/containerd."
+    log_info "NVIDIA container runtime will be patched into the live k3s/containerd config."
 }
 
 run_k3s_server() {
