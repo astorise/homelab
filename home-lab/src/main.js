@@ -1,5 +1,6 @@
 import './console-bridge.js';
 import './style.css';
+import gsap from 'gsap';
 import { installUiRefreshListener } from './ui-refresh.js';
 import './components/toast.js';
 import './components/dns-status.js';
