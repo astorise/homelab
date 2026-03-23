@@ -114,8 +114,28 @@ class DnsStatus extends HTMLElement {
       </div>`);
   }
 
-  // La fonction load() reste globalement inchangée
-  async load() { ... }
+   async load() {
+    this.clearRetry();
+    if (!this._hasSuccessfulLoad) {
+      this.renderLoading();
+    }
+    try {
+      const status = await dns_get_status();
+      this._hasSuccessfulLoad = true;
+       this._lastError = null;
+      this.renderSuccess(status);
+    } catch (err) {
+      const message = err?.message || String(err);
+      this._lastError = message;
+      if (this._hasSuccessfulLoad) {
+        this.renderError(err);
+        showError(message);
+      } else {
+        this.renderLoading();
+      }
+      this.scheduleRetry();
+    }
+  }
 }
 
 customElements.define('dns-status', DnsStatus);
