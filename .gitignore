@@ -9,3 +9,4 @@ certs/
 *.pfx
 *.p12
 *.cer
+.codex-tmp/
