@@ -32,6 +32,8 @@
                   ExeCommand='"[SystemFolder]cmd.exe" /C ""[SystemFolder]sc.exe" start HomeS3Service &gt;&gt; "[INSTALLDIR]installer-msi.log" 2&gt;&amp;1"' Return="ignore" />
     <CustomAction Id="StartHomeOidc" Directory="INSTALLDIR" Execute="deferred" Impersonate="no"
                   ExeCommand='"[SystemFolder]cmd.exe" /C ""[SystemFolder]sc.exe" start HomeOidcService &gt;&gt; "[INSTALLDIR]installer-msi.log" 2&gt;&amp;1"' Return="ignore" />
+    <CustomAction Id="EnsureWslPrereq" Directory="INSTALLDIR" Execute="deferred" Impersonate="no"
+                  ExeCommand='"[SystemFolder]cmd.exe" /C ""[SystemFolder]WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File "[INSTALLDIR]scripts\ensure-wsl.ps1" &gt;&gt; "[INSTALLDIR]installer-msi.log" 2&gt;&amp;1"' Return="ignore" />
     <!-- Uninstall: prefer binary uninstallers; rely on ServiceControl as safety net -->
     <CustomAction Id="UninstallHomeDns" Directory="INSTALLDIR" Execute="deferred" Impersonate="no"
                   ExeCommand='"[SystemFolder]cmd.exe" /C ""[INSTALLDIR]bin\home-dns.exe" uninstall &gt;&gt; "[INSTALLDIR]installer-msi.log" 2&gt;&amp;1"' Return="ignore" />
@@ -66,6 +68,7 @@
       <Custom Action="StartHomeHttp" After="StartHomeDns"><![CDATA[NOT (REMOVE = "ALL")]]></Custom>
       <Custom Action="StartHomeS3" After="StartHomeHttp"><![CDATA[NOT (REMOVE = "ALL")]]></Custom>
       <Custom Action="StartHomeOidc" After="StartHomeS3"><![CDATA[NOT (REMOVE = "ALL")]]></Custom>
+      <Custom Action="EnsureWslPrereq" After="StartHomeOidc"><![CDATA[NOT (REMOVE = "ALL")]]></Custom>
       <Custom Action="UninstallHomeOidc" Before="RemoveFiles">(REMOVE = "ALL")</Custom>
       <Custom Action="UninstallHomeS3" Before="RemoveFiles">(REMOVE = "ALL")</Custom>
       <Custom Action="UninstallHomeHttp" Before="RemoveFiles">(REMOVE = "ALL")</Custom>
@@ -106,6 +109,7 @@
     <CustomActionRef Id="StartHomeHttp" />
     <CustomActionRef Id="StartHomeS3" />
     <CustomActionRef Id="StartHomeOidc" />
+    <CustomActionRef Id="EnsureWslPrereq" />
     <CustomActionRef Id="UninstallHomeDns" />
     <CustomActionRef Id="UninstallHomeHttp" />
     <CustomActionRef Id="UninstallHomeS3" />

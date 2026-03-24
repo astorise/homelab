@@ -30,6 +30,25 @@ Function ApplyOidcDomain
   FileWrite $LOG_HANDLE "configure-oidc.ps1 => rc=$2 out=$3$\r$\n"
 FunctionEnd
 
+Function EnsureWslPrereq
+  StrCpy $0 "$INSTDIR\\scripts\\ensure-wsl.ps1"
+  ${IfNot} ${FileExists} "$0"
+    DetailPrint "[WARN] ensure-wsl.ps1 introuvable ($0)."
+    StrCmp $LOG_HANDLE "" +2
+    FileWrite $LOG_HANDLE "[WARN] ensure-wsl.ps1 introuvable ($0)$\r$\n"
+    Return
+  ${EndIf}
+  nsExec::ExecToStack '\"$SYSDIR\\WindowsPowerShell\\v1.0\\powershell.exe\" -NoProfile -ExecutionPolicy Bypass -File \"$0\"'
+  Pop $1
+  Pop $2
+  DetailPrint "ensure-wsl.ps1 => rc=$1 out=$2"
+  ${If} $1 != 0
+    DetailPrint "[WARN] ensure-wsl.ps1 a retourne $1"
+  ${EndIf}
+  StrCmp $LOG_HANDLE "" +2
+  FileWrite $LOG_HANDLE "ensure-wsl.ps1 => rc=$1 out=$2$\r$\n"
+FunctionEnd
+
 !macro NSIS_HOOK_PREINSTALL
   ; SetDetailsPrint is valid in sections; ShowInstDetails must be outside.
   ; Avoid ShowInstDetails here to keep NSIS happy in CI.
@@ -43,6 +62,8 @@ FunctionEnd
     DetailPrint "[installer] Logging to $LOG_FILE"
   ${EndIf}
   StrCpy $OIDC_DOMAIN "127.0.0.1"
+  IfSilent nsis_oidc_silent nsis_oidc_prompt
+nsis_oidc_prompt:
   nsExec::ExecToStack 'powershell -NoProfile -ExecutionPolicy Bypass -Command "Add-Type -AssemblyName Microsoft.VisualBasic; $$domain = [Microsoft.VisualBasic.Interaction]::InputBox(\"Veuillez indiquer le domaine utilisé pour le certificat HTTPS home-oidc\",\"Domaine OIDC\",\"127.0.0.1\"); [Console]::Write($$domain)"'
   Pop $0
   Pop $1
@@ -53,6 +74,10 @@ FunctionEnd
   ${If} $OIDC_DOMAIN == ""
     StrCpy $OIDC_DOMAIN "127.0.0.1"
   ${EndIf}
+  Goto nsis_oidc_done
+nsis_oidc_silent:
+  DetailPrint "[installer] Silent install detected. Using default OIDC domain: $OIDC_DOMAIN"
+nsis_oidc_done:
   DetailPrint "[installer] Domaine OIDC sélectionné: $OIDC_DOMAIN"
   StrCmp $LOG_HANDLE "" +2
   FileWrite $LOG_HANDLE "oidc_domain=$OIDC_DOMAIN$\r$\n"
@@ -149,7 +174,7 @@ FunctionEnd
     ; Exécution après installation
   ; Forcer l’élévation (si pas déjà perMachine)
   ; et lancer WSL sans distribution
-  nsExec::ExecToLog 'powershell -ExecutionPolicy Bypass -Command "wsl --install --no-distribution"'
+  Call EnsureWslPrereq
 
   ; Ajout au démarrage de Windows
   DetailPrint "Adding home-lab to startup..."
