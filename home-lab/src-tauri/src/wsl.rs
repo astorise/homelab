@@ -1318,6 +1318,40 @@ fn format_cli_command(program: &str, args: &[&str]) -> String {
     format!("{} {}", program, rendered_args.join(" "))
 }
 
+fn normalize_windows_path_for_cli(path: &Path) -> PathBuf {
+    let rendered = path.as_os_str().to_string_lossy();
+
+    if let Some(rest) = rendered.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{}", rest));
+    }
+
+    if let Some(rest) = rendered.strip_prefix(r"\\?\") {
+        return PathBuf::from(rest);
+    }
+
+    path.to_path_buf()
+}
+
+fn wsl_cli_reports_missing_system_file(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("the system cannot find the file specified")
+        || lower.contains("le fichier specifie est introuvable")
+        || lower.contains("le fichier spécifié est introuvable")
+}
+
+fn annotate_wsl_cli_failure(message: &str) -> String {
+    if !wsl_cli_reports_missing_system_file(message) {
+        return message.to_string();
+    }
+
+    let hint = "WSL ne repond pas correctement sur cet hote. Verifiez que WSL est installe puis redemarrez Windows (souvent requis apres 'wsl --install --no-distribution') avant de relancer Home Lab.";
+    if message.contains(hint) {
+        return message.to_string();
+    }
+
+    format!("{message}\n{hint}")
+}
+
 static WSL_LOG_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static KUBECTL_TRACE_SEQ: AtomicU64 = AtomicU64::new(1);
 
@@ -2464,6 +2498,7 @@ async fn wsl_import_instance_with_paths(
     let mut provision = match setup_result {
         Ok(prov) => prov,
         Err(err) => {
+            let message = annotate_wsl_cli_failure(&err.to_string());
             error!(target: "wsl", "Echec import WSL: {err}");
             log_wsl_event(format!(
                 "Echec import WSL pour l'instance {}: {err}",
@@ -2471,7 +2506,7 @@ async fn wsl_import_instance_with_paths(
             ));
             ProvisionResult {
                 ok: false,
-                message: err.to_string(),
+                message,
             }
         }
     };
@@ -2479,63 +2514,76 @@ async fn wsl_import_instance_with_paths(
     let mut allow_post_config = provision.ok;
     let expected_api_port = k3s_api_port_for_instance(&sanitized_name);
     if !allow_post_config {
-        match is_wsl_instance_present(&sanitized_name).await {
-            Ok(true) => {
-                match enforce_instance_api_port_range(&sanitized_name, expected_api_port).await {
-                    Ok(_) => {
-                        append_provision_message(
-                            &mut provision.message,
-                            &format!(
-                                "Port API Kubernetes reconcilie sur /etc/k3s-env ({expected_api_port})."
-                            ),
-                        );
-                        log_wsl_event(format!(
-                            "Reconciliation /etc/k3s-env pour {}: api_port={}",
-                            sanitized_debug, expected_api_port
-                        ));
+        if wsl_cli_reports_missing_system_file(&provision.message) {
+            warn!(
+                target: "wsl",
+                instance = %sanitized_name,
+                "Verification de presence ignoree car WSL n'est pas disponible cote hote"
+            );
+            log_wsl_event(format!(
+                "Verification de presence ignoree pour {}: WSL indisponible cote hote",
+                sanitized_debug
+            ));
+        } else {
+            match is_wsl_instance_present(&sanitized_name).await {
+                Ok(true) => {
+                    match enforce_instance_api_port_range(&sanitized_name, expected_api_port).await {
+                        Ok(_) => {
+                            append_provision_message(
+                                &mut provision.message,
+                                &format!(
+                                    "Port API Kubernetes reconcilie sur /etc/k3s-env ({expected_api_port})."
+                                ),
+                            );
+                            log_wsl_event(format!(
+                                "Reconciliation /etc/k3s-env pour {}: api_port={}",
+                                sanitized_debug, expected_api_port
+                            ));
+                        }
+                        Err(err) => {
+                            warn!(
+                                target: "wsl",
+                                instance = %sanitized_name,
+                                error = %err,
+                                "Reconciliation /etc/k3s-env impossible apres echec setup"
+                            );
+                            append_provision_message(
+                                &mut provision.message,
+                                &format!("Reconciliation /etc/k3s-env impossible: {err}"),
+                            );
+                        }
                     }
-                    Err(err) => {
-                        warn!(
-                            target: "wsl",
-                            instance = %sanitized_name,
-                            error = %err,
-                            "Reconciliation /etc/k3s-env impossible apres echec setup"
-                        );
-                        append_provision_message(
-                            &mut provision.message,
-                            &format!("Reconciliation /etc/k3s-env impossible: {err}"),
-                        );
-                    }
+                    allow_post_config = true;
+                    info!(
+                        target: "wsl",
+                        instance = %sanitized_name,
+                        "Instance presente malgre une erreur setup, tentative de configuration reseau/OIDC"
+                    );
+                    log_wsl_event(format!(
+                        "Instance {} presente malgre erreur setup, configuration reseau/OIDC en cours",
+                        sanitized_debug
+                    ));
                 }
-                allow_post_config = true;
-                info!(
-                    target: "wsl",
-                    instance = %sanitized_name,
-                    "Instance presente malgre une erreur setup, tentative de configuration reseau/OIDC"
-                );
-                log_wsl_event(format!(
-                    "Instance {} presente malgre erreur setup, configuration reseau/OIDC en cours",
-                    sanitized_debug
-                ));
-            }
-            Ok(false) => {
-                info!(
-                    target: "wsl",
-                    instance = %sanitized_name,
-                    "Instance absente apres echec setup, configuration reseau/OIDC ignoree"
-                );
-            }
-            Err(err) => {
-                warn!(
-                    target: "wsl",
-                    instance = %sanitized_name,
-                    error = %err,
-                    "Impossible de verifier la presence de l'instance WSL apres echec setup"
-                );
-                append_provision_message(
-                    &mut provision.message,
-                    &format!("Verification de l'instance WSL impossible: {err}"),
-                );
+                Ok(false) => {
+                    info!(
+                        target: "wsl",
+                        instance = %sanitized_name,
+                        "Instance absente apres echec setup, configuration reseau/OIDC ignoree"
+                    );
+                }
+                Err(err) => {
+                    let message = annotate_wsl_cli_failure(&err.to_string());
+                    warn!(
+                        target: "wsl",
+                        instance = %sanitized_name,
+                        error = %message,
+                        "Impossible de verifier la presence de l'instance WSL apres echec setup"
+                    );
+                    append_provision_message(
+                        &mut provision.message,
+                        &format!("Verification de l'instance WSL impossible: {message}"),
+                    );
+                }
             }
         }
     }
@@ -2763,6 +2811,9 @@ fn run_wsl_setup_with_paths(
     }
 
     let install_dir = paths.install_root.join(instance_name);
+    let script_path_cli = normalize_windows_path_for_cli(&script_path);
+    let rootfs_path_cli = normalize_windows_path_for_cli(&rootfs_path);
+    let install_dir_cli = normalize_windows_path_for_cli(&install_dir);
     let instance_debug = escape_for_log(instance_name);
     let plan = instance_port_plan(instance_name);
     let api_port = plan.api_backend_port;
@@ -2770,9 +2821,9 @@ fn run_wsl_setup_with_paths(
 
     info!(
         target: "wsl",
-        script = %script_path.display(),
-        rootfs = %rootfs_path.display(),
-        install = %install_dir.display(),
+        script = %script_path_cli.display(),
+        rootfs = %rootfs_path_cli.display(),
+        install = %install_dir_cli.display(),
         force = force_import,
         enable_nvidia,
         instance = %instance_name,
@@ -2786,9 +2837,9 @@ fn run_wsl_setup_with_paths(
         force_import,
         instance_debug,
         enable_nvidia,
-        script_path.display(),
-        rootfs_path.display(),
-        install_dir.display(),
+        script_path_cli.display(),
+        rootfs_path_cli.display(),
+        install_dir_cli.display(),
         api_port,
         nodeport_range_end
     ));
@@ -2799,11 +2850,11 @@ fn run_wsl_setup_with_paths(
         .arg("-ExecutionPolicy")
         .arg("Bypass")
         .arg("-File")
-        .arg(&script_path)
+        .arg(&script_path_cli)
         .arg("-InstallDir")
-        .arg(&install_dir)
+        .arg(&install_dir_cli)
         .arg("-Rootfs")
-        .arg(&rootfs_path)
+        .arg(&rootfs_path_cli)
         .arg("-DistroName")
         .arg(instance_name)
         .arg("-ApiPort")
@@ -2818,9 +2869,9 @@ fn run_wsl_setup_with_paths(
 
     let mut command_preview = format!(
         "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"{}\" -InstallDir \"{}\" -Rootfs \"{}\" -DistroName \"{}\" -ApiPort {}",
-        script_path.display(),
-        install_dir.display(),
-        rootfs_path.display(),
+        script_path_cli.display(),
+        install_dir_cli.display(),
+        rootfs_path_cli.display(),
         instance_name,
         api_port
     );
@@ -2919,7 +2970,7 @@ fn run_wsl_setup_with_paths(
         if combined.is_empty() {
             combined = format!("setup-wsl.ps1 a echoue (code {code})");
         }
-        Err(anyhow!(combined))
+        Err(anyhow!(annotate_wsl_cli_failure(&combined)))
     }
 }
 
@@ -3048,6 +3099,7 @@ fn collect_wsl_instances() -> Result<Vec<WslInstance>> {
         } else {
             "wsl.exe --list a echoue".to_string()
         };
+        let message = annotate_wsl_cli_failure(&message);
         log_wsl_event(format!("Echec wsl.exe --list --verbose --all: {message}"));
         return Err(anyhow!(message));
     }
@@ -3227,7 +3279,7 @@ pub async fn wsl_list_instances() -> Result<Vec<WslInstance>, String> {
             log_wsl_event(format!("Erreur JoinHandle lors du listing WSL: {e}"));
             format!("Erreur interne: {e}")
         })?
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| annotate_wsl_cli_failure(&e.to_string()))?;
 
     attach_cluster_details(&mut instances).await;
 
@@ -8495,5 +8547,25 @@ spec:
         )
         .expect("parse deployment manifest");
         assert!(!manifests_require_home_lab_traefik_restart(&manifests));
+    }
+
+    #[test]
+    fn windows_verbatim_paths_are_normalized_for_cli() {
+        assert_eq!(
+            normalize_windows_path_for_cli(Path::new(
+                r"\\?\C:\Program Files\home-lab\wsl\setup-wsl.ps1"
+            )),
+            PathBuf::from(r"C:\Program Files\home-lab\wsl\setup-wsl.ps1")
+        );
+        assert_eq!(
+            normalize_windows_path_for_cli(Path::new(r"\\?\UNC\server\share\demo.txt")),
+            PathBuf::from(r"\\server\share\demo.txt")
+        );
+    }
+
+    #[test]
+    fn wsl_cli_file_not_found_errors_include_actionable_hint() {
+        let annotated = annotate_wsl_cli_failure("Le fichier spécifié est introuvable.");
+        assert!(annotated.contains("WSL ne repond pas correctement"));
     }
 }

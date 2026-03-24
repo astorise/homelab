@@ -23,6 +23,62 @@ function Ensure-WslBinary {
     }
 }
 
+function Normalize-WindowsPath {
+    param([string]$PathValue)
+
+    if ([string]::IsNullOrWhiteSpace($PathValue)) {
+        return $PathValue
+    }
+
+    if ($PathValue.StartsWith('\\?\UNC\')) {
+        return ('\\' + $PathValue.Substring(8))
+    }
+
+    if ($PathValue.StartsWith('\\?\')) {
+        return $PathValue.Substring(4)
+    }
+
+    return $PathValue
+}
+
+function Normalize-CommandOutputLine {
+    param($Value)
+
+    if ($null -eq $Value) {
+        return ''
+    }
+
+    return (([string]$Value) -replace "`0", '').Trim()
+}
+
+function Join-CommandOutput {
+    param([object[]]$Lines)
+
+    @(
+        $Lines |
+            ForEach-Object { Normalize-CommandOutputLine -Value $_ } |
+            Where-Object { $_ -and $_.Length -gt 0 }
+    ) -join "`n"
+}
+
+function Invoke-WslExe {
+    param([string[]]$Arguments)
+
+    $previousPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $output = & wsl.exe @Arguments 2>&1
+        $exitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousPreference
+    }
+
+    [pscustomobject]@{
+        ExitCode = $exitCode
+        Output   = @($output)
+    }
+}
+
 function Get-ScriptDirectory {
     $cached = Get-Variable -Name SetupScriptDir -Scope Script -ValueOnly -ErrorAction SilentlyContinue
     if (-not [string]::IsNullOrWhiteSpace($cached)) {
@@ -40,22 +96,25 @@ function Get-ScriptDirectory {
         throw 'Impossible de determiner le dossier du script setup-wsl.ps1.'
     }
 
-    # Normalize long-path prefix for cmdlets/providers that do not handle it.
-    if ($candidate.StartsWith('\\?\')) {
-        $candidate = $candidate.Substring(4)
-    }
+    $candidate = Normalize-WindowsPath -PathValue $candidate
 
     Set-Variable -Name SetupScriptDir -Scope Script -Value $candidate
     return $candidate
 }
 
 function Get-RegisteredDistros {
-    $list = & wsl.exe -l -q 2>$null
-    if ($LASTEXITCODE -ne 0) {
-        throw "Impossible de recuperer la liste des distributions WSL (code $LASTEXITCODE)."
+    $result = Invoke-WslExe -Arguments @('-l', '-q')
+    $list = $result.Output
+    $exitCode = $result.ExitCode
+    if ($exitCode -ne 0) {
+        $details = Join-CommandOutput -Lines $list
+        if ($details) {
+            throw "Impossible de recuperer la liste des distributions WSL (code $exitCode) :`n$details"
+        }
+        throw "Impossible de recuperer la liste des distributions WSL (code $exitCode)."
     }
     $list `
-        | ForEach-Object { ($_ -replace "`0", '').Trim() } `
+        | ForEach-Object { Normalize-CommandOutputLine -Value $_ } `
         | Where-Object { $_ -and ($_.Length -gt 0) }
 }
 
@@ -77,11 +136,12 @@ function Import-Distro {
 
     Write-Info "Import de la distribution $Name depuis $TarPath"
     $args = @("--import", $Name, $TargetDir, $TarPath, "--version", "2")
-    $std = & wsl.exe @args 2>&1
-    $exitCode = $LASTEXITCODE
+    $result = Invoke-WslExe -Arguments $args
+    $std = $result.Output
+    $exitCode = $result.ExitCode
 
     if ($exitCode -ne 0) {
-        $details = ($std | Where-Object { $_ -and $_.Trim().Length -gt 0 }) -join "`n"
+        $details = Join-CommandOutput -Lines $std
         if ($details) {
             throw "Import WSL echoue (code $exitCode) :`n$details"
         }
@@ -89,7 +149,10 @@ function Import-Distro {
     }
 
     if ($std) {
-        Write-Info ("wsl.exe a renvoye:" + [Environment]::NewLine + ($std -join [Environment]::NewLine))
+        $details = Join-CommandOutput -Lines $std
+        if ($details) {
+            Write-Info ("wsl.exe a renvoye:" + [Environment]::NewLine + $details)
+        }
     }
 }
 
@@ -100,11 +163,12 @@ function Remove-Distro {
     )
 
     Write-Info "Suppression de la distribution $Name existante"
-    $std = & wsl.exe --unregister $Name 2>&1
-    $exitCode = $LASTEXITCODE
+    $result = Invoke-WslExe -Arguments @('--unregister', $Name)
+    $std = $result.Output
+    $exitCode = $result.ExitCode
 
     if ($exitCode -ne 0) {
-        $details = ($std | Where-Object { $_ -and $_.Trim().Length -gt 0 }) -join "`n"
+        $details = Join-CommandOutput -Lines $std
         if ($details) {
             throw "Suppression WSL echoue (code $exitCode) :`n$details"
         }
@@ -112,7 +176,10 @@ function Remove-Distro {
     }
 
     if ($std) {
-        Write-Info ("wsl.exe a renvoye:" + [Environment]::NewLine + ($std -join [Environment]::NewLine))
+        $details = Join-CommandOutput -Lines $std
+        if ($details) {
+            Write-Info ("wsl.exe a renvoye:" + [Environment]::NewLine + $details)
+        }
     }
 
     $maxAttempts = 10
@@ -170,7 +237,7 @@ function Invoke-WslScript {
         ExitCode = $process.ExitCode
         Stdout   = $stdout
         Stderr   = $stderr
-        Output   = @($stdout, $stderr) | Where-Object { $_ -and $_.Trim().Length -gt 0 }
+        Output   = @($stdout, $stderr) | ForEach-Object { Normalize-CommandOutputLine -Value $_ } | Where-Object { $_ -and $_.Length -gt 0 }
     }
 }
 
@@ -421,13 +488,14 @@ function Configure-K3sAutostart {
     $localStartContent = "#!/bin/sh`nexec sh /usr/local/bin/k3s-init.sh`n".Replace("`r`n", "`n").Replace("`r", "`n")
     [System.IO.File]::WriteAllText($localStartPath, $localStartContent, $utf8NoBom)
 
-    $chmodStd = & wsl.exe -d $Distro -- chmod +x /etc/local.d/k3s.start 2>&1
-    if ($LASTEXITCODE -ne 0) {
-        $details = ($chmodStd | Where-Object { $_ -and $_.Trim().Length -gt 0 }) -join "`n"
+    $chmodResult = Invoke-WslExe -Arguments @('-d', $Distro, '--', 'chmod', '+x', '/etc/local.d/k3s.start')
+    if ($chmodResult.ExitCode -ne 0) {
+        $chmodStd = $chmodResult.Output
+        $details = Join-CommandOutput -Lines $chmodStd
         if ($details) {
-            throw "Activation /etc/local.d/k3s.start echouee (code $LASTEXITCODE) :`n$details"
+            throw "Activation /etc/local.d/k3s.start echouee (code $($chmodResult.ExitCode)) :`n$details"
         }
-        throw "Activation /etc/local.d/k3s.start echouee (code $LASTEXITCODE)"
+        throw "Activation /etc/local.d/k3s.start echouee (code $($chmodResult.ExitCode))"
     }
 }
 
@@ -447,10 +515,10 @@ function Get-InstanceSlot {
     }
 
     # Fallback stable slot when the name does not follow home-lab-k3s(-N)
-    $hash = 2166136261
+    [uint32]$hash = 2166136261
     foreach ($ch in $Name.ToCharArray()) {
-        $hash = ($hash -bxor [int][char]$ch)
-        $hash = [uint32](($hash * 16777619) -band 0xffffffff)
+        $hash = [uint32]($hash -bxor [uint32][char]$ch)
+        $hash = [uint32](([uint64]$hash * 16777619) % 4294967296)
     }
     return [int]($hash % 1000)
 }
@@ -612,6 +680,8 @@ function Invoke-K3sBootstrap {
 try {
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
     Ensure-WslBinary
+    $InstallDir = Normalize-WindowsPath -PathValue $InstallDir
+    $Rootfs = Normalize-WindowsPath -PathValue $Rootfs
     if ([string]::IsNullOrWhiteSpace($Rootfs)) {
         $Rootfs = [System.IO.Path]::Combine((Get-ScriptDirectory), 'wsl-rootfs.tar')
     }

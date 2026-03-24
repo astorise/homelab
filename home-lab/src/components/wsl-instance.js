@@ -22,7 +22,8 @@ class WslInstanceManager extends HTMLElement {
     this._messageState = 'idle';
     this._message = '';
     this._instances = [];
-    this._loadingInstances = false;
+    this._loadingInstances = true;
+    this._instanceLoadFailed = false;
     this._hostCapabilities = { nvidia_available: false, nvidia_gpu_names: [] };
     this._loadingHostCapabilities = false;
   }
@@ -57,9 +58,11 @@ class WslInstanceManager extends HTMLElement {
     try {
       const data = await wsl_list_instances();
       this._instances = Array.isArray(data) ? data : [];
+      this._instanceLoadFailed = false;
       return true;
     } catch (err) {
       const message = err?.message || String(err);
+      this._instanceLoadFailed = true;
       showError(message);
       this._messageState = 'error';
       this._message = message;
@@ -215,6 +218,8 @@ class WslInstanceManager extends HTMLElement {
 
     const instancesContent = loading
       ? '<p class="mt-4 text-sm text-gray-500">Chargement des instances…</p>'
+      : this._instanceLoadFailed && this._instances.length === 0
+        ? '<p class="mt-4 text-sm text-red-600">Impossible de charger la liste des instances WSL.</p>'
       : this._instances.length === 0
         ? '<p class="mt-4 text-sm text-gray-500">Aucune instance WSL détectée.</p>'
         : `<ul class="mt-4 divide-y divide-gray-200 rounded border border-gray-200 bg-white overflow-hidden">
