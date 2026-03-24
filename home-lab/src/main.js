@@ -18,6 +18,9 @@ installUiRefreshListener();
 
 // Animation d'entrée au chargement de l'application
 document.addEventListener("DOMContentLoaded", () => {
+  gsap.set(".gsap-header", { opacity: 0, y: 12 });
+  gsap.set(".gsap-card", { opacity: 0, y: 20 });
+
   const tl = gsap.timeline();
 
   // Animation du header
@@ -26,7 +29,7 @@ document.addEventListener("DOMContentLoaded", () => {
     opacity: 1,
     duration: 0.6,
     ease: "power3.out",
-    clearProps: "all" 
+    clearProps: "opacity,transform" 
   })
   // Animation en cascade (stagger) des cartes du dashboard
   .to(".gsap-card", {
@@ -35,6 +38,6 @@ document.addEventListener("DOMContentLoaded", () => {
     duration: 0.5,
     stagger: 0.05, // Effet d'apparition séquentielle
     ease: "back.out(1.7)",
-    clearProps: "all"
+    clearProps: "opacity,transform"
   }, "-=0.4"); // Commence un peu avant la fin de l'animation du header
 });

@@ -8,7 +8,7 @@
   </head>
   <body class="bg-slate-50 text-slate-900 antialiased min-h-screen selection:bg-blue-100">
     <div class="max-w-7xl mx-auto p-6 lg:p-8">
-      <header class="mb-10 flex items-center justify-between opacity-0 gsap-header">
+      <header class="mb-10 flex items-center justify-between gsap-header">
         <div>
           <h1 class="text-3xl font-extrabold tracking-tight text-slate-900">HomeLab Dashboard</h1>
           <p class="text-slate-500 mt-1">Supervision de vos services</p>
@@ -16,16 +16,16 @@
       </header>
 
       <main class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6 auto-rows-max">
-        <dns-status class="gsap-card opacity-0"></dns-status>
-        <dns-records class="gsap-card opacity-0"></dns-status>
-        <http-status class="gsap-card opacity-0"></http-status>
-        <http-routes class="gsap-card opacity-0"></http-routes>
-        <s3-status class="gsap-card opacity-0"></s3-status>
-        <s3-buckets class="gsap-card opacity-0"></s3-buckets>
-        <oidc-status class="gsap-card opacity-0"></oidc-status>
-        <oidc-clients class="gsap-card opacity-0"></oidc-clients>
-        <wsl-instance-manager class="gsap-card opacity-0 lg:col-span-2"></wsl-instance-manager>
-        <k8s-client class="gsap-card opacity-0"></k8s-client>
+        <dns-status class="gsap-card"></dns-status>
+        <dns-records class="gsap-card"></dns-records>
+        <http-status class="gsap-card"></http-status>
+        <http-routes class="gsap-card"></http-routes>
+        <s3-status class="gsap-card"></s3-status>
+        <s3-buckets class="gsap-card"></s3-buckets>
+        <oidc-status class="gsap-card"></oidc-status>
+        <oidc-clients class="gsap-card"></oidc-clients>
+        <wsl-instance-manager class="gsap-card lg:col-span-2"></wsl-instance-manager>
+        <k8s-client class="gsap-card"></k8s-client>
       </main>
     </div>
     
