@@ -5910,56 +5910,69 @@ struct KubeApiEndpoint {
     tls_server_name: Option<String>,
 }
 
+fn home_lab_public_kube_api_endpoint(instance: &str) -> Result<KubeApiEndpoint> {
+    let plan = instance_port_plan(instance);
+    let domain = primary_cluster_domain(instance).ok_or_else(|| {
+        anyhow!(
+            "Aucun domaine principal disponible pour l'endpoint API Kubernetes de '{}'.",
+            instance
+        )
+    })?;
+
+    Ok(KubeApiEndpoint {
+        host: domain.clone(),
+        port: plan.api_public_port,
+        tls_server_name: Some(domain),
+    })
+}
+
 async fn resolve_kube_api_endpoint_for_instance(
     instance: &str,
     trace_id: &str,
 ) -> Result<KubeApiEndpoint> {
-    let api_port = resolve_kube_api_port_for_instance(instance, trace_id).await;
     if is_home_lab_wsl_instance(instance) {
+        let endpoint = home_lab_public_kube_api_endpoint(instance)?;
         info!(
             target: "wsl",
             trace_id = %trace_id,
             instance = %instance,
-            api_host = "127.0.0.1",
-            api_port,
-            "Endpoint API Kubernetes retenu (backend loopback direct)"
+            api_host = %endpoint.host,
+            api_port = endpoint.port,
+            tls_server_name = %endpoint.tls_server_name.as_deref().unwrap_or(""),
+            "Endpoint API Kubernetes retenu (proxy SNI public)"
         );
         log_wsl_event(format!(
-            "[{trace_id}] Endpoint API Kubernetes pour {}: 127.0.0.1:{} (direct-backend)",
+            "[{trace_id}] Endpoint API Kubernetes pour {}: {}:{} (proxy-sni-public)",
             escape_for_log(instance),
-            api_port
+            escape_for_log(&endpoint.host),
+            endpoint.port
         ));
+        return Ok(endpoint);
+    }
+
+    let api_port = resolve_kube_api_port_for_instance(instance, trace_id).await;
+    if let Some(domain) = primary_cluster_domain(instance) {
+        if tcp_connect_once(&domain, api_port, Duration::from_millis(700))
+            .await
+            .is_ok()
+        {
+            return Ok(KubeApiEndpoint {
+                host: domain,
+                port: api_port,
+                tls_server_name: None,
+            });
+        }
+    }
+
+    if tcp_connect_once("127.0.0.1", api_port, Duration::from_millis(700))
+        .await
+        .is_ok()
+    {
         return Ok(KubeApiEndpoint {
             host: "127.0.0.1".to_string(),
             port: api_port,
             tls_server_name: None,
         });
-    }
-
-    if !is_home_lab_wsl_instance(instance) {
-        if let Some(domain) = primary_cluster_domain(instance) {
-            if tcp_connect_once(&domain, api_port, Duration::from_millis(700))
-                .await
-                .is_ok()
-            {
-                return Ok(KubeApiEndpoint {
-                    host: domain,
-                    port: api_port,
-                    tls_server_name: None,
-                });
-            }
-        }
-
-        if tcp_connect_once("127.0.0.1", api_port, Duration::from_millis(700))
-            .await
-            .is_ok()
-        {
-            return Ok(KubeApiEndpoint {
-                host: "127.0.0.1".to_string(),
-                port: api_port,
-                tls_server_name: None,
-            });
-        }
     }
 
     if let Some(domain) = primary_cluster_domain(instance) {
@@ -5999,12 +6012,7 @@ async fn wait_for_kube_api_port(
     let timeout = Duration::from_secs(KUBE_API_READY_TIMEOUT_SECONDS);
     let mut attempt: u32 = 0;
     let mut last_error = String::new();
-    let probe_targets = if is_home_lab_wsl_instance(instance) {
-        let plan = instance_port_plan(instance);
-        vec![("127.0.0.1".to_string(), plan.api_backend_port)]
-    } else {
-        vec![(endpoint.host.clone(), endpoint.port)]
-    };
+    let probe_targets = vec![(endpoint.host.clone(), endpoint.port)];
 
     loop {
         if started_at.elapsed() >= timeout {
@@ -8449,6 +8457,22 @@ mod tests {
         assert_eq!(first.ingress_https_backend_port, 2001);
         assert_eq!(second.ingress_http_backend_port, 2002);
         assert_eq!(second.ingress_https_backend_port, 2003);
+    }
+
+    #[test]
+    fn home_lab_instances_use_public_dns_endpoint_for_kube_api() {
+        if allocation_overrides_present() {
+            return;
+        }
+
+        let endpoint =
+            home_lab_public_kube_api_endpoint(HOME_LAB_WSL_INSTANCE_PREFIX).expect("endpoint");
+        assert_eq!(endpoint.host, "home-lab-k3s.wsl");
+        assert_eq!(endpoint.port, DEFAULT_API_INBOUND_PORT);
+        assert_eq!(
+            endpoint.tls_server_name.as_deref(),
+            Some("home-lab-k3s.wsl")
+        );
     }
 
     #[test]
