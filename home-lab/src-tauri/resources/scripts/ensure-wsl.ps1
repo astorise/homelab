@@ -268,6 +268,17 @@ function Resolve-WslPackageMsiPath {
     return $null
 }
 
+function Get-WindowsOptionalFeatureState {
+    param([string]$FeatureName)
+
+    try {
+        $feature = Get-WindowsOptionalFeature -Online -FeatureName $FeatureName -ErrorAction Stop
+        return [string]$feature.State
+    } catch {
+        return $null
+    }
+}
+
 function Register-WslRetryTask {
     if (-not $ScheduleRetry.IsPresent) {
         return
@@ -366,8 +377,14 @@ function Get-WslAvailability {
 
 function Enable-WslWindowsFeatures {
     $restartRequired = $false
+    $featuresChanged = $false
 
     foreach ($featureName in @('Microsoft-Windows-Subsystem-Linux', 'VirtualMachinePlatform')) {
+        $stateBefore = Get-WindowsOptionalFeatureState -FeatureName $featureName
+        if (($stateBefore -ne $null) -and ($stateBefore -ne 'Enabled')) {
+            $featuresChanged = $true
+        }
+
         Write-Info "Activation de la fonctionnalite Windows $featureName via DISM."
         $result = Invoke-DismExe -Arguments @(
             '/online',
@@ -395,7 +412,15 @@ function Enable-WslWindowsFeatures {
         }
     }
 
-    return $restartRequired
+    if ($featuresChanged) {
+        $restartRequired = $true
+        Write-Info 'Les fonctionnalites Windows WSL ont ete modifiees. Un redemarrage Windows est requis avant la suite.'
+    }
+
+    [pscustomobject]@{
+        RestartRequired = $restartRequired
+        FeaturesChanged = $featuresChanged
+    }
 }
 
 function Invoke-WslInstallAttempt {
@@ -436,6 +461,77 @@ function Install-WslPackageMsi {
         ExitCode        = $result.ExitCode
         Details         = $details
         RestartRequired = ($result.ExitCode -eq 3010) -or ($result.ExitCode -eq 1641)
+    }
+}
+
+function Invoke-WslPackageInstallFlow {
+    $msiPath = Resolve-WslPackageMsiPath
+    if ([string]::IsNullOrWhiteSpace($msiPath)) {
+        return [pscustomobject]@{
+            Success         = $false
+            PackageFound    = $false
+            Deferred        = $false
+            RestartRequired = $false
+            ContinueWithWsl = $true
+            Details         = 'wsl.msi introuvable dans le package WSL.'
+        }
+    }
+
+    $msiAttempt = Install-WslPackageMsi
+    if ($msiAttempt.ExitCode -eq 0) {
+        return [pscustomobject]@{
+            Success         = $true
+            PackageFound    = $true
+            Deferred        = $false
+            RestartRequired = $msiAttempt.RestartRequired
+            ContinueWithWsl = $false
+            Details         = $msiAttempt.Details
+        }
+    }
+
+    if ($msiAttempt.RestartRequired) {
+        return [pscustomobject]@{
+            Success         = $false
+            PackageFound    = $true
+            Deferred        = $true
+            RestartRequired = $true
+            ContinueWithWsl = $false
+            Details         = $msiAttempt.Details
+        }
+    }
+
+    if ($msiAttempt.ExitCode -in @(1500, 1618)) {
+        Write-Info 'Une autre installation MSI est deja en cours. La finalisation WSL sera reprise hors du contexte courant.'
+        return [pscustomobject]@{
+            Success         = $false
+            PackageFound    = $true
+            Deferred        = $true
+            RestartRequired = $false
+            ContinueWithWsl = $false
+            Details         = $msiAttempt.Details
+        }
+    }
+
+    if ($msiAttempt.ExitCode -eq 1638) {
+        Write-Info 'wsl.msi est deja installe. Bascule sur wsl.exe pour finaliser WSL.'
+        return [pscustomobject]@{
+            Success         = $false
+            PackageFound    = $true
+            Deferred        = $false
+            RestartRequired = $false
+            ContinueWithWsl = $true
+            Details         = $msiAttempt.Details
+        }
+    }
+
+    return [pscustomobject]@{
+        Success         = $false
+        PackageFound    = $true
+        Deferred        = $false
+        RestartRequired = $false
+        ContinueWithWsl = $false
+        Details         = $msiAttempt.Details
+        ExitCode        = $msiAttempt.ExitCode
     }
 }
 
@@ -526,21 +622,44 @@ function Complete-WslInstallLater {
 }
 
 function Install-WslIfMissing {
-    $restartRequired = $false
+    Write-Info 'Activation DISM des fonctionnalites Windows requises avant l installation de WSL.'
+    $featureState = Enable-WslWindowsFeatures
 
-    if ([string]::IsNullOrWhiteSpace((Resolve-WslExecutablePath))) {
-        Write-Info 'wsl.exe introuvable. Activation des fonctionnalites Windows requises avant l installation de WSL.'
-        $restartRequired = Enable-WslWindowsFeatures
-
-        if ([string]::IsNullOrWhiteSpace((Resolve-WslExecutablePath))) {
-            Complete-WslInstallLater -Reason 'wsl.exe reste introuvable apres activation des fonctionnalites Windows.'
-            return
-        }
+    if ($featureState.FeaturesChanged) {
+        Complete-WslInstallLater -Reason 'Les fonctionnalites Windows WSL viennent d etre activees et la suite sera reprise apres redemarrage.'
+        return
     }
 
+    if ([string]::IsNullOrWhiteSpace((Resolve-WslExecutablePath))) {
+        Complete-WslInstallLater -Reason 'wsl.exe reste introuvable apres verification DISM.'
+        return
+    }
+
+    $msiFlow = Invoke-WslPackageInstallFlow
+    if ($msiFlow.Success) {
+        if ($msiFlow.RestartRequired -or $featureState.RestartRequired) {
+            Complete-WslInstallLater -Reason 'L installation WSL demande encore un redemarrage Windows.'
+        }
+        return
+    }
+
+    if ($msiFlow.Deferred) {
+        Complete-WslInstallLater -Reason 'La finalisation WSL doit etre rejouee hors du contexte courant.'
+        return
+    }
+
+    if (-not $msiFlow.ContinueWithWsl) {
+        if ($msiFlow.Details) {
+            throw "Installation automatique de WSL via wsl.msi echouee :`n$($msiFlow.Details)"
+        }
+
+        throw 'Installation automatique de WSL via wsl.msi echouee.'
+    }
+
+    Write-Info 'wsl.msi indisponible ou deja present. Bascule sur wsl.exe.'
     $attempt = Invoke-WslInstallFlow -Arguments @('--install', '--no-distribution') -Label 'wsl.exe --install --no-distribution'
     if ($attempt.Success) {
-        if ($attempt.RestartRequired) {
+        if ($attempt.RestartRequired -or $featureState.RestartRequired) {
             Complete-WslInstallLater -Reason 'L installation WSL demande encore un redemarrage Windows.'
         }
         return
@@ -550,7 +669,7 @@ function Install-WslIfMissing {
         Write-Info "L option --no-distribution n est pas supportee. Nouvelle tentative avec 'wsl --install'."
         $legacyAttempt = Invoke-WslInstallFlow -Arguments @('--install') -Label 'wsl.exe --install'
         if ($legacyAttempt.Success) {
-            if ($legacyAttempt.RestartRequired) {
+            if ($legacyAttempt.RestartRequired -or $featureState.RestartRequired) {
                 Complete-WslInstallLater -Reason 'L installation WSL demande encore un redemarrage Windows.'
             }
             return
@@ -573,58 +692,11 @@ function Install-WslIfMissing {
         return
     }
 
-    if (-not $restartRequired) {
-        Write-Info 'Lancement d une activation DISM en secours avant une derniere tentative.'
-        $restartRequired = Enable-WslWindowsFeatures
-
-        if ([string]::IsNullOrWhiteSpace((Resolve-WslExecutablePath))) {
-            Complete-WslInstallLater -Reason 'Activation DISM effectuee. Un redemarrage Windows est probablement necessaire avant que WSL soit disponible.'
-            return
-        }
-
-        $retryAttempt = Invoke-WslInstallFlow -Arguments @('--install', '--no-distribution') -Label 'wsl.exe --install --no-distribution'
-        if ($retryAttempt.Success) {
-            if ($retryAttempt.RestartRequired) {
-                Complete-WslInstallLater -Reason 'L installation WSL demande encore un redemarrage Windows.'
-            }
-            return
-        }
-
-        if ($retryAttempt.UnsupportedSwitch) {
-            Write-Info "L option --no-distribution n est pas supportee apres activation DISM. Nouvelle tentative avec 'wsl --install'."
-            $legacyRetryAttempt = Invoke-WslInstallFlow -Arguments @('--install') -Label 'wsl.exe --install'
-            if ($legacyRetryAttempt.Success) {
-                if ($legacyRetryAttempt.RestartRequired) {
-                    Complete-WslInstallLater -Reason 'L installation WSL demande encore un redemarrage Windows.'
-                }
-                return
-            }
-
-            if ($legacyRetryAttempt.Deferred) {
-                Complete-WslInstallLater -Reason 'La finalisation WSL doit etre rejouee hors du contexte courant.'
-                return
-            }
-
-            if ($legacyRetryAttempt.Details) {
-                throw "Installation automatique de WSL echouee :`n$($legacyRetryAttempt.Details)"
-            }
-
-            throw 'Installation automatique de WSL echouee.'
-        }
-
-        if ($retryAttempt.Deferred) {
-            Complete-WslInstallLater -Reason 'La finalisation WSL doit etre rejouee hors du contexte courant.'
-            return
-        }
-
-        if ($retryAttempt.Details) {
-            throw "Installation automatique de WSL echouee :`n$($retryAttempt.Details)"
-        }
-
-        throw 'Installation automatique de WSL echouee.'
+    if ($attempt.Details) {
+        throw "Installation automatique de WSL echouee :`n$($attempt.Details)"
     }
 
-    Complete-WslInstallLater -Reason 'L installation WSL a ete demandee, mais un redemarrage Windows peut encore etre necessaire.'
+    throw 'Installation automatique de WSL echouee.'
 }
 
 try {
