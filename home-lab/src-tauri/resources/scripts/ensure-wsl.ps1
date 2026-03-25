@@ -74,10 +74,6 @@ function Resolve-MsiexecExecutablePath {
     Resolve-SystemExecutablePath -ExecutableName 'msiexec.exe'
 }
 
-function Resolve-SchtasksExecutablePath {
-    Resolve-SystemExecutablePath -ExecutableName 'schtasks.exe'
-}
-
 function Resolve-WindowsPowerShellPath {
     $roots = @(
         @($env:SystemRoot, $env:WINDIR) |
@@ -156,17 +152,6 @@ function Invoke-Msiexec {
     }
 
     Invoke-ExternalExecutable -ExecutablePath $msiexecPath -Arguments $Arguments
-}
-
-function Invoke-Schtasks {
-    param([string[]]$Arguments)
-
-    $schtasksPath = Resolve-SchtasksExecutablePath
-    if ([string]::IsNullOrWhiteSpace($schtasksPath)) {
-        throw 'schtasks.exe introuvable.'
-    }
-
-    Invoke-ExternalExecutable -ExecutablePath $schtasksPath -Arguments $Arguments
 }
 
 function Test-NoDistroMessage {
@@ -297,39 +282,24 @@ function Register-WslRetryTask {
         throw 'Impossible de determiner le chemin du script ensure-wsl.ps1.'
     }
 
-    $taskCommand = '"' + $powershellPath + '" -NoProfile -ExecutionPolicy Bypass -File "' + $scriptPath + '" -ScheduleRetry'
+    $taskArguments = '-NoProfile -ExecutionPolicy Bypass -File "' + $scriptPath + '" -ScheduleRetry'
     Write-Info "Programmation d une reprise WSL via la tache planifiee $($script:WslRetryTaskName)."
-    $result = Invoke-Schtasks -Arguments @(
-        '/Create',
-        '/TN', $script:WslRetryTaskName,
-        '/SC', 'ONSTART',
-        '/RU', 'SYSTEM',
-        '/RL', 'HIGHEST',
-        '/TR', $taskCommand,
-        '/F'
-    )
-    $details = Join-CommandOutput -Lines $result.Output
-
-    if ($details) {
-        Write-Info ("schtasks.exe /Create a renvoye :" + [Environment]::NewLine + $details)
-    }
-
-    if ($result.ExitCode -ne 0) {
-        if ($details) {
-            throw "Impossible de programmer la reprise WSL (code $($result.ExitCode)) :`n$details"
-        }
-
-        throw "Impossible de programmer la reprise WSL (code $($result.ExitCode))."
-    }
+    $action = New-ScheduledTaskAction -Execute $powershellPath -Argument $taskArguments
+    $trigger = New-ScheduledTaskTrigger -AtStartup
+    $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+    Register-ScheduledTask -TaskName $script:WslRetryTaskName -Action $action -Trigger $trigger -Principal $principal -Force | Out-Null
 }
 
 function Unregister-WslRetryTask {
-    $result = Invoke-Schtasks -Arguments @('/Delete', '/TN', $script:WslRetryTaskName, '/F')
-    if (($result.ExitCode -ne 0) -and ($result.ExitCode -ne 1)) {
-        $details = Join-CommandOutput -Lines $result.Output
-        if ($details) {
-            Write-Info ("Impossible de supprimer la tache planifiee WSL :" + [Environment]::NewLine + $details)
-        }
+    $existingTask = Get-ScheduledTask -TaskName $script:WslRetryTaskName -ErrorAction SilentlyContinue
+    if ($null -eq $existingTask) {
+        return
+    }
+
+    try {
+        Unregister-ScheduledTask -TaskName $script:WslRetryTaskName -Confirm:$false -ErrorAction Stop
+    } catch {
+        Write-Info ("Impossible de supprimer la tache planifiee WSL :" + [Environment]::NewLine + $_.Exception.Message)
     }
 }
 
