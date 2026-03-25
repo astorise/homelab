@@ -309,6 +309,20 @@ function Wait-K3sInitScriptReady {
     }
 }
 
+function Test-K3sBinaryReady {
+    param(
+        [string]$Distro,
+        [string]$Operation = 'Verification binaire k3s'
+    )
+
+$cmd = @'
+set -eu
+test -s /usr/local/bin/k3s
+test -x /usr/local/bin/k3s
+'@
+    Invoke-WslScript -Distro $Distro -Script $cmd -Operation $Operation
+}
+
 function Get-K3sInitScriptContent {
     $sourcePath = [System.IO.Path]::Combine((Get-ScriptDirectory), 'k3s-init.sh')
     if (-not (Test-Path -LiteralPath $sourcePath)) {
@@ -640,6 +654,22 @@ function Invoke-K3sBootstrap {
     )
 
     Write-Info "Initialisation de k3s (bootstrap) dans $Distro"
+    $k3sBinaryState = Test-K3sBinaryReady -Distro $Distro -Operation 'Preparation bootstrap binaire k3s'
+    if ($k3sBinaryState.ExitCode -ne 0) {
+        $details = if ($k3sBinaryState.Output) {
+            ($k3sBinaryState.Output) -join "`n"
+        } else {
+            ''
+        }
+
+        if ($details) {
+            Write-Info ("Bootstrap k3s differe : /usr/local/bin/k3s est absent ou non executable." + [Environment]::NewLine + $details)
+        } else {
+            Write-Info 'Bootstrap k3s differe : /usr/local/bin/k3s est absent ou non executable.'
+        }
+        return
+    }
+
     $visibilityAttempts = [Math]::Min([Math]::Max([int]($TimeoutSeconds * 2), 20), 120)
     $readyState = Wait-K3sInitScriptReady -Distro $Distro -Attempts $visibilityAttempts -DelayMs 500 -Operation 'Preparation bootstrap k3s-init.sh'
     if (-not $readyState.Ready) {

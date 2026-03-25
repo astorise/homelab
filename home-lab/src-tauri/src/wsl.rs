@@ -1984,7 +1984,7 @@ rm -f /etc/rancher/k3s/k3s.yaml /root/.kube/config || true
 
 fn bootstrap_k3s_for_instance_if_available(instance: &str) -> Result<()> {
     let script = format!(
-        "set -eu; if [ ! -s /usr/local/bin/k3s-init.sh ]; then exit 0; fi; BOOTSTRAP_ONLY=1 BOOTSTRAP_TIMEOUT={} sh /usr/local/bin/k3s-init.sh",
+        "set -eu; if [ ! -s /usr/local/bin/k3s-init.sh ] || [ ! -x /usr/local/bin/k3s ]; then exit 0; fi; BOOTSTRAP_ONLY=1 BOOTSTRAP_TIMEOUT={} sh /usr/local/bin/k3s-init.sh",
         K3S_BOOTSTRAP_TIMEOUT_SECONDS
     );
     let command_line = format_cli_command("wsl.exe", &["-d", instance, "--", "sh", "-lc", &script]);
@@ -2504,10 +2504,7 @@ async fn wsl_import_instance_with_paths(
                 "Echec import WSL pour l'instance {}: {err}",
                 sanitized_debug
             ));
-            ProvisionResult {
-                ok: false,
-                message,
-            }
+            ProvisionResult { ok: false, message }
         }
     };
 
@@ -2527,7 +2524,8 @@ async fn wsl_import_instance_with_paths(
         } else {
             match is_wsl_instance_present(&sanitized_name).await {
                 Ok(true) => {
-                    match enforce_instance_api_port_range(&sanitized_name, expected_api_port).await {
+                    match enforce_instance_api_port_range(&sanitized_name, expected_api_port).await
+                    {
                         Ok(_) => {
                             append_provision_message(
                                 &mut provision.message,
@@ -2597,6 +2595,36 @@ async fn wsl_import_instance_with_paths(
                     sanitized_debug,
                     escape_for_log(&extra)
                 ));
+
+                match bootstrap_k3s_for_instance_if_available(&sanitized_name) {
+                    Ok(()) => {
+                        append_provision_message(
+                            &mut provision.message,
+                            "Bootstrap K3S initialise apres installation du binaire.",
+                        );
+                        log_wsl_event(format!(
+                            "Bootstrap K3S relance apres installation pour {}",
+                            sanitized_debug
+                        ));
+                    }
+                    Err(err) => {
+                        warn!(
+                            target: "wsl",
+                            instance = %sanitized_name,
+                            error = %err,
+                            "Bootstrap K3S impossible apres installation"
+                        );
+                        append_provision_message(
+                            &mut provision.message,
+                            &format!("Bootstrap K3S impossible apres installation: {err}"),
+                        );
+                        log_wsl_event(format!(
+                            "Bootstrap K3S impossible apres installation pour {}: {}",
+                            sanitized_debug,
+                            escape_for_log(&err.to_string())
+                        ));
+                    }
+                }
             }
             Err(err) => {
                 warn!(
