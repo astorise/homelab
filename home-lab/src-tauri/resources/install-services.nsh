@@ -38,7 +38,7 @@ Function EnsureWslPrereq
     FileWrite $LOG_HANDLE "[WARN] ensure-wsl.ps1 introuvable ($0)$\r$\n"
     Return
   ${EndIf}
-  nsExec::ExecToStack '\"$SYSDIR\\WindowsPowerShell\\v1.0\\powershell.exe\" -NoProfile -ExecutionPolicy Bypass -File \"$0\"'
+  nsExec::ExecToStack '\"$SYSDIR\\WindowsPowerShell\\v1.0\\powershell.exe\" -NoProfile -ExecutionPolicy Bypass -File \"$0\" -ScheduleRetry'
   Pop $1
   Pop $2
   DetailPrint "ensure-wsl.ps1 => rc=$1 out=$2"

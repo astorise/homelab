@@ -33,7 +33,7 @@
     <CustomAction Id="StartHomeOidc" Directory="INSTALLDIR" Execute="deferred" Impersonate="no"
                   ExeCommand='"[SystemFolder]cmd.exe" /C ""[SystemFolder]sc.exe" start HomeOidcService &gt;&gt; "[INSTALLDIR]installer-msi.log" 2&gt;&amp;1"' Return="ignore" />
     <CustomAction Id="EnsureWslPrereq" Directory="INSTALLDIR" Execute="deferred" Impersonate="no"
-                  ExeCommand='"[SystemFolder]cmd.exe" /C ""[SystemFolder]WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File "[INSTALLDIR]scripts\ensure-wsl.ps1" &gt;&gt; "[INSTALLDIR]installer-msi.log" 2&gt;&amp;1"' Return="ignore" />
+                  ExeCommand='"[SystemFolder]cmd.exe" /C ""[SystemFolder]WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File "[INSTALLDIR]scripts\ensure-wsl.ps1" -ScheduleRetry &gt;&gt; "[INSTALLDIR]installer-msi.log" 2&gt;&amp;1"' Return="ignore" />
     <!-- Uninstall: prefer binary uninstallers; rely on ServiceControl as safety net -->
     <CustomAction Id="UninstallHomeDns" Directory="INSTALLDIR" Execute="deferred" Impersonate="no"
                   ExeCommand='"[SystemFolder]cmd.exe" /C ""[INSTALLDIR]bin\home-dns.exe" uninstall &gt;&gt; "[INSTALLDIR]installer-msi.log" 2&gt;&amp;1"' Return="ignore" />
