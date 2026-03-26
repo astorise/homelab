@@ -2463,6 +2463,22 @@ fn read_instance_kubectl_config_view(instance: &str) -> Result<KubectlConfigView
     )
 }
 
+fn home_lab_loopback_kube_api_endpoint(instance: &str) -> Result<KubeApiEndpoint> {
+    let plan = instance_port_plan(instance);
+    let domain = primary_cluster_domain(instance).ok_or_else(|| {
+        anyhow!(
+            "Aucun domaine principal disponible pour l'endpoint API Kubernetes de '{}'.",
+            instance
+        )
+    })?;
+
+    Ok(KubeApiEndpoint {
+        host: "127.0.0.1".to_string(),
+        port: plan.api_public_port,
+        tls_server_name: Some(domain),
+    })
+}
+
 fn build_managed_kube_entry(instance: &str) -> Result<ManagedKubeEntry> {
     let view = read_instance_kubectl_config_view(instance)?;
 
@@ -2495,20 +2511,39 @@ fn build_managed_kube_entry(instance: &str) -> Result<ManagedKubeEntry> {
     let cluster_name = format!("{base_name}-cluster");
     let user_name = format!("{base_name}-user");
     let context_name = base_name;
-    let api_port = if is_home_lab_wsl_instance(instance) {
-        plan.api_public_port
+    let api_endpoint = if is_home_lab_wsl_instance(instance) {
+        home_lab_loopback_kube_api_endpoint(instance)?
     } else {
-        plan.api_backend_port
+        let api_port = plan.api_backend_port;
+        let api_host = primary_cluster_domain(instance).unwrap_or_else(|| "127.0.0.1".to_string());
+        KubeApiEndpoint {
+            host: api_host,
+            port: api_port,
+            tls_server_name: None,
+        }
     };
-    let api_host = primary_cluster_domain(instance).unwrap_or_else(|| "127.0.0.1".to_string());
 
     let mut cluster_json = selected_cluster.cluster.clone();
     if let serde_json::Value::Object(map) = &mut cluster_json {
         map.insert(
             "server".to_string(),
-            serde_json::Value::String(format!("https://{api_host}:{api_port}")),
+            serde_json::Value::String(format!(
+                "https://{}:{}",
+                api_endpoint.host, api_endpoint.port
+            )),
         );
-        map.remove("tls-server-name");
+        if let Some(server_name) = api_endpoint
+            .tls_server_name
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            map.insert(
+                "tls-server-name".to_string(),
+                serde_json::Value::String(server_name.to_string()),
+            );
+        } else {
+            map.remove("tls-server-name");
+        }
     }
 
     let cluster_value = serde_yaml::to_value(&cluster_json).context("Conversion cluster YAML")?;
@@ -6148,29 +6183,13 @@ struct KubeApiEndpoint {
     tls_server_name: Option<String>,
 }
 
-fn home_lab_public_kube_api_endpoint(instance: &str) -> Result<KubeApiEndpoint> {
-    let plan = instance_port_plan(instance);
-    let domain = primary_cluster_domain(instance).ok_or_else(|| {
-        anyhow!(
-            "Aucun domaine principal disponible pour l'endpoint API Kubernetes de '{}'.",
-            instance
-        )
-    })?;
-
-    Ok(KubeApiEndpoint {
-        host: domain.clone(),
-        port: plan.api_public_port,
-        tls_server_name: Some(domain),
-    })
-}
-
 async fn resolve_kube_api_endpoint_for_instance(
     instance: &str,
     trace_id: &str,
 ) -> Result<KubeApiEndpoint> {
     if is_home_lab_wsl_instance(instance) {
         sync_home_http_wsl_target(instance, trace_id).await?;
-        let endpoint = home_lab_public_kube_api_endpoint(instance)?;
+        let endpoint = home_lab_loopback_kube_api_endpoint(instance)?;
         info!(
             target: "wsl",
             trace_id = %trace_id,
@@ -6181,7 +6200,7 @@ async fn resolve_kube_api_endpoint_for_instance(
             "Endpoint API Kubernetes retenu (proxy SNI public)"
         );
         log_wsl_event(format!(
-            "[{trace_id}] Endpoint API Kubernetes pour {}: {}:{} (proxy-sni-public)",
+            "[{trace_id}] Endpoint API Kubernetes pour {}: {}:{} (proxy-loopback-sni)",
             escape_for_log(instance),
             escape_for_log(&endpoint.host),
             endpoint.port
@@ -8699,14 +8718,14 @@ mod tests {
     }
 
     #[test]
-    fn home_lab_instances_use_public_dns_endpoint_for_kube_api() {
+    fn home_lab_instances_use_loopback_endpoint_for_kube_api() {
         if allocation_overrides_present() {
             return;
         }
 
         let endpoint =
-            home_lab_public_kube_api_endpoint(HOME_LAB_WSL_INSTANCE_PREFIX).expect("endpoint");
-        assert_eq!(endpoint.host, "home-lab-k3s.wsl");
+            home_lab_loopback_kube_api_endpoint(HOME_LAB_WSL_INSTANCE_PREFIX).expect("endpoint");
+        assert_eq!(endpoint.host, "127.0.0.1");
         assert_eq!(endpoint.port, DEFAULT_API_INBOUND_PORT);
         assert_eq!(
             endpoint.tls_server_name.as_deref(),
