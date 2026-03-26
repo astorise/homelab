@@ -898,11 +898,249 @@ fn k3s_api_port_for_instance(instance: &str) -> u16 {
     instance_port_plan(instance).api_backend_port
 }
 
+fn home_http_config_path() -> PathBuf {
+    PathBuf::from(r"C:\ProgramData\home-http\http.yaml")
+}
+
+fn write_text_file_atomic(path: &Path, contents: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Creation du dossier {}", parent.display()))?;
+    }
+    let tmp_path = path.with_extension("tmp");
+    fs::write(&tmp_path, contents)
+        .with_context(|| format!("Ecriture du fichier temporaire {}", tmp_path.display()))?;
+    fs::rename(&tmp_path, path).with_context(|| {
+        format!(
+            "Remplacement atomique de {} par {} impossible",
+            path.display(),
+            tmp_path.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn home_http_set_yaml_string(
+    mapping: &mut serde_yaml::Mapping,
+    key: &str,
+    value: &str,
+) -> Result<bool> {
+    let key_value = serde_yaml::Value::String(key.to_string());
+    let value_value = serde_yaml::to_value(value).context("Conversion YAML string impossible")?;
+    let changed = mapping.get(&key_value) != Some(&value_value);
+    if changed {
+        mapping.insert(key_value, value_value);
+    }
+    Ok(changed)
+}
+
+fn home_http_set_yaml_u64(
+    mapping: &mut serde_yaml::Mapping,
+    key: &str,
+    value: u64,
+) -> Result<bool> {
+    let key_value = serde_yaml::Value::String(key.to_string());
+    let value_value = serde_yaml::to_value(value).context("Conversion YAML numeric impossible")?;
+    let changed = mapping.get(&key_value) != Some(&value_value);
+    if changed {
+        mapping.insert(key_value, value_value);
+    }
+    Ok(changed)
+}
+
+fn home_http_should_skip_wsl_interface(iface: &str) -> bool {
+    let iface = iface.trim();
+    iface.eq_ignore_ascii_case("lo")
+        || iface.starts_with("cni")
+        || iface.starts_with("flannel")
+        || iface.starts_with("docker")
+        || iface.starts_with("veth")
+        || iface.starts_with("br-")
+        || iface.eq_ignore_ascii_case("kube-ipvs0")
+}
+
+fn parse_default_route_interface(output: &str) -> Option<String> {
+    output.lines().find_map(|line| {
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        tokens.windows(2).find_map(|pair| {
+            if pair[0] == "dev" {
+                let candidate = pair[1].trim().trim_matches('\0');
+                (!candidate.is_empty()).then(|| candidate.to_string())
+            } else {
+                None
+            }
+        })
+    })
+}
+
+fn parse_wsl_instance_ipv4(addr_output: &str, preferred_interface: Option<&str>) -> Option<String> {
+    let mut fallback = None::<String>;
+
+    for line in addr_output.lines() {
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        let Some(iface) = tokens.get(1).copied() else {
+            continue;
+        };
+        if home_http_should_skip_wsl_interface(iface) {
+            continue;
+        }
+        let Some(inet_index) = tokens.iter().position(|token| *token == "inet") else {
+            continue;
+        };
+        let Some(raw_ip) = tokens.get(inet_index + 1) else {
+            continue;
+        };
+        let Some(host) = raw_ip.split('/').next() else {
+            continue;
+        };
+        let Ok(ip) = host.parse::<Ipv4Addr>() else {
+            continue;
+        };
+        if ip.is_loopback() || ip.is_unspecified() {
+            continue;
+        }
+        let candidate = ip.to_string();
+        if preferred_interface
+            .map(|preferred| preferred == iface)
+            .unwrap_or(false)
+        {
+            return Some(candidate);
+        }
+        if fallback.is_none() {
+            fallback = Some(candidate);
+        }
+    }
+
+    fallback
+}
+
+async fn resolve_wsl_instance_host_ipv4(instance: &str, trace_id: &str) -> Result<String> {
+    const SPLIT_MARKER: &str = "__HOME_LAB_SPLIT__";
+    let instance_owned = instance.to_string();
+    let script = format!(
+        "ip -o -4 route show default 2>/dev/null || true; printf '{SPLIT_MARKER}\\n'; ip -o -4 addr show scope global 2>/dev/null || true"
+    );
+    let output = tauri::async_runtime::spawn_blocking(move || {
+        Command::new("wsl.exe")
+            .args(["-d", &instance_owned, "--", "sh", "-lc", &script])
+            .output()
+    })
+    .await
+    .context("JoinHandle resolution IP WSL impossible")?
+    .context("Execution wsl.exe pour resolution IP WSL impossible")?;
+
+    let stdout = decode_cli_output(&output.stdout);
+    let stderr = decode_cli_output(&output.stderr);
+    if !output.status.success() {
+        anyhow::bail!(
+            "Impossible de resoudre l'IP WSL de '{}' (code={:?}, stdout='{}', stderr='{}').",
+            instance,
+            output.status.code(),
+            stdout.trim(),
+            stderr.trim()
+        );
+    }
+
+    let (route_section, addr_section) = stdout
+        .split_once(SPLIT_MARKER)
+        .unwrap_or(("", stdout.as_str()));
+    let preferred_interface = parse_default_route_interface(route_section);
+    let ip =
+        parse_wsl_instance_ipv4(addr_section, preferred_interface.as_deref()).ok_or_else(|| {
+            anyhow!(
+                "Aucune IPv4 WSL joignable n'a pu etre detectee pour '{}'.",
+                instance
+            )
+        })?;
+
+    info!(
+        target: "wsl",
+        trace_id = %trace_id,
+        instance = %instance,
+        wsl_ip = %ip,
+        preferred_interface = %preferred_interface.as_deref().unwrap_or(""),
+        "Adresse IPv4 WSL retenue pour home-http"
+    );
+    log_wsl_event(format!(
+        "[{trace_id}] IP WSL retenue pour {}: {} (iface={})",
+        escape_for_log(instance),
+        escape_for_log(&ip),
+        escape_for_log(preferred_interface.as_deref().unwrap_or(""))
+    ));
+
+    Ok(ip)
+}
+
+fn update_home_http_wsl_ip_config(ip: &str) -> Result<bool> {
+    let path = home_http_config_path();
+    let raw = fs::read_to_string(&path)
+        .with_context(|| format!("Lecture de {} impossible", path.display()))?;
+    let mut value: serde_yaml::Value =
+        serde_yaml::from_str(&raw).with_context(|| format!("YAML invalide: {}", path.display()))?;
+    let mapping = value.as_mapping_mut().ok_or_else(|| {
+        anyhow!(
+            "La configuration home-http {} n'est pas une mapping YAML.",
+            path.display()
+        )
+    })?;
+
+    let mut changed = false;
+    changed |= home_http_set_yaml_string(mapping, "wsl_resolve", "manual")?;
+    changed |= home_http_set_yaml_string(mapping, "wsl_ip", ip)?;
+    changed |= home_http_set_yaml_u64(mapping, "wsl_refresh_secs", 30)?;
+
+    if !changed {
+        return Ok(false);
+    }
+
+    let rendered = serde_yaml::to_string(&value)
+        .with_context(|| format!("Serialisation YAML impossible pour {}", path.display()))?;
+    write_text_file_atomic(&path, &rendered)?;
+    Ok(true)
+}
+
+async fn sync_home_http_wsl_target(instance: &str, trace_id: &str) -> Result<()> {
+    if !is_home_lab_wsl_instance(instance) {
+        return Ok(());
+    }
+
+    let wsl_ip = resolve_wsl_instance_host_ipv4(instance, trace_id).await?;
+    let changed = tauri::async_runtime::spawn_blocking({
+        let wsl_ip = wsl_ip.clone();
+        move || update_home_http_wsl_ip_config(&wsl_ip)
+    })
+    .await
+    .context("JoinHandle mise a jour config home-http impossible")?
+    .context("Mise a jour config home-http impossible")?;
+
+    if changed {
+        retry_http_rpc("reload_config", || http::http_reload_config())
+            .await
+            .context("Reload config home-http impossible")?;
+        info!(
+            target: "wsl",
+            trace_id = %trace_id,
+            instance = %instance,
+            wsl_ip = %wsl_ip,
+            "Configuration home-http synchronisee avec l'IP WSL"
+        );
+        log_wsl_event(format!(
+            "[{trace_id}] home-http synchronise avec l'IP WSL pour {}: {}",
+            escape_for_log(instance),
+            escape_for_log(&wsl_ip)
+        ));
+    }
+
+    Ok(())
+}
+
 async fn configure_cluster_networking(instance: &str) -> Result<String> {
     let hosts = cluster_domains(instance);
     if hosts.is_empty() {
         anyhow::bail!("Aucun nom de domaine valide pour l'instance {instance}");
     }
+
+    sync_home_http_wsl_target(instance, "configure-cluster-networking").await?;
 
     let plan = instance_port_plan(instance);
     let https_backend_port = plan.ingress_https_backend_port;
@@ -5931,6 +6169,7 @@ async fn resolve_kube_api_endpoint_for_instance(
     trace_id: &str,
 ) -> Result<KubeApiEndpoint> {
     if is_home_lab_wsl_instance(instance) {
+        sync_home_http_wsl_target(instance, trace_id).await?;
         let endpoint = home_lab_public_kube_api_endpoint(instance)?;
         info!(
             target: "wsl",
