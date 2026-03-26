@@ -23,6 +23,7 @@ use std::ffi::{c_void, OsString};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::pin::Pin;
+use std::process::Command;
 use std::task::{Context as TaskContext, Poll};
 use std::{
     collections::HashMap,
@@ -32,7 +33,7 @@ use std::{
         Arc,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
@@ -118,8 +119,7 @@ use proto::homehttp::v1::{
 // Harmonized naming with DNS service
 const SERVICE_NAME: &str = "HomeHttpService";
 const SERVICE_DISPLAY_NAME: &str = "Home HTTP Service";
-const SERVICE_DESCRIPTION: &str =
-    r"HTTP, TLS SNI and TCP L4 proxy to WSL/Windows targets with Windows RPC IPC on endpoint home-http";
+const SERVICE_DESCRIPTION: &str = r"HTTP, TLS SNI and TCP L4 proxy to WSL/Windows targets with Windows RPC IPC on endpoint home-http";
 #[cfg(debug_assertions)]
 const NAMED_PIPE_NAME: &str = r"\\.\pipe\home-http-dev";
 #[cfg(not(debug_assertions))]
@@ -175,6 +175,12 @@ struct HttpConfig {
     http: u16,
     #[serde(default = "default_https_port")]
     https: u16,
+    #[serde(default = "default_wsl_resolve")]
+    wsl_resolve: String,
+    #[serde(default)]
+    wsl_ip: Option<String>,
+    #[serde(default = "default_wsl_refresh_secs")]
+    wsl_refresh_secs: u64,
     #[serde(default)]
     routes: HashMap<String, u16>, // host -> port (u16)
     #[serde(default)]
@@ -262,15 +268,14 @@ impl TcpRouteConfig {
         SocketAddr::new(self.listen_scope.bind_ip(), self.listen_port)
     }
 
-    fn resolve_target_hosts(&self) -> Vec<String> {
+    fn resolve_target_hosts(&self, shared: &Shared) -> Vec<String> {
         match self.target_kind {
-            TcpTargetKindConfig::Wsl => select_wsl_target_hosts(),
-            TcpTargetKindConfig::Address => vec![
-                self.target_host
-                    .clone()
-                    .filter(|value| !value.trim().is_empty())
-                    .unwrap_or_else(|| Ipv4Addr::LOCALHOST.to_string()),
-            ],
+            TcpTargetKindConfig::Wsl => select_wsl_target_hosts(shared),
+            TcpTargetKindConfig::Address => vec![self
+                .target_host
+                .clone()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| Ipv4Addr::LOCALHOST.to_string())],
         }
     }
 
@@ -279,8 +284,383 @@ impl TcpRouteConfig {
     }
 }
 
-fn select_wsl_target_hosts() -> Vec<String> {
+#[derive(Debug, Clone)]
+struct WslTargetCache {
+    hosts: Vec<String>,
+    last_refresh: Option<Instant>,
+    last_error: Option<String>,
+}
+
+impl WslTargetCache {
+    fn from_config(cfg: &HttpConfig) -> Self {
+        Self {
+            hosts: build_wsl_target_hosts(cfg, &[]),
+            last_refresh: None,
+            last_error: None,
+        }
+    }
+}
+
+fn default_wsl_resolve() -> String {
+    "auto".to_string()
+}
+
+fn default_wsl_refresh_secs() -> u64 {
+    30
+}
+
+fn default_wsl_target_hosts() -> Vec<String> {
     vec![Ipv4Addr::LOCALHOST.to_string()]
+}
+
+fn normalize_wsl_resolve_mode(value: &str) -> String {
+    let normalized = value.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        "auto".to_string()
+    } else {
+        normalized
+    }
+}
+
+fn push_unique_host(hosts: &mut Vec<String>, host: impl Into<String>) {
+    let host = host.into();
+    if !hosts
+        .iter()
+        .any(|existing| existing.eq_ignore_ascii_case(&host))
+    {
+        hosts.push(host);
+    }
+}
+
+fn normalize_host_candidate(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Ok(ip) = trimmed.parse::<IpAddr>() {
+        return Some(ip.to_string());
+    }
+    Some(trimmed.to_string())
+}
+
+fn auto_wsl_resolution_enabled(cfg: &HttpConfig) -> bool {
+    !matches!(
+        normalize_wsl_resolve_mode(&cfg.wsl_resolve).as_str(),
+        "localhost" | "local" | "off" | "disabled" | "manual" | "fixed"
+    )
+}
+
+fn build_wsl_target_hosts(cfg: &HttpConfig, discovered_hosts: &[String]) -> Vec<String> {
+    let mode = normalize_wsl_resolve_mode(&cfg.wsl_resolve);
+    let mut hosts = default_wsl_target_hosts();
+    let manual_host = cfg
+        .wsl_ip
+        .as_deref()
+        .and_then(normalize_host_candidate)
+        .filter(|host| !host.trim().is_empty());
+
+    if let Some(host) = manual_host {
+        push_unique_host(&mut hosts, host);
+    }
+
+    if matches!(mode.as_str(), "localhost" | "local" | "off" | "disabled") {
+        return hosts;
+    }
+
+    if auto_wsl_resolution_enabled(cfg) {
+        for host in discovered_hosts {
+            if let Some(host) = normalize_host_candidate(host) {
+                push_unique_host(&mut hosts, host);
+            }
+        }
+    }
+
+    hosts
+}
+
+fn select_wsl_target_hosts(shared: &Shared) -> Vec<String> {
+    let cfg = shared.cfg.lock().clone();
+    let cache = shared.wsl_targets.lock();
+    if cache.hosts.is_empty() {
+        build_wsl_target_hosts(&cfg, &[])
+    } else {
+        cache.hosts.clone()
+    }
+}
+
+fn decode_cli_output(data: &[u8]) -> String {
+    if data.is_empty() {
+        return String::new();
+    }
+
+    if let Ok(utf8) = std::str::from_utf8(data) {
+        if !utf8.contains('\0') {
+            return utf8.to_string();
+        }
+    }
+
+    if data.len() % 2 == 0 {
+        let utf16: Vec<u16> = data
+            .chunks_exact(2)
+            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+            .collect();
+        if let Ok(text) = String::from_utf16(&utf16) {
+            return text;
+        }
+        return String::from_utf16_lossy(&utf16);
+    }
+
+    String::from_utf8_lossy(data).into_owned()
+}
+
+fn parse_running_wsl_distributions(output: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    for line in output.lines() {
+        let trimmed = line.trim_matches('\0').trim();
+        if !trimmed.is_empty() {
+            let normalized = trimmed.to_string();
+            if !names.contains(&normalized) {
+                names.push(normalized);
+            }
+        }
+    }
+    names
+}
+
+fn parse_default_route_interfaces(output: &str) -> Vec<String> {
+    let mut interfaces = Vec::new();
+    for line in output.lines() {
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        for pair in tokens.windows(2) {
+            if pair[0] == "dev" {
+                let iface = pair[1].trim().trim_matches('\0').to_string();
+                if !iface.is_empty() && !interfaces.contains(&iface) {
+                    interfaces.push(iface);
+                }
+            }
+        }
+    }
+    interfaces
+}
+
+fn should_skip_wsl_interface(iface: &str) -> bool {
+    let iface = iface.trim();
+    iface.eq_ignore_ascii_case("lo")
+        || iface.starts_with("cni")
+        || iface.starts_with("flannel")
+        || iface.starts_with("docker")
+        || iface.starts_with("veth")
+        || iface.starts_with("br-")
+        || iface.eq_ignore_ascii_case("kube-ipvs0")
+}
+
+fn parse_wsl_ipv4_candidates(addr_output: &str, default_ifaces: &[String]) -> Vec<String> {
+    let mut preferred = Vec::new();
+    let mut fallback = Vec::new();
+
+    for line in addr_output.lines() {
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        let Some(iface) = tokens.get(1).copied() else {
+            continue;
+        };
+        if should_skip_wsl_interface(iface) {
+            continue;
+        }
+        let Some(inet_index) = tokens.iter().position(|token| *token == "inet") else {
+            continue;
+        };
+        let Some(raw_ip) = tokens.get(inet_index + 1) else {
+            continue;
+        };
+        let Some(host) = raw_ip.split('/').next() else {
+            continue;
+        };
+        let Ok(ip) = host.parse::<Ipv4Addr>() else {
+            continue;
+        };
+        if ip.is_loopback() || ip.is_unspecified() {
+            continue;
+        }
+        if default_ifaces.iter().any(|candidate| candidate == iface) {
+            push_unique_host(&mut preferred, ip.to_string());
+        } else {
+            push_unique_host(&mut fallback, ip.to_string());
+        }
+    }
+
+    for host in fallback {
+        push_unique_host(&mut preferred, host);
+    }
+    preferred
+}
+
+fn discover_wsl_target_hosts_for_distribution(distribution: &str) -> Result<Vec<String>> {
+    let script = "ip -o -4 route show default 2>/dev/null || true; printf '__HOME_LAB_SPLIT__\\n'; ip -o -4 addr show scope global 2>/dev/null || true";
+    let output = Command::new("wsl.exe")
+        .args(["-d", distribution, "--", "sh", "-lc", script])
+        .output()
+        .with_context(|| format!("execution de wsl.exe -d {} impossible", distribution))?;
+
+    if !output.status.success() {
+        let stdout = decode_cli_output(&output.stdout);
+        let stderr = decode_cli_output(&output.stderr);
+        anyhow::bail!(
+            "wsl.exe -d {} a echoue (code={:?}, stdout='{}', stderr='{}')",
+            distribution,
+            output.status.code(),
+            stdout.trim(),
+            stderr.trim()
+        );
+    }
+
+    let stdout = decode_cli_output(&output.stdout);
+    let (route_section, addr_section) = stdout
+        .split_once("__HOME_LAB_SPLIT__")
+        .unwrap_or(("", stdout.as_str()));
+    let default_ifaces = parse_default_route_interfaces(route_section);
+    Ok(parse_wsl_ipv4_candidates(addr_section, &default_ifaces))
+}
+
+fn discover_wsl_target_hosts_blocking() -> Result<Vec<String>> {
+    let output = Command::new("wsl.exe")
+        .args(["--list", "--running", "--quiet"])
+        .output()
+        .context("execution de wsl.exe --list --running --quiet impossible")?;
+
+    if !output.status.success() {
+        let stdout = decode_cli_output(&output.stdout);
+        let stderr = decode_cli_output(&output.stderr);
+        anyhow::bail!(
+            "wsl.exe --list --running --quiet a echoue (code={:?}, stdout='{}', stderr='{}')",
+            output.status.code(),
+            stdout.trim(),
+            stderr.trim()
+        );
+    }
+
+    let distributions = parse_running_wsl_distributions(&decode_cli_output(&output.stdout));
+    let mut hosts = Vec::new();
+    let mut errors = Vec::new();
+
+    for distribution in distributions {
+        match discover_wsl_target_hosts_for_distribution(&distribution) {
+            Ok(discovered) => {
+                for host in discovered {
+                    push_unique_host(&mut hosts, host);
+                }
+            }
+            Err(err) => errors.push(format!("{distribution}: {err}")),
+        }
+    }
+
+    if hosts.is_empty() && !errors.is_empty() {
+        anyhow::bail!("{}", errors.join(" | "));
+    }
+
+    Ok(hosts)
+}
+
+async fn refresh_wsl_target_cache(shared: &Shared, force: bool, reason: &str) -> Vec<String> {
+    let cfg = shared.cfg.lock().clone();
+    let refresh_window = Duration::from_secs(cfg.wsl_refresh_secs.max(1));
+
+    {
+        let cache = shared.wsl_targets.lock();
+        if !force {
+            let fresh_enough = cache
+                .last_refresh
+                .map(|last| last.elapsed() < refresh_window)
+                .unwrap_or(false);
+            if fresh_enough && !cache.hosts.is_empty() {
+                return cache.hosts.clone();
+            }
+            if !auto_wsl_resolution_enabled(&cfg) && !cache.hosts.is_empty() {
+                return cache.hosts.clone();
+            }
+        }
+    }
+
+    if !auto_wsl_resolution_enabled(&cfg) {
+        let hosts = build_wsl_target_hosts(&cfg, &[]);
+        let mut cache = shared.wsl_targets.lock();
+        cache.hosts = hosts.clone();
+        cache.last_refresh = Some(Instant::now());
+        cache.last_error = None;
+        return hosts;
+    }
+
+    match tokio::task::spawn_blocking(discover_wsl_target_hosts_blocking).await {
+        Ok(Ok(discovered)) => {
+            let hosts = build_wsl_target_hosts(&cfg, &discovered);
+            let mut cache = shared.wsl_targets.lock();
+            let changed = cache.hosts != hosts;
+            cache.hosts = hosts.clone();
+            cache.last_refresh = Some(Instant::now());
+            cache.last_error = None;
+            if changed {
+                info!(
+                    "WSL target hosts refreshed ({reason}): {}",
+                    hosts.join(", ")
+                );
+            }
+            hosts
+        }
+        Ok(Err(err)) => {
+            let mut cache = shared.wsl_targets.lock();
+            let fallback = if cache.hosts.is_empty() {
+                build_wsl_target_hosts(&cfg, &[])
+            } else {
+                cache.hosts.clone()
+            };
+            cache.last_refresh = Some(Instant::now());
+            cache.last_error = Some(err.to_string());
+            warn!(
+                "WSL target discovery failed ({reason}): {:#}; using {}",
+                err,
+                fallback.join(", ")
+            );
+            fallback
+        }
+        Err(err) => {
+            let mut cache = shared.wsl_targets.lock();
+            let fallback = if cache.hosts.is_empty() {
+                build_wsl_target_hosts(&cfg, &[])
+            } else {
+                cache.hosts.clone()
+            };
+            cache.last_refresh = Some(Instant::now());
+            cache.last_error = Some(err.to_string());
+            warn!(
+                "WSL target discovery task failed ({reason}): {err}; using {}",
+                fallback.join(", ")
+            );
+            fallback
+        }
+    }
+}
+
+async fn connect_wsl_target_port(shared: &Shared, port: u16) -> Result<(TcpStream, String)> {
+    let initial_hosts = refresh_wsl_target_cache(shared, false, "connect-initial").await;
+    match connect_target_hosts(initial_hosts.clone(), port).await {
+        Ok(result) => Ok(result),
+        Err(initial_err) => {
+            let refreshed_hosts = refresh_wsl_target_cache(shared, true, "connect-retry").await;
+            if refreshed_hosts != initial_hosts {
+                match connect_target_hosts(refreshed_hosts.clone(), port).await {
+                    Ok(result) => {
+                        info!(
+                            "WSL upstream connect recovered on retry for port {} via {}",
+                            port, result.1
+                        );
+                        Ok(result)
+                    }
+                    Err(retry_err) => Err(retry_err),
+                }
+            } else {
+                Err(initial_err)
+            }
+        }
+    }
 }
 
 async fn connect_target_hosts(hosts: Vec<String>, port: u16) -> Result<(TcpStream, String)> {
@@ -359,6 +739,9 @@ fn load_config_or_init() -> Result<HttpConfig> {
         let cfg = HttpConfig {
             http: 80,
             https: 443,
+            wsl_resolve: default_wsl_resolve(),
+            wsl_ip: None,
+            wsl_refresh_secs: default_wsl_refresh_secs(),
             routes: HashMap::new(),
             tcp_routes: Vec::new(),
             log_level: Some(default_level_str().into()),
@@ -442,10 +825,14 @@ fn tcp_route_from_request(req: AddTcpRouteRequest) -> Result<TcpRouteConfig> {
 async fn proxy_tcp_connection(
     mut inbound: TcpStream,
     route: TcpRouteConfig,
-    _shared: Shared,
+    shared: Shared,
 ) -> Result<()> {
-    let (mut outbound, target_host) =
-        connect_target_hosts(route.resolve_target_hosts(), route.target_port).await?;
+    let (mut outbound, target_host) = match route.target_kind {
+        TcpTargetKindConfig::Wsl => connect_wsl_target_port(&shared, route.target_port).await?,
+        TcpTargetKindConfig::Address => {
+            connect_target_hosts(route.resolve_target_hosts(&shared), route.target_port).await?
+        }
+    };
     inbound.set_nodelay(true)?;
     outbound.set_nodelay(true)?;
     let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound)
@@ -542,7 +929,10 @@ async fn run_tcp_route_listener_group(routes: Vec<TcpRouteConfig>, shared: Share
         });
     }
 
-    info!("TCP listener '{}' stopped on {}", first_route.name, bind_addr);
+    info!(
+        "TCP listener '{}' stopped on {}",
+        first_route.name, bind_addr
+    );
 }
 
 async fn sync_tcp_listeners(shared: &Shared) -> Result<()> {
@@ -556,7 +946,10 @@ async fn sync_tcp_listeners(shared: &Shared) -> Result<()> {
     }
     for routes in desired_by_key.values_mut() {
         routes.sort_by(|left, right| left.name.cmp(&right.name));
-        let sni_count = routes.iter().filter(|route| route.server_name.is_some()).count();
+        let sni_count = routes
+            .iter()
+            .filter(|route| route.server_name.is_some())
+            .count();
         if sni_count > 0 && sni_count != routes.len() {
             anyhow::bail!(
                 "tcp listener {} mixes SNI and raw routes, which is unsupported",
@@ -635,6 +1028,7 @@ struct Shared {
     cfg: Arc<Mutex<HttpConfig>>,
     stopping: Arc<AtomicBool>,
     tcp_listeners: Arc<Mutex<HashMap<String, TcpListenerRuntime>>>,
+    wsl_targets: Arc<Mutex<WslTargetCache>>,
 }
 
 struct TcpListenerRuntime {
@@ -665,7 +1059,9 @@ impl HomeHttp for MyHttpService {
     ) -> Result<tonic::Response<Acknowledge>, tonic::Status> {
         match load_config_or_init() {
             Ok(new_cfg) => {
+                let new_wsl_targets = WslTargetCache::from_config(&new_cfg);
                 *self.shared.cfg.lock() = new_cfg;
+                *self.shared.wsl_targets.lock() = new_wsl_targets;
                 if let Err(err) = sync_tcp_listeners(&self.shared).await {
                     error!("reload_config failed to sync tcp listeners: {err:#}");
                     return Err(tonic::Status::internal(err.to_string()));
@@ -759,7 +1155,8 @@ impl HomeHttp for MyHttpService {
         let route = tcp_route_from_request(request.into_inner())
             .map_err(|err| tonic::Status::invalid_argument(err.to_string()))?;
         let mut cfg = self.shared.cfg.lock().clone();
-        cfg.tcp_routes.retain(|existing| existing.name != route.name);
+        cfg.tcp_routes
+            .retain(|existing| existing.name != route.name);
         cfg.tcp_routes.push(route);
         cfg.tcp_routes.sort_by(|left, right| {
             left.listen_port
@@ -946,7 +1343,7 @@ async fn handle_tls_conn(inb: &mut TcpStream, _peer: SocketAddr, shared: Shared)
         .get(&host)
         .copied()
         .context("no route for host")?;
-    let (mut outb, _) = connect_target_hosts(select_wsl_target_hosts(), port).await?;
+    let (mut outb, _) = connect_wsl_target_port(&shared, port).await?;
     outb.set_nodelay(true)?;
     let (mut ri, mut wi) = inb.split();
     let (mut ro, mut wo) = outb.split();
@@ -1078,6 +1475,7 @@ fn run_service() -> Result<()> {
     );
 
     let shared = Shared {
+        wsl_targets: Arc::new(Mutex::new(WslTargetCache::from_config(&cfg))),
         cfg: Arc::new(Mutex::new(cfg)),
         stopping: Arc::new(AtomicBool::new(false)),
         tcp_listeners: Arc::new(Mutex::new(HashMap::new())),
@@ -1252,6 +1650,7 @@ fn main() -> Result<()> {
             let rt = Runtime::new()?;
             rt.block_on(async {
                 let shared = Shared {
+                    wsl_targets: Arc::new(Mutex::new(WslTargetCache::from_config(&cfg))),
                     cfg: Arc::new(Mutex::new(cfg)),
                     stopping: Arc::new(AtomicBool::new(false)),
                     tcp_listeners: Arc::new(Mutex::new(HashMap::new())),
@@ -1314,6 +1713,57 @@ fn main() -> Result<()> {
         _ => usage(),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_http_config() -> HttpConfig {
+        HttpConfig {
+            http: 80,
+            https: 443,
+            wsl_resolve: default_wsl_resolve(),
+            wsl_ip: None,
+            wsl_refresh_secs: default_wsl_refresh_secs(),
+            routes: HashMap::new(),
+            tcp_routes: Vec::new(),
+            log_level: Some("info".to_string()),
+        }
+    }
+
+    #[test]
+    fn decode_cli_output_handles_utf16le_wsl_list_output() {
+        let utf16: Vec<u16> = "home-lab-k3s\r\n".encode_utf16().collect();
+        let bytes: Vec<u8> = utf16.into_iter().flat_map(u16::to_le_bytes).collect();
+        assert_eq!(decode_cli_output(&bytes), "home-lab-k3s\r\n");
+    }
+
+    #[test]
+    fn parse_wsl_ipv4_candidates_prefers_default_interface() {
+        let default_ifaces = parse_default_route_interfaces("default via 172.18.192.1 dev eth0");
+        let addr_output = "\
+1: lo    inet 10.255.255.254/32 brd 10.255.255.254 scope global lo
+2: eth0    inet 172.18.194.89/20 brd 172.18.207.255 scope global eth0
+3: flannel.1    inet 10.42.0.0/32 scope global flannel.1
+4: cni0    inet 10.42.0.1/24 brd 10.42.0.255 scope global cni0";
+
+        assert_eq!(
+            parse_wsl_ipv4_candidates(addr_output, &default_ifaces),
+            vec!["172.18.194.89".to_string()]
+        );
+    }
+
+    #[test]
+    fn build_wsl_target_hosts_keeps_localhost_and_manual_override() {
+        let mut cfg = sample_http_config();
+        cfg.wsl_ip = Some("172.18.194.89".to_string());
+
+        assert_eq!(
+            build_wsl_target_hosts(&cfg, &["172.18.194.89".to_string()]),
+            vec!["127.0.0.1".to_string(), "172.18.194.89".to_string()]
+        );
+    }
 }
 
 fn named_pipe_stream() -> io::Result<UnboundedReceiverStream<Result<PipeConnection, io::Error>>> {
