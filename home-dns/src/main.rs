@@ -34,7 +34,7 @@ use std::convert::Infallible;
 use std::ffi::{OsString, c_void};
 use std::fs::{self, File};
 use std::io::{self, Write};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::{Command, Stdio};
@@ -129,6 +129,7 @@ const SERVICE_DISPLAY_NAME: &str = "Home DNS Service";
 const SERVICE_DESCRIPTION: &str =
     r"DNS config + rollback + Windows RPC IPC on ncalrpc endpoint home-dns";
 const DEFAULT_SERVERS_V4: &[&str] = &["127.0.0.1"];
+const DEFAULT_SERVERS_V6: &[&str] = &["::1"];
 const LEGACY_DEFAULT_SERVERS_V4: &[&str] = &["1.1.1.1", "1.0.0.1"];
 const LEGACY_LOCALHOST_SERVERS_V4: &[&str] = &["127.0.0.1"];
 const LEGACY_LOOPBACK_2_SERVERS_V4: &[&str] = &["127.0.0.2"];
@@ -445,7 +446,7 @@ fn load_config_or_init() -> Result<DnsConfig> {
     if !p.exists() {
         let cfg = DnsConfig {
             servers_v4: as_string_vec(DEFAULT_SERVERS_V4),
-            servers_v6: vec![],
+            servers_v6: as_string_vec(DEFAULT_SERVERS_V6),
             upstream_dns_v4: default_upstream_dns_v4(),
             backups: HashMap::new(),
             log_level: Some(default_level_str().into()),
@@ -468,6 +469,10 @@ fn load_config_or_init() -> Result<DnsConfig> {
     }
     if should_migrate_legacy_defaults(&cfg) {
         cfg.servers_v4 = as_string_vec(DEFAULT_SERVERS_V4);
+        changed = true;
+    }
+    if cfg.servers_v6.is_empty() {
+        cfg.servers_v6 = as_string_vec(DEFAULT_SERVERS_V6);
         changed = true;
     }
     if cfg.doh.listen_addr.trim().is_empty() {
@@ -819,6 +824,29 @@ fn parse_dns_bind_ipv4_addrs(cfg: &DnsConfig) -> Vec<Ipv4Addr> {
     out
 }
 
+fn parse_dns_bind_ipv6_addrs(cfg: &DnsConfig) -> Vec<Ipv6Addr> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for server in &cfg.servers_v6 {
+        let trimmed = server.trim();
+        let Ok(ip) = trimmed.parse::<Ipv6Addr>() else {
+            debug!("skip non-IPv6 DNS server for local bind: {}", trimmed);
+            continue;
+        };
+        if !ip.is_loopback() {
+            debug!(
+                "skip non-loopback DNS server for local listener bind: {}",
+                ip
+            );
+            continue;
+        }
+        if seen.insert(ip) {
+            out.push(ip);
+        }
+    }
+    out
+}
+
 fn normalize_record_key(value: &str) -> String {
     let mut out = String::new();
     for ch in value.trim().trim_start_matches('\u{feff}').chars() {
@@ -1146,8 +1174,7 @@ async fn resolve_dns_query(state: &DohRuntimeState, wire_query: Vec<u8>) -> Resu
     forward_dns_query(state, wire_query).await
 }
 
-async fn serve_dns_udp(bind_ip: Ipv4Addr, state: DohRuntimeState) -> Result<()> {
-    let bind_addr = SocketAddr::new(IpAddr::V4(bind_ip), 53);
+async fn serve_dns_udp(bind_addr: SocketAddr, state: DohRuntimeState) -> Result<()> {
     let socket = UdpSocket::bind(bind_addr)
         .await
         .with_context(|| format!("bind DNS UDP listener on {bind_addr}"))?;
@@ -1245,8 +1272,7 @@ async fn handle_dns_tcp_client(
     let _ = stream.shutdown().await;
 }
 
-async fn serve_dns_tcp(bind_ip: Ipv4Addr, state: DohRuntimeState) -> Result<()> {
-    let bind_addr = SocketAddr::new(IpAddr::V4(bind_ip), 53);
+async fn serve_dns_tcp(bind_addr: SocketAddr, state: DohRuntimeState) -> Result<()> {
     let listener = TcpListener::bind(bind_addr)
         .await
         .with_context(|| format!("bind DNS TCP listener on {bind_addr}"))?;
@@ -1839,25 +1865,36 @@ fn run_service() -> Result<()> {
                 None
             }
         };
-        let bind_ips = {
+        let bind_addrs = {
             let cfg = shared.cfg.lock().clone();
-            parse_dns_bind_ipv4_addrs(&cfg)
+            let mut addrs = parse_dns_bind_ipv4_addrs(&cfg)
+                .into_iter()
+                .map(|ip| SocketAddr::new(IpAddr::V4(ip), 53))
+                .collect::<Vec<_>>();
+            addrs.extend(
+                parse_dns_bind_ipv6_addrs(&cfg)
+                    .into_iter()
+                    .map(|ip| SocketAddr::new(IpAddr::V6(ip), 53)),
+            );
+            addrs
         };
         if let Some(state) = runtime_state.clone() {
-            if bind_ips.is_empty() {
-                warn!("no loopback DNS address configured in servers_v4; DNS data-plane disabled");
+            if bind_addrs.is_empty() {
+                warn!(
+                    "no loopback DNS address configured in servers_v4/servers_v6; DNS data-plane disabled"
+                );
             }
-            for ip in bind_ips {
+            for bind_addr in bind_addrs {
                 let state_udp = state.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = serve_dns_udp(ip, state_udp).await {
-                        error!("DNS UDP listener error on {}: {e:#}", ip);
+                    if let Err(e) = serve_dns_udp(bind_addr, state_udp).await {
+                        error!("DNS UDP listener error on {}: {e:#}", bind_addr);
                     }
                 });
                 let state_tcp = state.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = serve_dns_tcp(ip, state_tcp).await {
-                        error!("DNS TCP listener error on {}: {e:#}", ip);
+                    if let Err(e) = serve_dns_tcp(bind_addr, state_tcp).await {
+                        error!("DNS TCP listener error on {}: {e:#}", bind_addr);
                     }
                 });
             }
@@ -1975,25 +2012,36 @@ fn run_console() -> Result<()> {
                 None
             }
         };
-        let bind_ips = {
+        let bind_addrs = {
             let cfg = shared.cfg.lock().clone();
-            parse_dns_bind_ipv4_addrs(&cfg)
+            let mut addrs = parse_dns_bind_ipv4_addrs(&cfg)
+                .into_iter()
+                .map(|ip| SocketAddr::new(IpAddr::V4(ip), 53))
+                .collect::<Vec<_>>();
+            addrs.extend(
+                parse_dns_bind_ipv6_addrs(&cfg)
+                    .into_iter()
+                    .map(|ip| SocketAddr::new(IpAddr::V6(ip), 53)),
+            );
+            addrs
         };
         if let Some(state) = runtime_state.clone() {
-            if bind_ips.is_empty() {
-                warn!("no loopback DNS address configured in servers_v4; DNS data-plane disabled");
+            if bind_addrs.is_empty() {
+                warn!(
+                    "no loopback DNS address configured in servers_v4/servers_v6; DNS data-plane disabled"
+                );
             }
-            for ip in bind_ips {
+            for bind_addr in bind_addrs {
                 let state_udp = state.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = serve_dns_udp(ip, state_udp).await {
-                        error!("DNS UDP listener error on {}: {e:#}", ip);
+                    if let Err(e) = serve_dns_udp(bind_addr, state_udp).await {
+                        error!("DNS UDP listener error on {}: {e:#}", bind_addr);
                     }
                 });
                 let state_tcp = state.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = serve_dns_tcp(ip, state_tcp).await {
-                        error!("DNS TCP listener error on {}: {e:#}", ip);
+                    if let Err(e) = serve_dns_tcp(bind_addr, state_tcp).await {
+                        error!("DNS TCP listener error on {}: {e:#}", bind_addr);
                     }
                 });
             }
@@ -2320,4 +2368,53 @@ fn named_pipe_stream()
     });
 
     Ok(UnboundedReceiverStream::new(rx))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_config(servers_v4: &[&str], servers_v6: &[&str]) -> DnsConfig {
+        DnsConfig {
+            servers_v4: servers_v4
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect(),
+            servers_v6: servers_v6
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect(),
+            upstream_dns_v4: default_upstream_dns_v4(),
+            backups: HashMap::new(),
+            log_level: Some(default_level_str().into()),
+            records: HashMap::new(),
+            doh: DohConfig::default(),
+        }
+    }
+
+    #[test]
+    fn parse_dns_bind_ipv4_addrs_keeps_unique_loopback_only() {
+        let cfg = sample_config(
+            &[
+                "127.0.0.1",
+                "127.0.0.1",
+                "127.0.0.2",
+                "1.1.1.1",
+                "not-an-ip",
+            ],
+            &[],
+        );
+
+        assert_eq!(
+            parse_dns_bind_ipv4_addrs(&cfg),
+            vec![Ipv4Addr::new(127, 0, 0, 1), Ipv4Addr::new(127, 0, 0, 2)]
+        );
+    }
+
+    #[test]
+    fn parse_dns_bind_ipv6_addrs_keeps_unique_loopback_only() {
+        let cfg = sample_config(&[], &["::1", "::1", "fd0f:ee:b0::1", "not-an-ipv6"]);
+
+        assert_eq!(parse_dns_bind_ipv6_addrs(&cfg), vec![Ipv6Addr::LOCALHOST]);
+    }
 }
