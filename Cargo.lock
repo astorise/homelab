@@ -4557,7 +4557,7 @@ dependencies = [
  "google-cloud-wkt",
  "http 1.4.0",
  "pin-project",
- "rand 0.10.0",
+ "rand 0.10.1",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -5157,7 +5157,7 @@ dependencies = [
  "pin-project",
  "prost 0.14.3",
  "protoc-bin-vendored",
- "rand 0.10.0",
+ "rand 0.10.1",
  "rcgen",
  "rsa 0.9.10",
  "rustls 0.23.37",
@@ -8798,9 +8798,9 @@ dependencies = [
 
 [[package]]
 name = "rand"
-version = "0.10.0"
+version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bc266eb313df6c5c09c1c7b1fbe2510961e5bcd3add930c1e31f7ed9da0feff8"
+checksum = "d2e8e8bcc7961af1fdac401278c6a831614941f6164ee3bf4ce61b7edb162207"
 dependencies = [
  "chacha20",
  "getrandom 0.4.1",
@@ -9493,7 +9493,7 @@ dependencies = [
  "opentelemetry",
  "pin-project-lite",
  "pprof-pyroscope-fork",
- "rand 0.10.0",
+ "rand 0.10.1",
  "reqwest 0.13.2",
  "rmp-serde",
  "rust-embed",
@@ -9559,7 +9559,7 @@ name = "rustfs-appauth"
 version = "0.0.5"
 dependencies = [
  "base64-simd",
- "rand 0.10.0",
+ "rand 0.10.1",
  "rsa 0.10.0-rc.17",
  "serde",
  "serde_json",
@@ -9632,7 +9632,7 @@ name = "rustfs-credentials"
 version = "0.0.5"
 dependencies = [
  "base64-simd",
- "rand 0.10.0",
+ "rand 0.10.1",
  "serde",
  "serde_json",
  "time",
@@ -9648,7 +9648,7 @@ dependencies = [
  "chacha20poly1305",
  "jsonwebtoken",
  "pbkdf2",
- "rand 0.10.0",
+ "rand 0.10.1",
  "serde_json",
  "sha2 0.10.9",
  "thiserror 2.0.18",
@@ -9696,7 +9696,7 @@ dependencies = [
  "path-absolutize",
  "pin-project-lite",
  "quick-xml 0.39.2",
- "rand 0.10.0",
+ "rand 0.10.1",
  "ratelimit",
  "reed-solomon-simd",
  "regex",
@@ -9795,7 +9795,7 @@ dependencies = [
  "moka",
  "openidconnect",
  "pollster",
- "rand 0.10.0",
+ "rand 0.10.1",
  "reqwest 0.13.2",
  "rustfs-config",
  "rustfs-credentials",
@@ -9849,7 +9849,7 @@ dependencies = [
  "jiff",
  "md5",
  "moka",
- "rand 0.10.0",
+ "rand 0.10.1",
  "reqwest 0.13.2",
  "serde",
  "serde_json",
@@ -10042,7 +10042,7 @@ dependencies = [
  "http 1.4.0",
  "md-5 0.11.0-rc.5",
  "pin-project-lite",
- "rand 0.10.0",
+ "rand 0.10.1",
  "reqwest 0.13.2",
  "rustfs-config",
  "rustfs-utils",
@@ -10118,7 +10118,7 @@ dependencies = [
  "futures",
  "http 1.4.0",
  "path-clean",
- "rand 0.10.0",
+ "rand 0.10.1",
  "rmp-serde",
  "rustfs-common",
  "rustfs-config",
@@ -11959,7 +11959,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.1",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.4",
  "windows-sys 0.59.0",
@@ -12921,7 +12921,7 @@ checksum = "a68d3c8f01c0cfa54a75291d83601161799e4a89a39e0929f4b0354d88757a37"
 dependencies = [
  "getrandom 0.4.1",
  "js-sys",
- "rand 0.10.0",
+ "rand 0.10.1",
  "serde_core",
  "wasm-bindgen",
 ]
