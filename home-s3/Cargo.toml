@@ -14,7 +14,7 @@ pin-project = "1.1.5"
 prost = "0.14"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-rustfs = { git = "https://github.com/astorise/rustfs", tag = "v0.0.5" }
+rustfs = { git = "https://github.com/astorise/rustfs", rev = "2786a4734afa14659f142c87d0e9ec1c5670d92b" }
 tokio = { workspace = true, features = ["fs", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-stream = "0.1.15"
 tonic = { version = "0.14", features = ["transport"] }
