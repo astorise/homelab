@@ -6,10 +6,7 @@ members = [
   "home-s3",
   "home-oidc",
   "home-lab/src-tauri",
-  "pipe-test",
-  "service-tester"
 ]
-exclude = ["vendor/rustfs"]
 resolver = "3"
 
 [workspace.package]
