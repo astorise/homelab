@@ -1,0 +1,86 @@
+schema: spec-driven
+
+context: |
+  ## Homelab — Windows-native local network services manager
+
+  **Platform:** Windows 11 (primary), with WSL2 for containerized workloads.
+  **License:** GPL-3.0-only
+
+  ### Tech stack
+  - Language: Rust (Edition 2021 for most crates, Edition 2024 for home-dns)
+  - Desktop app: Tauri v2 (system tray, hidden main window, skipTaskbar: true)
+  - Frontend: Vanilla JS + Web Components + Tailwind CSS + Vite
+  - IPC: gRPC over Windows Named Pipes (`\\.\pipe\home-{service}`)
+  - Proto generation: tonic-build + prost-build via build.rs
+  - Error handling: anyhow with `.context()` chains
+  - Async: tokio with `rt-multi-thread` + `macros`
+  - Logging: flexi_logger (file rotation, stderr mirror in debug)
+  - Config: YAML (services), JSON (home-s3)
+  - PKI: rcgen (ECC P-256), x509-parser — CA at C:\ProgramData\home-lab\pki\
+  - CI: GitHub Actions (3-job pipeline: docker image → services → tauri)
+  - Deps: Renovate for automated updates
+
+  ### Architecture
+  Four Windows services + one Tauri tray app:
+  - **home-dns** — DNS server (loopback + IPv6 loopback `::1`), DoH support
+  - **home-http** — TLS SNI pass-through reverse proxy (port 443), TCP routing for k3s API
+  - **home-s3** — Embedded RustFS S3 server (127.0.0.1:9000); binds loopback only
+  - **home-oidc** — OIDC provider
+  - **home-lab** — Tauri tray app; orchestrates install, WSL provisioning, reconciliation
+
+  Services communicate with the Tauri app via Named Pipes (gRPC).
+  Proto files are duplicated: `{service}/proto/` and `home-lab/src-tauri/proto/`.
+
+  ### WSL / k3s
+  - WSL instances named after cluster (e.g. `tachyon-mesh`); prefix pattern `home-lab-k3s`
+  - k3s API listens IPv6-only (`:::PORT`); Windows kubeconfig uses `https://<name>.wsl:PORT`
+  - Traefik ingress: HTTPS on loopback via `kubectl port-forward` (ports computed
+    deterministically per instance name using FNV hash + base/step)
+  - Port assignments written to `/etc/k3s-env` at provisioning; managed by homelab app
+  - Known collision: api_backend_port and ingress_https_backend_port share the same
+    deterministic formula — fixed in instance_port_plan() with post-calc bump loop
+  - Domains: `{name}.wsl` (A → 127.0.0.1, AAAA → ::1 for IPv6 k3s API access)
+  - S3 routing: s3.wsl → 10.255.255.254 (stable WSL loopback alias); iptables DNAT
+    inside WSL redirects to Hyper-V gateway; Windows portproxy bridges to home-s3
+  - Hyper-V WSL interface: vEthernet(WSL) at 172.18.x.x — private, not LAN/WAN exposed
+
+  ### Named Pipe pattern (required for gRPC on Windows)
+  ```rust
+  #[pin_project]
+  struct PipeConnection { #[pin] inner: NamedPipeServer }
+  unsafe impl Send for PipeConnection {}
+  impl Connected for PipeConnection { type ConnectInfo = (); fn connect_info(&self) {} }
+  ```
+
+  ### Conventions
+  - Release builds: `windows_subsystem = "windows"` (no console)
+  - Config paths: `C:\ProgramData\home-{service}\`
+  - Proto duplication: ALWAYS update both service and Tauri copies
+  - Commits: conventional commits (`fix:`, `feat:`, `chore(deps):`)
+  - No comments unless WHY is non-obvious
+  - No `0.0.0.0` binding for home-s3 — security risk (LAN/WAN exposure)
+  - RustFS cannot bind on non-loopback addresses (hangs at startup)
+
+  ### Key file locations
+  - WSL boot script: `home-lab/src-tauri/resources/wsl/k3s-init.sh`
+  - Homelab PKI: `C:\ProgramData\home-lab\pki\home-lab-root-ca.pem` (visible only via
+    [System.IO.Directory]::GetFiles(), not Get-ChildItem)
+  - home-s3 config: `C:\ProgramData\home-s3\s3-config.json`
+  - home-http config: `C:\ProgramData\home-http\http.yaml`
+  - iptables in WSL: busybox stub is broken; real binary at
+    `/var/lib/rancher/k3s/data/<hash>/bin/aux/iptables`
+
+rules:
+  proposal:
+    - Include a "Security considerations" section for any networking change
+    - State explicitly whether the change affects Windows services, WSL, or both
+    - List which Named Pipe services are impacted
+  design:
+    - Specify port numbers and binding addresses (never use 0.0.0.0 for home-s3)
+    - Document any iptables rules required in WSL
+    - Include the proto diff if gRPC interface changes
+  tasks:
+    - Mark tasks as [Windows service], [WSL], or [Tauri app] for clarity
+    - Always include "Update both service and Tauri proto copies" when proto changes
+    - Include a cargo check step before any release build task
+    - Cap tasks at ~2 hours each
