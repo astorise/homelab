@@ -45,6 +45,11 @@ K3S_INGRESS_HTTPS_PORT=${K3S_INGRESS_HTTPS_PORT:-}
 K3S_GIT_SSH_PORT=${K3S_GIT_SSH_PORT:-}
 K3S_TLS_SANS=${K3S_TLS_SANS:-}
 ENABLE_NVIDIA_TOOLKIT=${ENABLE_NVIDIA_TOOLKIT:-0}
+# S3 DNAT: redirect a stable loopback alias to the Windows host (Hyper-V gateway).
+# Pods use 10.255.255.254:WSL_S3_PORT; iptables rewrites dst to the actual gateway IP.
+# home-s3 on Windows binds on the Hyper-V interface IP, not 0.0.0.0, keeping LAN/WAN unexposed.
+WSL_S3_LOOPBACK_IP=${WSL_S3_LOOPBACK_IP:-10.255.255.254}
+WSL_S3_PORT=${WSL_S3_PORT:-9000}
 K3S_RUNTIME_BIN_DIR=${K3S_RUNTIME_BIN_DIR:-/var/lib/rancher/k3s/data/current/bin}
 K3S_RUNTIME_AUX_BIN_DIR=${K3S_RUNTIME_AUX_BIN_DIR:-$K3S_RUNTIME_BIN_DIR/aux}
 CONTAINERD_STREAM_PATCH_PID=
@@ -246,6 +251,51 @@ start_traefik_loopback_listener() {
     pkill -f "nc -lk .* -p $listen_port " 2>/dev/null || true
     pkill -f "$cmd" 2>/dev/null || true
     nohup sh -c "exec $cmd" >> "$log_file" 2>&1 &
+}
+
+find_iptables() {
+    # Prefer the real iptables from the k3s runtime bundle over the busybox stub.
+    _ipt=$(find /var/lib/rancher/k3s/data -name "iptables" -not -type l 2>/dev/null | head -1)
+    if [ -n "$_ipt" ] && "$_ipt" --version >/dev/null 2>&1; then
+        echo "$_ipt"
+        return 0
+    fi
+    # Fall back to whatever is in PATH (works after k3s has set up the runtime path).
+    if command -v iptables >/dev/null 2>&1; then
+        echo "iptables"
+        return 0
+    fi
+    return 1
+}
+
+ensure_s3_iptables_dnat() {
+    if [ -z "$WSL_S3_LOOPBACK_IP" ] || [ -z "$WSL_S3_PORT" ]; then
+        return 0
+    fi
+    IPT=$(find_iptables) || { log_info "S3 DNAT: iptables not found, skipping"; return 0; }
+    GW=$(ip -4 route show default 2>/dev/null | awk '{print $3}' | head -1)
+    if [ -z "$GW" ]; then
+        log_info "S3 DNAT: no default gateway detected, skipping iptables rules"
+        return 0
+    fi
+    TARGET="${GW}:${WSL_S3_PORT}"
+    # Remove stale rules for this loopback/port before (re)adding them.
+    "$IPT" -t nat -D PREROUTING -d "$WSL_S3_LOOPBACK_IP" -p tcp --dport "$WSL_S3_PORT" \
+        -j DNAT --to-destination "$TARGET" 2>/dev/null || true
+    "$IPT" -t nat -D OUTPUT -d "$WSL_S3_LOOPBACK_IP" -p tcp --dport "$WSL_S3_PORT" \
+        -j DNAT --to-destination "$TARGET" 2>/dev/null || true
+    "$IPT" -t nat -D POSTROUTING -d "$GW" -p tcp --dport "$WSL_S3_PORT" \
+        -j MASQUERADE 2>/dev/null || true
+    # PREROUTING: rewrite dst for traffic from pods (comes through cni0/flannel).
+    "$IPT" -t nat -A PREROUTING -d "$WSL_S3_LOOPBACK_IP" -p tcp --dport "$WSL_S3_PORT" \
+        -j DNAT --to-destination "$TARGET"
+    # OUTPUT: rewrite dst for traffic originating on the WSL host itself.
+    "$IPT" -t nat -A OUTPUT -d "$WSL_S3_LOOPBACK_IP" -p tcp --dport "$WSL_S3_PORT" \
+        -j DNAT --to-destination "$TARGET"
+    # MASQUERADE: ensure return packets reach the pod, not just the WSL host.
+    "$IPT" -t nat -A POSTROUTING -d "$GW" -p tcp --dport "$WSL_S3_PORT" \
+        -j MASQUERADE
+    log_info "S3 DNAT: ${WSL_S3_LOOPBACK_IP}:${WSL_S3_PORT} -> ${TARGET} via ${IPT} (PREROUTING+OUTPUT+MASQUERADE)"
 }
 
 ensure_traefik_loopback_proxy() {
@@ -495,6 +545,7 @@ if [ "$ROLE" = "server" ]; then
     ensure_server_config
     ensure_traefik_config
     ensure_traefik_loopback_proxy
+    ensure_s3_iptables_dnat
     rewrite_internal_server_kubeconfigs
     sync_kubeconfig || true
 

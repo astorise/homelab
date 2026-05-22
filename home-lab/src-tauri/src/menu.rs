@@ -105,8 +105,11 @@ pub fn setup_ui(app: &AppHandle<Wry>, icons: Arc<Icons>) -> Result<()> {
         .menu(&menu)
         .show_menu_on_left_click(false)
         .on_tray_icon_event(|tray, ev| {
-            if let TrayIconEvent::DoubleClick { .. } = ev {
-                let _ = open_or_focus_main(&tray.app_handle());
+            match ev {
+                TrayIconEvent::Click { .. } | TrayIconEvent::DoubleClick { .. } => {
+                    let _ = open_or_focus_main(&tray.app_handle());
+                }
+                _ => {}
             }
         })
         .on_menu_event({

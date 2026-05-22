@@ -855,12 +855,26 @@ fn instance_port_plan(instance: &str) -> InstancePortPlan {
             k3s_api_port_max(),
         )
     };
-    let ingress_https_backend_port = deterministic_port_for_instance(
+    // Ensure ingress ports don't collide with the k3s API port or its adjacent
+    // supervisor listener (api_backend_port + 1). The HTTP ingress port is
+    // ingress_https - 1, so both must be checked against the reserved range.
+    let mut ingress_https_backend_port = deterministic_port_for_instance(
         instance,
         http_port_base(),
         http_port_step(),
         http_port_max(),
     );
+    {
+        let step = http_port_step();
+        let api_reserved_end = api_backend_port.saturating_add(1);
+        while ingress_https_backend_port == api_backend_port
+            || ingress_https_backend_port == api_reserved_end
+            || ingress_https_backend_port.saturating_sub(1) == api_backend_port
+            || ingress_https_backend_port.saturating_sub(1) == api_reserved_end
+        {
+            ingress_https_backend_port = ingress_https_backend_port.saturating_add(step);
+        }
+    }
     let nodeport_start = deterministic_port_for_instance(
         instance,
         k3s_nodeport_base(),
@@ -1134,6 +1148,118 @@ async fn sync_home_http_wsl_target(instance: &str, trace_id: &str) -> Result<()>
     Ok(())
 }
 
+// ---- S3 Hyper-V binding sync ------------------------------------------------
+
+const WSL_S3_LOOPBACK_IP: &str = "10.255.255.254";
+const WSL_S3_PORT: u16 = 9000;
+const WSL_S3_HOSTNAME: &str = "s3.wsl";
+
+/// Detect the IPv4 address of the Hyper-V virtual switch used for WSL2.
+/// Returns the first IPv4 on any adapter whose alias contains "WSL".
+fn get_hyperv_wsl_ip() -> Option<String> {
+    let script = r#"
+$a = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+     Where-Object { $_.InterfaceAlias -like '*WSL*' } |
+     Select-Object -First 1 -ExpandProperty IPAddress
+if ($a) { Write-Output $a }
+"#;
+    let out = Command::new("powershell.exe")
+        .args(["-NoProfile", "-Command", script])
+        .output()
+        .ok()?;
+    let ip = decode_cli_output(&out.stdout).trim().to_string();
+    if ip.is_empty() { None } else { Some(ip) }
+}
+
+/// Manage a portproxy rule that exposes home-s3 (loopback) on the Hyper-V WSL interface.
+/// home-s3 binds on 127.0.0.1:WSL_S3_PORT; the portproxy accepts on <hyper-v-ip>:WSL_S3_PORT
+/// and forwards to loopback. The Hyper-V vEthernet(WSL) adapter is a private virtual switch —
+/// not reachable from LAN or WAN — so this is equivalent in security to binding on loopback.
+fn upsert_s3_portproxy_rule(hyperv_ip: &str) -> bool {
+    // Delete any existing rule for this port on any address first (idempotent cleanup).
+    let _ = Command::new("netsh")
+        .args([
+            "interface", "portproxy", "delete", "v4tov4",
+            &format!("listenport={WSL_S3_PORT}"),
+            &format!("listenaddress={hyperv_ip}"),
+        ])
+        .status();
+    let status = Command::new("netsh")
+        .args([
+            "interface", "portproxy", "add", "v4tov4",
+            &format!("listenport={WSL_S3_PORT}"),
+            &format!("listenaddress={hyperv_ip}"),
+            &format!("connectport={WSL_S3_PORT}"),
+            "connectaddress=127.0.0.1",
+        ])
+        .status();
+    matches!(status, Ok(s) if s.success())
+}
+
+/// Remove the s3 portproxy rule when the Hyper-V IP is no longer valid.
+fn remove_s3_portproxy_rule(hyperv_ip: &str) {
+    let _ = Command::new("netsh")
+        .args([
+            "interface", "portproxy", "delete", "v4tov4",
+            &format!("listenport={WSL_S3_PORT}"),
+            &format!("listenaddress={hyperv_ip}"),
+        ])
+        .status();
+}
+
+/// Ensure home-s3 is reachable from WSL pods via the stable loopback alias 10.255.255.254:9000:
+///  - Creates/updates a portproxy on the Hyper-V WSL interface (private virtual switch).
+///  - Sets the `s3.wsl` DNS record to 10.255.255.254 (stable; never changes).
+///
+/// The WSL image handles the routing: iptables DNAT 10.255.255.254:9000 → <gw>:9000.
+/// home-s3 itself stays bound on 127.0.0.1:9000 — no LAN/WAN exposure.
+async fn sync_home_s3_wsl_binding(trace_id: &str) -> Result<()> {
+    let Some(hyperv_ip) = get_hyperv_wsl_ip() else {
+        info!(
+            target: "wsl",
+            trace_id = %trace_id,
+            "S3 WSL sync: aucune interface Hyper-V WSL detectee, sync ignoree"
+        );
+        return Ok(());
+    };
+
+    let ip_clone = hyperv_ip.clone();
+    let ok = tauri::async_runtime::spawn_blocking(move || upsert_s3_portproxy_rule(&ip_clone))
+        .await
+        .context("JoinHandle upsert_s3_portproxy_rule")?;
+
+    if ok {
+        info!(
+            target: "wsl",
+            trace_id = %trace_id,
+            hyperv_ip = %hyperv_ip,
+            "Portproxy S3 WSL mis a jour: {}:{} -> 127.0.0.1:{}",
+            hyperv_ip, WSL_S3_PORT, WSL_S3_PORT
+        );
+        log_wsl_event(format!(
+            "[{trace_id}] Portproxy S3 WSL: {hyperv_ip}:{WSL_S3_PORT} -> 127.0.0.1:{WSL_S3_PORT}"
+        ));
+    }
+
+    // Ensure s3.wsl resolves to the stable WSL loopback alias (10.255.255.254).
+    // WSL iptables DNAT handles the rest: 10.255.255.254:9000 → <gw>:9000 → portproxy.
+    let ttl = dns_record_ttl();
+    retry_dns_rpc("s3_add_record", || {
+        dns::dns_add_record(
+            WSL_S3_HOSTNAME.to_string(),
+            "A".into(),
+            WSL_S3_LOOPBACK_IP.to_string(),
+            ttl,
+        )
+    })
+    .await
+    .with_context(|| format!("dns_add_record({WSL_S3_HOSTNAME})"))?;
+
+    Ok(())
+}
+
+// ---- end S3 Hyper-V binding sync --------------------------------------------
+
 async fn configure_cluster_networking(instance: &str) -> Result<String> {
     let hosts = cluster_domains(instance);
     if hosts.is_empty() {
@@ -1141,6 +1267,7 @@ async fn configure_cluster_networking(instance: &str) -> Result<String> {
     }
 
     sync_home_http_wsl_target(instance, "configure-cluster-networking").await?;
+    sync_home_s3_wsl_binding("configure-cluster-networking").await?;
 
     let plan = instance_port_plan(instance);
     let https_backend_port = plan.ingress_https_backend_port;
@@ -6189,6 +6316,7 @@ async fn resolve_kube_api_endpoint_for_instance(
 ) -> Result<KubeApiEndpoint> {
     if is_home_lab_wsl_instance(instance) {
         sync_home_http_wsl_target(instance, trace_id).await?;
+        sync_home_s3_wsl_binding(trace_id).await?;
         let endpoint = home_lab_loopback_kube_api_endpoint(instance)?;
         info!(
             target: "wsl",
