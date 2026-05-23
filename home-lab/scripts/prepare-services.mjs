@@ -20,35 +20,46 @@ const services = ['home-dns', 'home-http', 'home-s3', 'home-oidc']
 const targetDir = join(repoRoot, 'target', 'release')
 const bundleBinDir = join(repoRoot, 'home-lab', 'src-tauri', 'resources', 'bin')
 
-console.log('[prepare-services] Building Windows service binaries...')
-for (const svc of services) {
-  run(`cargo build -p ${svc} --release`)
-}
-run('cargo build --manifest-path home-lab/src-tauri/Cargo.toml --bin home-lab-cert --release')
-
 mkdirSync(bundleBinDir, { recursive: true })
-for (const svc of services) {
-  const exeName = `${svc}.exe`
-  const src = join(targetDir, exeName)
-  const dst = join(bundleBinDir, exeName)
 
-  if (!existsSync(src)) {
-    throw new Error(`[prepare-services] Missing compiled binary: ${src}`)
+// If all service binaries are already present in resources/bin (e.g. downloaded
+// from CI artifacts), skip the cargo build to avoid rebuilding in CI.
+const allPrebuilt = [...services, 'home-lab-cert'].every(
+  svc => existsSync(join(bundleBinDir, `${svc}.exe`))
+)
+
+if (allPrebuilt) {
+  console.log('[prepare-services] All binaries already present in resources/bin, skipping cargo build.')
+} else {
+  console.log('[prepare-services] Building Windows service binaries...')
+  for (const svc of services) {
+    run(`cargo build -p ${svc} --release`)
+  }
+  run('cargo build --manifest-path home-lab/src-tauri/Cargo.toml --bin home-lab-cert --release')
+
+  for (const svc of services) {
+    const exeName = `${svc}.exe`
+    const src = join(targetDir, exeName)
+    const dst = join(bundleBinDir, exeName)
+
+    if (!existsSync(src)) {
+      throw new Error(`[prepare-services] Missing compiled binary: ${src}`)
+    }
+
+    copyFileSync(src, dst)
+    const size = statSync(dst).size
+    console.log(`[prepare-services] Updated ${dst} (${size} bytes)`)
   }
 
-  copyFileSync(src, dst)
-  const size = statSync(dst).size
-  console.log(`[prepare-services] Updated ${dst} (${size} bytes)`)
-}
-
-{
-  const exeName = 'home-lab-cert.exe'
-  const src = join(targetDir, exeName)
-  const dst = join(bundleBinDir, exeName)
-  if (!existsSync(src)) {
-    throw new Error(`[prepare-services] Missing compiled binary: ${src}`)
+  {
+    const exeName = 'home-lab-cert.exe'
+    const src = join(targetDir, exeName)
+    const dst = join(bundleBinDir, exeName)
+    if (!existsSync(src)) {
+      throw new Error(`[prepare-services] Missing compiled binary: ${src}`)
+    }
+    copyFileSync(src, dst)
+    const size = statSync(dst).size
+    console.log(`[prepare-services] Updated ${dst} (${size} bytes)`)
   }
-  copyFileSync(src, dst)
-  const size = statSync(dst).size
-  console.log(`[prepare-services] Updated ${dst} (${size} bytes)`)
 }
