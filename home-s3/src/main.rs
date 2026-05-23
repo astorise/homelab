@@ -15,7 +15,6 @@ use aws_sdk_s3::{
 use flexi_logger::{Age, Cleanup, Criterion, Duplicate, FileSpec, Logger, Naming};
 use log::{debug, error, info, warn, LevelFilter};
 use pin_project::pin_project;
-use rustfs::{CancellationToken as RustfsCancellationToken, Config as RustfsConfig};
 use serde::{Deserialize, Serialize};
 use std::ffi::{c_void, OsString};
 use std::fs as std_fs;
@@ -28,7 +27,7 @@ use std::sync::{
 };
 use std::task::{Context as TaskContext, Poll};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::fs;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
@@ -182,8 +181,7 @@ impl EmbeddedRustfsState {
 #[derive(Default)]
 struct EmbeddedRustfsRuntime {
     state: Option<EmbeddedRustfsState>,
-    shutdown: Option<RustfsCancellationToken>,
-    task: Option<tokio::task::JoinHandle<()>>,
+    server: Option<rustfs::embedded::RustFSServer>,
 }
 
 #[derive(Clone)]
@@ -523,111 +521,36 @@ fn rustfs_address_from_endpoint(endpoint: &str) -> Result<String> {
     Ok(without_path.to_string())
 }
 
-fn build_embedded_rustfs_config(cfg: &ServiceConfig) -> Result<RustfsConfig> {
-    let data_dir = PathBuf::from(&cfg.data_dir);
-    ensure_data_dir(&data_dir)?;
-    Ok(RustfsConfig {
-        volumes: vec![data_dir.display().to_string()],
-        address: rustfs_address_from_endpoint(&cfg.endpoint)?,
-        server_domains: Vec::new(),
-        access_key: cfg.access_key_id.clone(),
-        secret_key: cfg.secret_access_key.clone(),
-        console_enable: false,
-        console_address: String::new(),
-        obs_endpoint: String::new(),
-        tls_path: None,
-        license: None,
-        region: Some(cfg.region.clone()),
-        kms_enable: false,
-        kms_backend: "local".to_string(),
-        kms_key_dir: None,
-        kms_vault_address: None,
-        kms_vault_token: None,
-        kms_default_key_id: None,
-        buffer_profile_disable: false,
-        buffer_profile: "GeneralPurpose".to_string(),
-    })
-}
-
-async fn wait_for_embedded_rustfs(shared: &SharedState, cfg: &ServiceConfig) -> Result<()> {
-    let client = make_s3_client(cfg).await?;
-    let deadline = Instant::now() + Duration::from_secs(20);
-    let mut last_error = None::<String>;
-
-    loop {
-        let state = current_embedded_state(shared).await;
-        if let Some(message) = state.error_message() {
-            bail!("embedded RustFS failed to start: {message}");
-        }
-
-        match client.list_buckets().send().await {
-            Ok(_) => return Ok(()),
-            Err(err) => {
-                last_error = Some(format!("{err:#}"));
-            }
-        }
-
-        if Instant::now() >= deadline {
-            let detail = last_error.unwrap_or_else(|| "no response received".to_string());
-            bail!(
-                "timed out waiting for embedded RustFS at {} to become ready: {detail}",
-                cfg.endpoint
-            );
-        }
-
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
-}
 
 async fn start_embedded_rustfs(shared: &SharedState) -> Result<()> {
     let cfg = current_config(shared).await;
-    let rustfs_cfg = build_embedded_rustfs_config(&cfg)?;
-    let shutdown = RustfsCancellationToken::new();
 
     {
         let mut embedded = shared.embedded.lock().await;
-        if embedded.task.is_some() {
+        if embedded.server.is_some() {
             bail!("embedded RustFS is already running");
         }
         embedded.state = Some(EmbeddedRustfsState::Starting);
-        embedded.shutdown = Some(shutdown.clone());
     }
 
-    let embedded_runtime = shared.embedded.clone();
-    let service_stopping = shared.stopping.clone();
-    let task = tokio::spawn(async move {
-        let result = rustfs::run_embedded(rustfs_cfg, shutdown.clone()).await;
-        let mut embedded = embedded_runtime.lock().await;
-        match result {
-            Ok(()) => {
-                if service_stopping.load(Ordering::SeqCst) {
-                    embedded.state = Some(EmbeddedRustfsState::Stopped);
-                } else if !matches!(embedded.state, Some(EmbeddedRustfsState::Error(_))) {
-                    embedded.state = Some(EmbeddedRustfsState::Stopped);
-                }
-            }
-            Err(err) => {
-                let message = format!("{err:#}");
-                error!("embedded RustFS stopped with an error: {message}");
-                embedded.state = Some(EmbeddedRustfsState::Error(message));
-            }
-        }
-        embedded.shutdown = None;
-    });
+    let data_dir = PathBuf::from(&cfg.data_dir);
+    ensure_data_dir(&data_dir)?;
+    let address = rustfs_address_from_endpoint(&cfg.endpoint)?;
+
+    let server = rustfs::embedded::RustFSServerBuilder::new()
+        .address(address)
+        .access_key(cfg.access_key_id.clone())
+        .secret_key(cfg.secret_access_key.clone())
+        .region(cfg.region.clone())
+        .volume(data_dir.display().to_string())
+        .build()
+        .await
+        .map_err(|e| anyhow!("{e}"))?;
 
     {
         let mut embedded = shared.embedded.lock().await;
-        embedded.task = Some(task);
-    }
-
-    if let Err(err) = wait_for_embedded_rustfs(shared, &cfg).await {
-        let _ = stop_embedded_rustfs(shared).await;
-        return Err(err);
-    }
-
-    let mut embedded = shared.embedded.lock().await;
-    if !matches!(embedded.state, Some(EmbeddedRustfsState::Error(_))) {
         embedded.state = Some(EmbeddedRustfsState::Running);
+        embedded.server = Some(server);
     }
 
     info!(
@@ -638,29 +561,22 @@ async fn start_embedded_rustfs(shared: &SharedState) -> Result<()> {
 }
 
 async fn stop_embedded_rustfs(shared: &SharedState) -> Result<()> {
-    let task = {
+    let server = {
         let mut embedded = shared.embedded.lock().await;
-        if embedded.task.is_none() {
+        if embedded.server.is_none() {
             embedded.state = Some(EmbeddedRustfsState::Stopped);
-            embedded.shutdown = None;
             return Ok(());
         }
         embedded.state = Some(EmbeddedRustfsState::Stopping);
-        if let Some(shutdown) = embedded.shutdown.take() {
-            shutdown.cancel();
-        }
-        embedded.task.take()
+        embedded.server.take()
     };
 
-    if let Some(task) = task {
-        if let Err(err) = task.await {
-            error!("failed to join embedded RustFS task: {err}");
-        }
+    if let Some(server) = server {
+        server.shutdown().await;
     }
 
     let mut embedded = shared.embedded.lock().await;
     embedded.state = Some(EmbeddedRustfsState::Stopped);
-    embedded.shutdown = None;
     Ok(())
 }
 
