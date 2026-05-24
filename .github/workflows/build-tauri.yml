@@ -40,7 +40,7 @@ jobs:
           name: env-dev-image.tar
           path: env-dev-image.tar
   build-services:
-    runs-on: windows-2025
+    runs-on: windows-2025-vs2026
     steps:
       - uses: actions/checkout@v6
 
@@ -89,7 +89,7 @@ jobs:
 
   # === OPTION RECOMMANDÉE: installateur Windows officiel (runner Windows) ===
   build-tauri-win:
-    runs-on: windows-2025
+    runs-on: windows-2025-vs2026
     needs: [build-services, build-docker-image]
     steps:
       - uses: actions/checkout@v6
