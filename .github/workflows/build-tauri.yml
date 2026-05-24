@@ -5,6 +5,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
+  PROTOC_VERSION: "23.4"
   RUSTC_WRAPPER: sccache
   SCCACHE_GHA_ENABLED: "true"
   SCCACHE_CACHE_SIZE: 2G
@@ -39,14 +40,21 @@ jobs:
           name: env-dev-image.tar
           path: env-dev-image.tar
   build-services:
-    runs-on: windows-latest
+    runs-on: windows-2025
     steps:
       - uses: actions/checkout@v6
 
       - name: Setup protoc
-        uses: arduino/setup-protoc@v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+        shell: pwsh
+        run: |
+          $zip = Join-Path $env:RUNNER_TEMP 'protoc.zip'
+          $dest = Join-Path $env:RUNNER_TOOL_CACHE "protoc\$env:PROTOC_VERSION"
+          $url = "https://github.com/protocolbuffers/protobuf/releases/download/v$env:PROTOC_VERSION/protoc-$env:PROTOC_VERSION-win64.zip"
+          New-Item -ItemType Directory -Path $dest -Force | Out-Null
+          Invoke-WebRequest -Uri $url -OutFile $zip
+          Expand-Archive -Path $zip -DestinationPath $dest -Force
+          Add-Content -Path $env:GITHUB_PATH -Value (Join-Path $dest 'bin')
+          & (Join-Path $dest 'bin\protoc.exe') --version
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -54,7 +62,7 @@ jobs:
           targets: x86_64-pc-windows-msvc
 
       - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
+        uses: mozilla-actions/sccache-action@v0.0.10
 
       - name: Cache Rust (workspace)
         uses: Swatinem/rust-cache@v2
@@ -81,15 +89,22 @@ jobs:
 
   # === OPTION RECOMMANDÉE: installateur Windows officiel (runner Windows) ===
   build-tauri-win:
-    runs-on: windows-latest
+    runs-on: windows-2025
     needs: [build-services, build-docker-image]
     steps:
       - uses: actions/checkout@v6
 
       - name: Setup protoc
-        uses: arduino/setup-protoc@v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+        shell: pwsh
+        run: |
+          $zip = Join-Path $env:RUNNER_TEMP 'protoc.zip'
+          $dest = Join-Path $env:RUNNER_TOOL_CACHE "protoc\$env:PROTOC_VERSION"
+          $url = "https://github.com/protocolbuffers/protobuf/releases/download/v$env:PROTOC_VERSION/protoc-$env:PROTOC_VERSION-win64.zip"
+          New-Item -ItemType Directory -Path $dest -Force | Out-Null
+          Invoke-WebRequest -Uri $url -OutFile $zip
+          Expand-Archive -Path $zip -DestinationPath $dest -Force
+          Add-Content -Path $env:GITHUB_PATH -Value (Join-Path $dest 'bin')
+          & (Join-Path $dest 'bin\protoc.exe') --version
 
       - name: Clear bundled services directory
         shell: pwsh
@@ -111,7 +126,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
+        uses: mozilla-actions/sccache-action@v0.0.10
 
       - name: Cache Rust (Tauri app)
         uses: Swatinem/rust-cache@v2
@@ -149,7 +164,7 @@ jobs:
           cache-dependency-path: home-lab/package-lock.json
       
       - name: import windows certificate
-        if: matrix.platform == 'windows-latest'
+        if: runner.os == 'Windows'
         env:
           WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
           WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
