@@ -747,18 +747,37 @@ fn restore_all() -> Result<()> {
                 continue;
             };
             info!("Restoring adapter [{} key={}]", alias, key);
-            if entry.is_dhcp_v4 {
-                let _ = reset_dns_to_dhcp(interface_index, &alias, "IPv4");
+            let v4_ok = if entry.is_dhcp_v4 {
+                reset_dns_to_dhcp(interface_index, &alias, "IPv4")
+                    .map_err(|e| warn!("Failed to reset IPv4 DNS on {}: {}", alias, e))
+                    .is_ok()
             } else if !entry.servers_v4.is_empty() {
-                let _ = set_dns_with_powershell(interface_index, &alias, "IPv4", &entry.servers_v4);
-            }
-            if entry.is_dhcp_v6 {
-                let _ = reset_dns_to_dhcp(interface_index, &alias, "IPv6");
+                set_dns_with_powershell(interface_index, &alias, "IPv4", &entry.servers_v4)
+                    .map_err(|e| warn!("Failed to restore IPv4 DNS on {}: {}", alias, e))
+                    .is_ok()
+            } else {
+                true
+            };
+            let v6_ok = if entry.is_dhcp_v6 {
+                reset_dns_to_dhcp(interface_index, &alias, "IPv6")
+                    .map_err(|e| warn!("Failed to reset IPv6 DNS on {}: {}", alias, e))
+                    .is_ok()
             } else if !entry.servers_v6.is_empty() {
-                let _ = set_dns_with_powershell(interface_index, &alias, "IPv6", &entry.servers_v6);
+                set_dns_with_powershell(interface_index, &alias, "IPv6", &entry.servers_v6)
+                    .map_err(|e| warn!("Failed to restore IPv6 DNS on {}: {}", alias, e))
+                    .is_ok()
+            } else {
+                true
+            };
+            if v4_ok && v6_ok {
+                entry.dirty = false;
+                restored += 1;
+            } else {
+                warn!(
+                    "Restore incomplete for adapter {} (key={}), will retry on next restore call",
+                    alias, key
+                );
             }
-            entry.dirty = false;
-            restored += 1;
         }
     }
     if restored > 0 {
@@ -2143,7 +2162,7 @@ fn uninstall_service() -> Result<()> {
         ServiceAccess::STOP | ServiceAccess::QUERY_STATUS | ServiceAccess::DELETE,
     )?;
     let _ = service.stop();
-    for _ in 0..20 {
+    for _ in 0..120 {
         if let Ok(st) = service.query_status() {
             if st.current_state == ServiceState::Stopped {
                 break;

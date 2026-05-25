@@ -322,6 +322,10 @@ nsis_oidc_done:
     FileWrite $LOG_HANDLE "sc stop homehttp => rc=$0 out=$1$\r$\n"
   ${EndIf}
 
+  ; Wait for HomeDnsService process to fully exit before restoring DNS
+  ; (service may still be running restore_all() even after delete mark)
+  Sleep 2000
+
   ; Best-effort: restore DNS settings explicitly (service also restores on stop)
   ${If} ${FileExists} "$INSTDIR\bin\home-dns.exe"
     nsExec::ExecToStack '"$INSTDIR\bin\home-dns.exe" restore'
@@ -331,6 +335,14 @@ nsis_oidc_done:
     StrCmp $LOG_HANDLE "" +2
     FileWrite $LOG_HANDLE "home-dns.exe restore => rc=$0 out=$1$\r$\n"
   ${EndIf}
+
+  ; Remove DoH template for 127.0.0.1 (best-effort)
+  nsExec::ExecToStack 'powershell -NoProfile -ExecutionPolicy Bypass -Command "Remove-DnsClientDohServerAddress -ServerAddress 127.0.0.1 -ErrorAction SilentlyContinue"'
+  Pop $0
+  Pop $1
+  DetailPrint "Remove DoH template => rc=$0 out=$1"
+  StrCmp $LOG_HANDLE "" +2
+  FileWrite $LOG_HANDLE "Remove DoH template => rc=$0 out=$1$\r$\n"
 
   ; Fallback deletion only if the uninstaller failed or binary is missing
   ${If} $UNINS_HTTP_OK != 1
