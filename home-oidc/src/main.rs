@@ -423,7 +423,18 @@ fn ensure_certificate(cfg: &ServiceConfig) -> Result<()> {
     Ok(())
 }
 
+fn install_rustls_provider() -> Result<()> {
+    if rustls::crypto::CryptoProvider::get_default().is_some() {
+        return Ok(());
+    }
+
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .map_err(|_| anyhow!("failed to initialize the rustls aws-lc-rs provider"))
+}
+
 fn load_key_material(cfg: &ServiceConfig) -> Result<KeyMaterial> {
+    install_rustls_provider().context("initialize rustls crypto provider")?;
     ensure_certificate(cfg)?;
     let key_pem = fs::read_to_string(private_key_path()).context("read private key")?;
     let cert_pem = fs::read_to_string(certificate_path()).context("read certificate")?;

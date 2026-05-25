@@ -12,8 +12,7 @@ use aws_sdk_s3::{
     types::{Delete, ObjectIdentifier},
     Client,
 };
-use flexi_logger::{Age, Cleanup, Criterion, Duplicate, FileSpec, Logger, Naming};
-use log::{debug, error, info, warn, LevelFilter};
+use log::{debug, error, info, warn};
 use pin_project::pin_project;
 use serde::{Deserialize, Serialize};
 use std::ffi::{c_void, OsString};
@@ -243,46 +242,12 @@ fn default_force_path_style() -> bool {
     true
 }
 
-fn default_level_filter() -> LevelFilter {
-    if cfg!(debug_assertions) {
-        LevelFilter::Debug
-    } else {
-        LevelFilter::Info
-    }
-}
-
 fn default_level_str() -> &'static str {
     if cfg!(debug_assertions) {
         "debug"
     } else {
         "info"
     }
-}
-
-fn level_filter_to_str(level: LevelFilter) -> &'static str {
-    match level {
-        LevelFilter::Off => "off",
-        LevelFilter::Error => "error",
-        LevelFilter::Warn => "warn",
-        LevelFilter::Info => "info",
-        LevelFilter::Debug => "debug",
-        LevelFilter::Trace => "trace",
-    }
-}
-
-fn level_from_cfg(cfg: &ServiceConfig) -> LevelFilter {
-    cfg.log_level
-        .as_deref()
-        .map(|value| match value.trim().to_ascii_lowercase().as_str() {
-            "off" => LevelFilter::Off,
-            "error" => LevelFilter::Error,
-            "warn" | "warning" => LevelFilter::Warn,
-            "info" => LevelFilter::Info,
-            "debug" => LevelFilter::Debug,
-            "trace" => LevelFilter::Trace,
-            _ => default_level_filter(),
-        })
-        .unwrap_or_else(default_level_filter)
 }
 
 fn is_endpoint_unreachable(message: &str) -> bool {
@@ -313,33 +278,6 @@ fn endpoint_status(operation: &str, endpoint: &str, err: anyhow::Error) -> Statu
     };
     error!("{message}");
     Status::internal(message)
-}
-
-fn build_label() -> String {
-    let raw = if BUILD_GIT_TAG.trim().is_empty() || BUILD_GIT_TAG == "unknown" {
-        BUILD_GIT_SHA
-    } else {
-        BUILD_GIT_TAG
-    };
-    let sanitized: String = raw
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    if sanitized.trim_matches('_').is_empty() {
-        "unknown".to_string()
-    } else {
-        sanitized
-    }
-}
-
-fn build_log_basename(prefix: &str) -> String {
-    format!("{prefix}_{}", build_label())
 }
 
 fn ensure_layout() -> Result<()> {
@@ -457,26 +395,6 @@ fn rename_bucket_source_path(current_bucket: &str, new_bucket: &str) -> Result<(
     save_bucket_metadata(&metadata)
 }
 
-fn init_logger(level: LevelFilter) -> Result<()> {
-    ensure_layout()?;
-    Logger::try_with_str(level_filter_to_str(level))?
-        .log_to_file(
-            FileSpec::default()
-                .directory(logs_dir())
-                .basename(build_log_basename("home-s3")),
-        )
-        .duplicate_to_stderr(Duplicate::Warn)
-        .rotate(
-            Criterion::Age(Age::Day),
-            Naming::Numbers,
-            Cleanup::KeepLogFiles(10),
-        )
-        .use_utc()
-        .start()
-        .context("start logger")?;
-    Ok(())
-}
-
 async fn current_config(shared: &SharedState) -> ServiceConfig {
     shared.cfg.lock().await.clone()
 }
@@ -521,7 +439,6 @@ fn rustfs_address_from_endpoint(endpoint: &str) -> Result<String> {
     Ok(without_path.to_string())
 }
 
-
 async fn start_embedded_rustfs(shared: &SharedState) -> Result<()> {
     let cfg = current_config(shared).await;
 
@@ -537,6 +454,7 @@ async fn start_embedded_rustfs(shared: &SharedState) -> Result<()> {
     ensure_data_dir(&data_dir)?;
     let address = rustfs_address_from_endpoint(&cfg.endpoint)?;
 
+    // RustFS initializes the process-global tracing/log subscriber during build.
     let server = rustfs::embedded::RustFSServerBuilder::new()
         .address(address)
         .access_key(cfg.access_key_id.clone())
@@ -1240,7 +1158,6 @@ fn run_service() -> Result<()> {
 
     set_status(ServiceState::StartPending);
     let cfg = load_config_or_init()?;
-    init_logger(level_from_cfg(&cfg))?;
     info!(
         "home-s3 service starting build_tag={} sha={} at {}",
         BUILD_GIT_TAG, BUILD_GIT_SHA, BUILD_TIME
@@ -1389,7 +1306,6 @@ fn main() -> Result<()> {
         }
         "console" => {
             let cfg = load_config_or_init()?;
-            init_logger(level_from_cfg(&cfg))?;
             let shared = SharedState {
                 cfg: Arc::new(Mutex::new(cfg)),
                 embedded: Arc::new(Mutex::new(EmbeddedRustfsRuntime::default())),

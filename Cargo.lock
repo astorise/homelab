@@ -5688,7 +5688,6 @@ dependencies = [
  "aws-config",
  "aws-sdk-s3",
  "chrono",
- "flexi_logger",
  "log",
  "pin-project",
  "prost 0.14.3",
