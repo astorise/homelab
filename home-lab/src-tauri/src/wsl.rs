@@ -4026,6 +4026,7 @@ struct KubectlDeleteRequest {
     names: Vec<String>,
     namespace: Option<String>,
     all: bool,
+    ignore_not_found: bool,
     grace_period_seconds: Option<u32>,
 }
 
@@ -4700,6 +4701,7 @@ fn parse_kubectl_delete_request(args: &[String]) -> Result<KubectlDeleteRequest>
         names: inline_name.into_iter().collect(),
         namespace: None,
         all: false,
+        ignore_not_found: false,
         grace_period_seconds: None,
     };
 
@@ -4711,6 +4713,26 @@ fn parse_kubectl_delete_request(args: &[String]) -> Result<KubectlDeleteRequest>
         let token = &args[i];
         if token.eq_ignore_ascii_case("--all") {
             request.all = true;
+            i += 1;
+            continue;
+        }
+        if token.eq_ignore_ascii_case("--ignore-not-found")
+            || token.eq_ignore_ascii_case("--ignore-not-found=true")
+        {
+            request.ignore_not_found = true;
+            i += 1;
+            continue;
+        }
+        if token.eq_ignore_ascii_case("--ignore-not-found=false") {
+            request.ignore_not_found = false;
+            i += 1;
+            continue;
+        }
+        if token.eq_ignore_ascii_case("--wait")
+            || token.eq_ignore_ascii_case("--wait=true")
+            || token.eq_ignore_ascii_case("--wait=false")
+        {
+            // --wait is accepted but ignored: the API call is already synchronous
             i += 1;
             continue;
         }
@@ -8069,30 +8091,37 @@ async fn execute_kubectl_delete(
 
     let mut lines = Vec::with_capacity(request.names.len());
     for name in &request.names {
-        match resolved.scope {
+        let result = match resolved.scope {
             DiscoveryScope::Cluster => {
                 let api: Api<DynamicObject> =
                     Api::all_with(client.clone(), &resolved.api_resource);
-                let _ = api.delete(name, &dp).await.with_context(|| {
-                    format!("{} \"{}\" introuvable", resolved.api_resource.kind, name)
-                })?;
+                api.delete(name, &dp).await
             }
             DiscoveryScope::Namespaced => {
                 let api: Api<DynamicObject> =
                     Api::namespaced_with(client.clone(), &ns, &resolved.api_resource);
-                let _ = api.delete(name, &dp).await.with_context(|| {
-                    format!(
-                        "{} \"{}\" introuvable dans le namespace '{}'",
-                        resolved.api_resource.kind, name, ns
-                    )
-                })?;
+                api.delete(name, &dp).await
+            }
+        };
+        match result {
+            Ok(_) => lines.push(format!(
+                "{} \"{}\" deleted",
+                resolved.api_resource.kind.to_ascii_lowercase(),
+                name
+            )),
+            Err(kube::Error::Api(err)) if err.code == 404 && request.ignore_not_found => {
+                lines.push(format!(
+                    "{} \"{}\" not found (ignored)",
+                    resolved.api_resource.kind.to_ascii_lowercase(),
+                    name
+                ));
+            }
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!("{} \"{}\" delete failed", resolved.api_resource.kind, name)
+                });
             }
         }
-        lines.push(format!(
-            "{} \"{}\" deleted",
-            resolved.api_resource.kind.to_ascii_lowercase(),
-            name
-        ));
     }
     Ok(lines.join("\n"))
 }
