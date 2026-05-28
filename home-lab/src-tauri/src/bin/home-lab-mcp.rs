@@ -212,7 +212,7 @@ impl HomeLabMcpServer {
 
     #[tool(
         name = "wsl_kubectl_exec",
-        description = "Execute a kubectl command against a managed WSL k3s cluster."
+        description = "Execute a kubectl command against a managed WSL k3s cluster. Supported verbs: get, describe, logs, events, delete, rollout (restart|status)."
     )]
     async fn wsl_kubectl_exec(
         &self,

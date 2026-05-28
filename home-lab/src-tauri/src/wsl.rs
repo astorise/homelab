@@ -24,7 +24,7 @@ use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::core::v1::{Event as CoreEvent, Namespace, Node, Pod, Secret};
 use k8s_openapi::api::events::v1::Event as EventsV1Event;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{MicroTime, Time};
-use kube::api::{Api, DynamicObject, ListParams, LogParams, Patch, PatchParams};
+use kube::api::{Api, DeleteParams, DynamicObject, ListParams, LogParams, Patch, PatchParams};
 use kube::config::{KubeConfigOptions, Kubeconfig};
 use kube::discovery::{self, verbs, Discovery, Scope as DiscoveryScope};
 use kube::{Client, Config as KubeClientConfig, ResourceExt};
@@ -4016,6 +4016,31 @@ enum KubectlCommand {
     Describe(KubectlDescribeRequest),
     Logs(KubectlLogsRequest),
     Events(KubectlEventsRequest),
+    Delete(KubectlDeleteRequest),
+    Rollout(KubectlRolloutRequest),
+}
+
+#[derive(Clone, Debug)]
+struct KubectlDeleteRequest {
+    resource: String,
+    names: Vec<String>,
+    namespace: Option<String>,
+    all: bool,
+    grace_period_seconds: Option<u32>,
+}
+
+#[derive(Clone, Debug)]
+enum KubectlRolloutSubcommand {
+    Restart,
+    Status,
+}
+
+#[derive(Clone, Debug)]
+struct KubectlRolloutRequest {
+    subcommand: KubectlRolloutSubcommand,
+    resource: String,
+    name: String,
+    namespace: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -4660,6 +4685,149 @@ fn parse_kubectl_events_request(args: &[String]) -> Result<KubectlEventsRequest>
     Ok(request)
 }
 
+fn parse_kubectl_delete_request(args: &[String]) -> Result<KubectlDeleteRequest> {
+    if args.len() < 2 || !args[0].eq_ignore_ascii_case("delete") {
+        return Err(anyhow!("La commande attendue est 'kubectl delete'."));
+    }
+
+    let (resource_raw, inline_name) = split_resource_and_inline_name(&args[1]);
+    if resource_raw.trim().is_empty() {
+        return Err(anyhow!("La ressource kubectl est requise pour delete."));
+    }
+
+    let mut request = KubectlDeleteRequest {
+        resource: normalize_resource_alias(&resource_raw),
+        names: inline_name.into_iter().collect(),
+        namespace: None,
+        all: false,
+        grace_period_seconds: None,
+    };
+
+    let mut i = 2;
+    while i < args.len() {
+        if parse_namespace_flag(args, &mut i, &mut request.namespace)? {
+            continue;
+        }
+        let token = &args[i];
+        if token.eq_ignore_ascii_case("--all") {
+            request.all = true;
+            i += 1;
+            continue;
+        }
+        if let Some(value) = token.strip_prefix("--grace-period=") {
+            let secs: u32 = value
+                .trim()
+                .parse()
+                .map_err(|_| anyhow!("Valeur --grace-period invalide: '{}'.", value))?;
+            request.grace_period_seconds = Some(secs);
+            i += 1;
+            continue;
+        }
+        if token.eq_ignore_ascii_case("--grace-period") {
+            let value = args
+                .get(i + 1)
+                .ok_or_else(|| anyhow!("L'option --grace-period attend une valeur."))?;
+            let secs: u32 = value
+                .trim()
+                .parse()
+                .map_err(|_| anyhow!("Valeur --grace-period invalide: '{}'.", value))?;
+            request.grace_period_seconds = Some(secs);
+            i += 2;
+            continue;
+        }
+        if token.starts_with('-') {
+            return Err(anyhow!("Option kubectl non supportee: '{}'.", token));
+        }
+        request.names.push(token.clone());
+        i += 1;
+    }
+
+    if request.names.is_empty() && !request.all {
+        return Err(anyhow!(
+            "kubectl delete requiert au moins un nom de ressource ou l'option --all."
+        ));
+    }
+    if !request.names.is_empty() && request.all {
+        return Err(anyhow!(
+            "kubectl delete: --all et des noms de ressources ne peuvent pas etre combines."
+        ));
+    }
+    Ok(request)
+}
+
+fn parse_kubectl_rollout_request(args: &[String]) -> Result<KubectlRolloutRequest> {
+    if args.len() < 2 || !args[0].eq_ignore_ascii_case("rollout") {
+        return Err(anyhow!("La commande attendue est 'kubectl rollout'."));
+    }
+
+    let subcommand = match args[1].to_ascii_lowercase().as_str() {
+        "restart" => KubectlRolloutSubcommand::Restart,
+        "status" => KubectlRolloutSubcommand::Status,
+        other => {
+            return Err(anyhow!(
+                "Sous-commande rollout non supportee: '{}'. Sous-commandes supportees: restart, status.",
+                other
+            ))
+        }
+    };
+
+    if args.len() < 3 {
+        return Err(anyhow!(
+            "La ressource est requise pour kubectl rollout {} (ex: rollout {} deployment/my-app).",
+            args[1],
+            args[1]
+        ));
+    }
+
+    let (resource_raw, inline_name) = split_resource_and_inline_name(&args[2]);
+    let resource = normalize_resource_alias(&resource_raw);
+    match resource.as_str() {
+        "deployments" | "daemonsets" | "statefulsets" => {}
+        other => {
+            return Err(anyhow!(
+                "kubectl rollout ne supporte pas la ressource '{}'. Ressources supportees: deployments, daemonsets, statefulsets.",
+                other
+            ))
+        }
+    }
+
+    let mut namespace: Option<String> = None;
+    let mut name = inline_name;
+
+    let mut i = 3;
+    while i < args.len() {
+        if parse_namespace_flag(args, &mut i, &mut namespace)? {
+            continue;
+        }
+        let token = &args[i];
+        if token.starts_with('-') {
+            return Err(anyhow!("Option kubectl non supportee: '{}'.", token));
+        }
+        if name.is_none() {
+            name = Some(token.clone());
+        } else {
+            return Err(anyhow!(
+                "kubectl rollout n'accepte qu'une seule ressource a la fois."
+            ));
+        }
+        i += 1;
+    }
+
+    let name = name.ok_or_else(|| {
+        anyhow!(
+            "Le nom de la ressource est requis pour kubectl rollout (ex: rollout {} deployment/my-app).",
+            args[1]
+        )
+    })?;
+
+    Ok(KubectlRolloutRequest {
+        subcommand,
+        resource,
+        name,
+        namespace,
+    })
+}
+
 fn parse_kubectl_command(args: &[String]) -> Result<KubectlCommand> {
     if args.is_empty() {
         return Err(anyhow!("La commande kubectl est requise."));
@@ -4678,8 +4846,14 @@ fn parse_kubectl_command(args: &[String]) -> Result<KubectlCommand> {
     if args[0].eq_ignore_ascii_case("events") {
         return Ok(KubectlCommand::Events(parse_kubectl_events_request(args)?));
     }
+    if args[0].eq_ignore_ascii_case("delete") {
+        return Ok(KubectlCommand::Delete(parse_kubectl_delete_request(args)?));
+    }
+    if args[0].eq_ignore_ascii_case("rollout") {
+        return Ok(KubectlCommand::Rollout(parse_kubectl_rollout_request(args)?));
+    }
     Err(anyhow!(
-        "Commande kubectl non supportee: '{}'. Commandes supportees: get, describe, logs, events.",
+        "Commande kubectl non supportee: '{}'. Commandes supportees: get, describe, logs, events, delete, rollout.",
         args[0]
     ))
 }
@@ -7834,6 +8008,231 @@ async fn execute_kubectl_get(
     }
 }
 
+async fn execute_kubectl_delete(
+    client: &Client,
+    config: &KubeClientConfig,
+    request: KubectlDeleteRequest,
+) -> Result<String> {
+    let resolved = resolve_dynamic_resource(client, &request.resource).await?;
+    let ns = default_namespace(config, request.namespace.as_deref());
+    let dp = match request.grace_period_seconds {
+        Some(secs) => DeleteParams::default().grace_period(secs),
+        None => DeleteParams::default(),
+    };
+
+    if request.all {
+        let objects = list_dynamic_objects(
+            client,
+            config,
+            &resolved,
+            Some(ns.as_str()),
+            false,
+            None,
+        )
+        .await?;
+        if objects.is_empty() {
+            return Ok("No resources found.".to_string());
+        }
+        let mut lines = Vec::with_capacity(objects.len());
+        for obj in &objects {
+            let name = obj.name_any();
+            match resolved.scope {
+                DiscoveryScope::Cluster => {
+                    let api: Api<DynamicObject> =
+                        Api::all_with(client.clone(), &resolved.api_resource);
+                    let _ = api.delete(&name, &dp).await.with_context(|| {
+                        format!(
+                            "{} \"{}\" introuvable",
+                            resolved.api_resource.kind, name
+                        )
+                    })?;
+                }
+                DiscoveryScope::Namespaced => {
+                    let api: Api<DynamicObject> =
+                        Api::namespaced_with(client.clone(), &ns, &resolved.api_resource);
+                    let _ = api.delete(&name, &dp).await.with_context(|| {
+                        format!(
+                            "{} \"{}\" introuvable dans le namespace '{}'",
+                            resolved.api_resource.kind, name, ns
+                        )
+                    })?;
+                }
+            }
+            lines.push(format!(
+                "{} \"{}\" deleted",
+                resolved.api_resource.kind.to_ascii_lowercase(),
+                name
+            ));
+        }
+        return Ok(lines.join("\n"));
+    }
+
+    let mut lines = Vec::with_capacity(request.names.len());
+    for name in &request.names {
+        match resolved.scope {
+            DiscoveryScope::Cluster => {
+                let api: Api<DynamicObject> =
+                    Api::all_with(client.clone(), &resolved.api_resource);
+                let _ = api.delete(name, &dp).await.with_context(|| {
+                    format!("{} \"{}\" introuvable", resolved.api_resource.kind, name)
+                })?;
+            }
+            DiscoveryScope::Namespaced => {
+                let api: Api<DynamicObject> =
+                    Api::namespaced_with(client.clone(), &ns, &resolved.api_resource);
+                let _ = api.delete(name, &dp).await.with_context(|| {
+                    format!(
+                        "{} \"{}\" introuvable dans le namespace '{}'",
+                        resolved.api_resource.kind, name, ns
+                    )
+                })?;
+            }
+        }
+        lines.push(format!(
+            "{} \"{}\" deleted",
+            resolved.api_resource.kind.to_ascii_lowercase(),
+            name
+        ));
+    }
+    Ok(lines.join("\n"))
+}
+
+fn rollout_restart_timestamp() -> String {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    // Compute UTC date/time from Unix seconds (no leap second handling)
+    let days = secs / 86400;
+    let time = secs % 86400;
+    let h = time / 3600;
+    let m = (time % 3600) / 60;
+    let s = time % 60;
+    // Civil date from days since 1970-01-01 (Euclidean affine algorithm)
+    let z = days as i64 + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let mo = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if mo <= 2 { y + 1 } else { y };
+    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, mo, d, h, m, s)
+}
+
+async fn execute_kubectl_rollout(
+    client: &Client,
+    config: &KubeClientConfig,
+    request: KubectlRolloutRequest,
+) -> Result<String> {
+    let ns = default_namespace(config, request.namespace.as_deref());
+    let resolved = resolve_dynamic_resource(client, &request.resource).await?;
+    let api: Api<DynamicObject> =
+        Api::namespaced_with(client.clone(), &ns, &resolved.api_resource);
+
+    match request.subcommand {
+        KubectlRolloutSubcommand::Restart => {
+            let restart_at = rollout_restart_timestamp();
+            let patch = serde_json::json!({
+                "spec": {
+                    "template": {
+                        "metadata": {
+                            "annotations": {
+                                "kubectl.kubernetes.io/restartedAt": restart_at
+                            }
+                        }
+                    }
+                }
+            });
+            api.patch(&request.name, &PatchParams::default(), &Patch::Merge(&patch))
+                .await
+                .with_context(|| {
+                    format!(
+                        "{} \"{}\" introuvable dans le namespace '{}'",
+                        resolved.api_resource.kind, request.name, ns
+                    )
+                })?;
+            Ok(format!(
+                "{}/{} restarted",
+                resolved.api_resource.kind.to_ascii_lowercase(),
+                request.name
+            ))
+        }
+        KubectlRolloutSubcommand::Status => {
+            let object = api.get(&request.name).await.with_context(|| {
+                format!(
+                    "{} \"{}\" introuvable dans le namespace '{}'",
+                    resolved.api_resource.kind, request.name, ns
+                )
+            })?;
+
+            let spec_replicas = object
+                .data
+                .get("spec")
+                .and_then(|s| s.get("replicas"))
+                .and_then(|r| r.as_i64())
+                .unwrap_or(1);
+            let status = object.data.get("status");
+            let updated = status
+                .and_then(|s| s.get("updatedReplicas"))
+                .and_then(|r| r.as_i64())
+                .unwrap_or(0);
+            let available = status
+                .and_then(|s| s.get("availableReplicas"))
+                .and_then(|r| r.as_i64())
+                .unwrap_or(0);
+            let ready = status
+                .and_then(|s| s.get("readyReplicas"))
+                .and_then(|r| r.as_i64())
+                .unwrap_or(0);
+            let observed_generation = status
+                .and_then(|s| s.get("observedGeneration"))
+                .and_then(|g| g.as_i64())
+                .unwrap_or(0);
+            let generation = object
+                .metadata
+                .generation
+                .unwrap_or(0);
+
+            if generation > observed_generation {
+                return Ok(format!(
+                    "Waiting for {}/{} rollout to finish: observed generation {} < desired generation {}",
+                    resolved.api_resource.kind.to_ascii_lowercase(),
+                    request.name,
+                    observed_generation,
+                    generation
+                ));
+            }
+            if updated < spec_replicas {
+                return Ok(format!(
+                    "Waiting for {}/{} rollout to finish: {} out of {} new replicas have been updated...",
+                    resolved.api_resource.kind.to_ascii_lowercase(),
+                    request.name,
+                    updated,
+                    spec_replicas
+                ));
+            }
+            if available < spec_replicas {
+                return Ok(format!(
+                    "Waiting for {}/{} rollout to finish: {} of {} updated replicas are available...",
+                    resolved.api_resource.kind.to_ascii_lowercase(),
+                    request.name,
+                    available,
+                    spec_replicas
+                ));
+            }
+            let _ = ready;
+            Ok(format!(
+                "{}/{} successfully rolled out",
+                resolved.api_resource.kind.to_ascii_lowercase(),
+                request.name
+            ))
+        }
+    }
+}
+
 async fn execute_kubectl_command(
     client: &Client,
     config: &KubeClientConfig,
@@ -7846,6 +8245,8 @@ async fn execute_kubectl_command(
         }
         KubectlCommand::Logs(request) => execute_kubectl_logs(client, config, request).await,
         KubectlCommand::Events(request) => execute_kubectl_events(client, config, request).await,
+        KubectlCommand::Delete(request) => execute_kubectl_delete(client, config, request).await,
+        KubectlCommand::Rollout(request) => execute_kubectl_rollout(client, config, request).await,
     }
 }
 
