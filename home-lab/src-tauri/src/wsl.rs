@@ -6594,7 +6594,16 @@ async fn wait_for_kube_api_port(
     let timeout = Duration::from_secs(KUBE_API_READY_TIMEOUT_SECONDS);
     let mut attempt: u32 = 0;
     let mut last_error = String::new();
-    let probe_targets = vec![(endpoint.host.clone(), endpoint.port)];
+    // Probe HTTPS rather than raw TCP: k3s can accept TCP connections while its
+    // TLS layer is still initialising, which causes WSAECONNRESET (os error 10054)
+    // in the kube client immediately after. Any HTTP response (200/401/403/503)
+    // confirms TLS is up and the API server is ready.
+    let probe_url = format!("https://{}:{}/readyz", endpoint.host, endpoint.port);
+    let probe_client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .timeout(Duration::from_millis(1500))
+        .build()
+        .unwrap_or_default();
 
     loop {
         if started_at.elapsed() >= timeout {
@@ -6617,23 +6626,21 @@ async fn wait_for_kube_api_port(
         }
 
         attempt += 1;
-        for (probe_host, probe_port) in &probe_targets {
-            match tcp_connect_once(probe_host, *probe_port, Duration::from_millis(900)).await {
-                Ok(()) => {
-                    info!(
-                        target: "wsl",
-                        trace_id = %trace_id,
-                        instance = %instance,
-                        api_host = %probe_host,
-                        api_port = %probe_port,
-                        attempts = attempt,
-                        "Port API Kubernetes joignable"
-                    );
-                    return Ok(endpoint.clone());
-                }
-                Err(err) => {
-                    last_error = format!("{probe_host}:{probe_port}: {err}");
-                }
+        match probe_client.get(&probe_url).send().await {
+            Ok(_response) => {
+                info!(
+                    target: "wsl",
+                    trace_id = %trace_id,
+                    instance = %instance,
+                    api_host = %endpoint.host,
+                    api_port = %endpoint.port,
+                    attempts = attempt,
+                    "API Kubernetes prete (TLS etabli)"
+                );
+                return Ok(endpoint.clone());
+            }
+            Err(err) => {
+                last_error = format!("{}:{}: {}", endpoint.host, endpoint.port, err);
             }
         }
 
