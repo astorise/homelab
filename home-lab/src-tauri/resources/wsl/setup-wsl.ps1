@@ -593,7 +593,8 @@ function Get-IngressPortLayoutForInstance {
     param([string]$Name)
 
     # HTTPS is the published backend port; keep one full HTTP/HTTPS pair per instance.
-    $httpsPort = Get-DeterministicPortForInstance -Name $Name -BasePort 2001 -Step 2 -MaxPort 60000
+    # Range 2001-3999 (step 2) is disjoint from API (1001-1999) and SSH (4001-5999).
+    $httpsPort = Get-DeterministicPortForInstance -Name $Name -BasePort 2001 -Step 2 -MaxPort 3999
     [pscustomobject]@{
         HttpPort  = [int]($httpsPort - 1)
         HttpsPort = [int]$httpsPort
@@ -605,13 +606,15 @@ function Get-K3sApiPortForInstance {
 
     # k3s reserves the adjacent supervisor/apiserver port pair, so instances must
     # advance by 2 to avoid collisions between home-lab-k3s and home-lab-k3s-N.
-    return Get-DeterministicPortForInstance -Name $Name -BasePort 1001 -Step 2 -MaxPort 60000
+    # Range 1001-1999 (step 2) is disjoint from Ingress (2001-3999) and SSH (4001-5999).
+    return Get-DeterministicPortForInstance -Name $Name -BasePort 1001 -Step 2 -MaxPort 1999
 }
 
 function Get-SshPortForInstance {
     param([string]$Name)
 
-    return Get-DeterministicPortForInstance -Name $Name -BasePort 3001 -Step 1 -MaxPort 60000
+    # Range 4001-5999 (step 1) is disjoint from API (1001-1999) and Ingress (2001-3999).
+    return Get-DeterministicPortForInstance -Name $Name -BasePort 4001 -Step 1 -MaxPort 5999
 }
 
 function Get-ContainerdStreamPortForInstance {
