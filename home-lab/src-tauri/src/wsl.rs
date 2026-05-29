@@ -6105,6 +6105,195 @@ async fn ensure_wsl_keepalive(instance: &str, context: &str) -> Result<()> {
     Ok(())
 }
 
+fn wslconfig_path() -> Result<PathBuf> {
+    let home = std::env::var_os("USERPROFILE")
+        .map(PathBuf::from)
+        .or_else(dirs::home_dir)
+        .ok_or_else(|| anyhow!("Profil utilisateur introuvable pour localiser .wslconfig"))?;
+    Ok(home.join(".wslconfig"))
+}
+
+/// Upsert `key=value` under `[section]` in a `.wslconfig`-style line buffer,
+/// preserving every other section and key. Returns true when a change was made.
+fn upsert_ini_value(lines: &mut Vec<String>, section: &str, key: &str, value: &str) -> bool {
+    let header = format!("[{section}]");
+    let section_start = lines
+        .iter()
+        .position(|l| l.trim().eq_ignore_ascii_case(&header));
+
+    let Some(start) = section_start else {
+        // Section absent: append it (with a blank separator if needed).
+        if lines
+            .last()
+            .map(|l| !l.trim().is_empty())
+            .unwrap_or(false)
+        {
+            lines.push(String::new());
+        }
+        lines.push(header);
+        lines.push(format!("{key}={value}"));
+        return true;
+    };
+
+    // Bound the section to the next "[...]" header (or EOF).
+    let end = lines
+        .iter()
+        .enumerate()
+        .skip(start + 1)
+        .find(|(_, l)| l.trim_start().starts_with('['))
+        .map(|(i, _)| i)
+        .unwrap_or(lines.len());
+
+    for line in lines.iter_mut().take(end).skip(start + 1) {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('#') || trimmed.starts_with(';') {
+            continue;
+        }
+        if let Some(eq) = trimmed.find('=') {
+            if trimmed[..eq].trim().eq_ignore_ascii_case(key) {
+                if trimmed[eq + 1..].trim() == value {
+                    return false; // already correct
+                }
+                *line = format!("{key}={value}");
+                return true;
+            }
+        }
+    }
+
+    // Key missing inside an existing section: insert at the section's end.
+    lines.insert(end, format!("{key}={value}"));
+    true
+}
+
+/// Ensure `.wslconfig` disables the WSL2 idle shutdown that otherwise stops the
+/// VM (and k3s with it) after ~60s without an attached session — see
+/// microsoft/WSL#40363. Idempotent: other settings are preserved and the file
+/// is only rewritten when a value was missing or wrong. Returns true if changed.
+///
+/// Note: a change only takes effect on the next VM start; the keepalive holds
+/// the current VM up in the meantime, so we deliberately do not force
+/// `wsl --shutdown` here.
+pub fn ensure_wslconfig_idle_settings() -> Result<bool> {
+    let path = wslconfig_path()?;
+    let original = fs::read_to_string(&path).unwrap_or_default();
+    let mut lines: Vec<String> = original.lines().map(str::to_string).collect();
+
+    let mut changed = false;
+    for (section, key, value) in [
+        ("wsl2", "vmIdleTimeout", "-1"),
+        ("experimental", "autoMemoryReclaim", "disabled"),
+    ] {
+        changed |= upsert_ini_value(&mut lines, section, key, value);
+    }
+
+    if changed {
+        let mut out = lines.join("\n");
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        fs::write(&path, out)
+            .with_context(|| format!("Écriture de {} impossible", path.display()))?;
+    }
+    Ok(changed)
+}
+
+/// Cheap check: an instance is Home Lab-managed if it carries the prefix or has
+/// the bootstrap script installed by setup-wsl.ps1. Used so the keepalive only
+/// holds instances we provisioned, never the user's unrelated WSL distros.
+fn instance_is_managed_by_homelab(instance: &str) -> bool {
+    if is_home_lab_wsl_instance(instance) {
+        return true;
+    }
+    Command::new("wsl.exe")
+        .args([
+            "-d",
+            instance,
+            "--",
+            "sh",
+            "-lc",
+            "test -s /usr/local/bin/k3s-init.sh",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+/// Ensure a keepalive client is attached to every running, Home Lab-managed WSL
+/// instance. Instances already holding a live keepalive are skipped cheaply.
+fn ensure_keepalive_for_managed_instances() {
+    let instances = match collect_wsl_instances() {
+        Ok(instances) => instances,
+        Err(err) => {
+            warn!(target: "wsl", error = %err, "Superviseur keepalive: listing WSL impossible");
+            return;
+        }
+    };
+
+    for instance in instances {
+        if !wsl_state_is_running(&instance.state) {
+            continue;
+        }
+
+        // Skip if a live keepalive is already tracked for this instance.
+        let already_alive = keepalive_children()
+            .lock()
+            .ok()
+            .and_then(|mut guard| {
+                guard
+                    .get_mut(&instance.name)
+                    .map(|child| matches!(child.try_wait(), Ok(None)))
+            })
+            .unwrap_or(false);
+        if already_alive {
+            continue;
+        }
+
+        if !instance_is_managed_by_homelab(&instance.name) {
+            continue;
+        }
+
+        if let Err(err) = run_keepalive_launcher(&instance.name) {
+            warn!(
+                target: "wsl",
+                instance = %instance.name,
+                error = %err,
+                "Superviseur keepalive: lancement impossible"
+            );
+        }
+    }
+}
+
+/// Background maintenance owned by the tray app (which runs in the user's WSL
+/// context): write the anti-idle `.wslconfig` once, then keep every managed
+/// instance attached so the VM never idle-stops. Safe to call once at startup.
+pub fn start_wsl_maintenance() {
+    std::thread::spawn(|| {
+        match ensure_wslconfig_idle_settings() {
+            Ok(true) => {
+                info!(target: "wsl", "Réglages .wslconfig anti-idle appliqués (WSL#40363)");
+                log_wsl_event(
+                    "Réglages .wslconfig appliqués: vmIdleTimeout=-1, autoMemoryReclaim=disabled",
+                );
+            }
+            Ok(false) => {
+                info!(target: "wsl", ".wslconfig déjà conforme (anti-idle)");
+            }
+            Err(err) => {
+                warn!(target: "wsl", error = %err, "Écriture .wslconfig anti-idle impossible");
+            }
+        }
+
+        loop {
+            ensure_keepalive_for_managed_instances();
+            std::thread::sleep(std::time::Duration::from_secs(30));
+        }
+    });
+}
+
 async fn wsl_instance_state(instance: &str) -> Result<Option<String>> {
     let target = instance.to_ascii_lowercase();
     tauri::async_runtime::spawn_blocking(move || {

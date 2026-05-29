@@ -213,6 +213,14 @@ pub fn run() {
                 ensure_service_running("HomeDnsService");
             }
 
+            // Maintenance WSL portée par l'app (contexte utilisateur): applique le
+            // .wslconfig anti-idle (microsoft/WSL#40363) et maintient un keepalive
+            // sur les instances gérées pour que la VM ne s'arrête plus sur inactivité.
+            #[cfg(target_os = "windows")]
+            {
+                crate::wsl::start_wsl_maintenance();
+            }
+
             // En dev sur Windows, lance les services en mode console et redirige leurs logs
             #[cfg(all(debug_assertions, target_os = "windows"))]
             {
