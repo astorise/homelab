@@ -368,7 +368,7 @@ run_k3s_server() {
     ensure_nvidia_toolkit
     start_containerd_stream_patch_watcher
     ensure_k3s_runtime_path
-    set -- /usr/local/bin/k3s server --https-listen-port "$API_PORT"
+    set -- /usr/local/bin/k3s server --https-listen-port "$API_PORT" --prefer-bundled-bin
 
     if [ -n "$K3S_LB_SERVER_PORT" ]; then
         set -- "$@" --lb-server-port "$K3S_LB_SERVER_PORT"

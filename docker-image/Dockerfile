@@ -146,10 +146,7 @@ ENV WSL_ROLE=server
 ENV WSL_PORT_RANGE=6443-6550
 
 RUN mkdir -p /sbin /usr/local/bin /etc/ssl/certs /etc/profile.d /var/log \
- && ln -sf /bin/busybox /sbin/ip \
- && ln -sf /bin/busybox /sbin/iptables \
- && ln -sf /bin/busybox /sbin/iptables-save \
- && ln -sf /bin/busybox /sbin/iptables-restore
+ && ln -sf /bin/busybox /sbin/ip
 
 COPY --from=ca-certs /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 RUN ln -sf /etc/ssl/certs/ca-certificates.crt /etc/ssl/cert.pem
