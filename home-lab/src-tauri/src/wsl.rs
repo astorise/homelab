@@ -240,7 +240,10 @@ const ENV_DNS_TTL: &str = "HOME_LAB_WSL_DNS_TTL";
 const DEFAULT_HTTP_PORT_BASE: u16 = 2001;
 // Ingress backends use an adjacent HTTP/HTTPS pair, so blocks must not overlap.
 const DEFAULT_HTTP_PORT_STEP: u16 = 2;
-const DEFAULT_HTTP_PORT_MAX: u16 = 60000;
+// Ingress range 2001-3999 is disjoint from the API range (1001-1999) and the SSH
+// range (4001-5999). These bounds MUST match setup-wsl.ps1's Get-IngressPortLayoutForInstance
+// so the env file (written by PowerShell) and Rust's firewall/DNS/portproxy agree.
+const DEFAULT_HTTP_PORT_MAX: u16 = 3999;
 const ENV_HTTP_PORT_BASE: &str = "HOME_LAB_WSL_HTTP_PORT_BASE";
 const ENV_HTTP_PORT_STEP: &str = "HOME_LAB_WSL_HTTP_PORT_STEP";
 const ENV_HTTP_PORT_MAX: &str = "HOME_LAB_WSL_HTTP_PORT_MAX";
@@ -253,7 +256,11 @@ const ENV_API_PORT: &str = "HOME_LAB_WSL_K3S_API_PORT";
 const DEFAULT_API_PORT_BASE: u16 = 1001;
 // k3s uses an adjacent supervisor listener, so consecutive API ports collide.
 const DEFAULT_API_PORT_STEP: u16 = 2;
-const DEFAULT_API_PORT_MAX: u16 = 60000;
+// API range 1001-1999 is disjoint from the ingress range (2001-3999) and the SSH
+// range (4001-5999). The API port is passed to setup-wsl.ps1 via -ApiPort, while
+// PowerShell computes the ingress port independently; disjoint ranges guarantee they
+// can never collide (this was the K3S_API_PORT == K3S_INGRESS_HTTPS_PORT bug).
+const DEFAULT_API_PORT_MAX: u16 = 1999;
 const ENV_API_PORT_BASE: &str = "HOME_LAB_WSL_K3S_API_PORT_BASE";
 const ENV_API_PORT_STEP: &str = "HOME_LAB_WSL_K3S_API_PORT_STEP";
 const ENV_API_PORT_MAX: &str = "HOME_LAB_WSL_K3S_API_PORT_MAX";
@@ -271,9 +278,11 @@ const ENV_K3S_NODEPORT_MAX: &str = "HOME_LAB_WSL_K3S_NODEPORT_MAX";
 const DEFAULT_CONTAINERD_STREAM_PORT_BASE: u16 = 10010;
 const DEFAULT_K3S_LOCAL_PORT_BASE: u16 = 11040;
 const DEFAULT_K3S_LOCAL_PORT_STEP: u16 = 20;
-const DEFAULT_SSH_PORT_BASE: u16 = 3001;
+// SSH range 4001-5999 is disjoint from the API range (1001-1999) and the ingress
+// range (2001-3999). MUST match setup-wsl.ps1's Get-SshPortForInstance.
+const DEFAULT_SSH_PORT_BASE: u16 = 4001;
 const DEFAULT_SSH_PORT_STEP: u16 = 1;
-const DEFAULT_SSH_PORT_MAX: u16 = 60000;
+const DEFAULT_SSH_PORT_MAX: u16 = 5999;
 const ENV_SSH_PORT_BASE: &str = "HOME_LAB_WSL_SSH_PORT_BASE";
 const ENV_SSH_PORT_STEP: &str = "HOME_LAB_WSL_SSH_PORT_STEP";
 const ENV_SSH_PORT_MAX: &str = "HOME_LAB_WSL_SSH_PORT_MAX";
