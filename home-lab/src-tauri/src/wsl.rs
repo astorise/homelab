@@ -4063,7 +4063,16 @@ struct KubectlRolloutRequest {
     resource: String,
     name: String,
     namespace: Option<String>,
+    /// `rollout status` only: wait (watch) until the rollout completes.
+    watch: bool,
+    /// `rollout status` only: max seconds to wait. None means use the default cap.
+    timeout_seconds: Option<i64>,
 }
+
+/// Upper bound for how long `rollout status` will block, even if the caller asks
+/// for more (or for "wait forever"). Keeps a single kubectl call bounded.
+const KUBECTL_ROLLOUT_STATUS_MAX_WAIT_SECONDS: i64 = 600;
+const KUBECTL_ROLLOUT_STATUS_POLL_INTERVAL_MS: u64 = 2000;
 
 #[derive(Clone, Debug)]
 struct KubectlApplyManifest {
@@ -4836,6 +4845,8 @@ fn parse_kubectl_rollout_request(args: &[String]) -> Result<KubectlRolloutReques
 
     let mut namespace: Option<String> = None;
     let mut name = inline_name;
+    let mut watch = true; // kubectl rollout status watches by default
+    let mut timeout_seconds: Option<i64> = None;
 
     let mut i = 3;
     while i < args.len() {
@@ -4843,6 +4854,37 @@ fn parse_kubectl_rollout_request(args: &[String]) -> Result<KubectlRolloutReques
             continue;
         }
         let token = &args[i];
+
+        // --timeout=<dur> | --timeout <dur>
+        if let Some(value) = token.strip_prefix("--timeout=") {
+            timeout_seconds = Some(parse_duration_seconds(value)?);
+            i += 1;
+            continue;
+        }
+        if token.eq_ignore_ascii_case("--timeout") {
+            let value = args
+                .get(i + 1)
+                .ok_or_else(|| anyhow!("L'option --timeout attend une valeur."))?;
+            timeout_seconds = Some(parse_duration_seconds(value)?);
+            i += 2;
+            continue;
+        }
+
+        // --watch[=bool] | -w[=bool]
+        if token.eq_ignore_ascii_case("--watch") || token.eq_ignore_ascii_case("-w") {
+            watch = true;
+            i += 1;
+            continue;
+        }
+        if let Some(value) = token
+            .strip_prefix("--watch=")
+            .or_else(|| token.strip_prefix("-w="))
+        {
+            watch = !value.eq_ignore_ascii_case("false");
+            i += 1;
+            continue;
+        }
+
         if token.starts_with('-') {
             return Err(anyhow!("Option kubectl non supportee: '{}'.", token));
         }
@@ -4868,6 +4910,8 @@ fn parse_kubectl_rollout_request(args: &[String]) -> Result<KubectlRolloutReques
         resource,
         name,
         namespace,
+        watch,
+        timeout_seconds,
     })
 }
 
@@ -8408,6 +8452,54 @@ fn rollout_restart_timestamp() -> String {
     format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, mo, d, h, m, s)
 }
 
+enum RolloutState {
+    Complete(String),
+    Waiting(String),
+}
+
+/// Compute kubectl-like `rollout status` text for a workload object.
+fn rollout_status_snapshot(object: &DynamicObject, kind: &str, name: &str) -> RolloutState {
+    let spec_replicas = object
+        .data
+        .get("spec")
+        .and_then(|s| s.get("replicas"))
+        .and_then(|r| r.as_i64())
+        .unwrap_or(1);
+    let status = object.data.get("status");
+    let updated = status
+        .and_then(|s| s.get("updatedReplicas"))
+        .and_then(|r| r.as_i64())
+        .unwrap_or(0);
+    let available = status
+        .and_then(|s| s.get("availableReplicas"))
+        .and_then(|r| r.as_i64())
+        .unwrap_or(0);
+    let observed_generation = status
+        .and_then(|s| s.get("observedGeneration"))
+        .and_then(|g| g.as_i64())
+        .unwrap_or(0);
+    let generation = object.metadata.generation.unwrap_or(0);
+
+    if generation > observed_generation {
+        RolloutState::Waiting(format!(
+            "Waiting for {}/{} rollout to finish: observed generation {} < desired generation {}",
+            kind, name, observed_generation, generation
+        ))
+    } else if updated < spec_replicas {
+        RolloutState::Waiting(format!(
+            "Waiting for {}/{} rollout to finish: {} out of {} new replicas have been updated...",
+            kind, name, updated, spec_replicas
+        ))
+    } else if available < spec_replicas {
+        RolloutState::Waiting(format!(
+            "Waiting for {}/{} rollout to finish: {} of {} updated replicas are available...",
+            kind, name, available, spec_replicas
+        ))
+    } else {
+        RolloutState::Complete(format!("{}/{} successfully rolled out", kind, name))
+    }
+}
+
 async fn execute_kubectl_rollout(
     client: &Client,
     config: &KubeClientConfig,
@@ -8447,75 +8539,65 @@ async fn execute_kubectl_rollout(
             ))
         }
         KubectlRolloutSubcommand::Status => {
-            let object = api.get(&request.name).await.with_context(|| {
-                format!(
-                    "{} \"{}\" introuvable dans le namespace '{}'",
-                    resolved.api_resource.kind, request.name, ns
-                )
-            })?;
+            let kind = resolved.api_resource.kind.to_ascii_lowercase();
+            let max_wait = request
+                .timeout_seconds
+                .unwrap_or(KUBECTL_ROLLOUT_STATUS_MAX_WAIT_SECONDS)
+                .clamp(0, KUBECTL_ROLLOUT_STATUS_MAX_WAIT_SECONDS);
+            let started = Instant::now();
 
-            let spec_replicas = object
-                .data
-                .get("spec")
-                .and_then(|s| s.get("replicas"))
-                .and_then(|r| r.as_i64())
-                .unwrap_or(1);
-            let status = object.data.get("status");
-            let updated = status
-                .and_then(|s| s.get("updatedReplicas"))
-                .and_then(|r| r.as_i64())
-                .unwrap_or(0);
-            let available = status
-                .and_then(|s| s.get("availableReplicas"))
-                .and_then(|r| r.as_i64())
-                .unwrap_or(0);
-            let ready = status
-                .and_then(|s| s.get("readyReplicas"))
-                .and_then(|r| r.as_i64())
-                .unwrap_or(0);
-            let observed_generation = status
-                .and_then(|s| s.get("observedGeneration"))
-                .and_then(|g| g.as_i64())
-                .unwrap_or(0);
-            let generation = object
-                .metadata
-                .generation
-                .unwrap_or(0);
+            loop {
+                let object = api.get(&request.name).await.with_context(|| {
+                    format!(
+                        "{} \"{}\" introuvable dans le namespace '{}'",
+                        resolved.api_resource.kind, request.name, ns
+                    )
+                })?;
 
-            if generation > observed_generation {
-                return Ok(format!(
-                    "Waiting for {}/{} rollout to finish: observed generation {} < desired generation {}",
-                    resolved.api_resource.kind.to_ascii_lowercase(),
-                    request.name,
-                    observed_generation,
-                    generation
-                ));
+                match rollout_status_snapshot(&object, &kind, &request.name) {
+                    RolloutState::Complete(msg) => return Ok(msg),
+                    RolloutState::Waiting(msg) => {
+                        // One-shot (`--watch=false`) returns the current status as-is.
+                        if !request.watch {
+                            return Ok(msg);
+                        }
+                        // Watching: give up once the deadline passes, mirroring
+                        // kubectl's non-zero "timed out waiting for the condition".
+                        if started.elapsed().as_secs() as i64 >= max_wait {
+                            anyhow::bail!(
+                                "timed out waiting for the condition on {}/{} after {}s. Dernier etat: {}",
+                                kind,
+                                request.name,
+                                max_wait,
+                                msg
+                            );
+                        }
+                        sleep(Duration::from_millis(
+                            KUBECTL_ROLLOUT_STATUS_POLL_INTERVAL_MS,
+                        ))
+                        .await;
+                    }
+                }
             }
-            if updated < spec_replicas {
-                return Ok(format!(
-                    "Waiting for {}/{} rollout to finish: {} out of {} new replicas have been updated...",
-                    resolved.api_resource.kind.to_ascii_lowercase(),
-                    request.name,
-                    updated,
-                    spec_replicas
-                ));
-            }
-            if available < spec_replicas {
-                return Ok(format!(
-                    "Waiting for {}/{} rollout to finish: {} of {} updated replicas are available...",
-                    resolved.api_resource.kind.to_ascii_lowercase(),
-                    request.name,
-                    available,
-                    spec_replicas
-                ));
-            }
-            let _ = ready;
-            Ok(format!(
-                "{}/{} successfully rolled out",
-                resolved.api_resource.kind.to_ascii_lowercase(),
-                request.name
-            ))
         }
+    }
+}
+
+/// Outer wall-clock budget for a kubectl operation. Most commands are quick
+/// (default cap), but `rollout status --watch` legitimately blocks until the
+/// rollout completes, so it gets the requested timeout plus a small margin.
+fn command_exec_timeout_secs(command: &KubectlCommand) -> u64 {
+    match command {
+        KubectlCommand::Rollout(req)
+            if matches!(req.subcommand, KubectlRolloutSubcommand::Status) && req.watch =>
+        {
+            let wait = req
+                .timeout_seconds
+                .unwrap_or(KUBECTL_ROLLOUT_STATUS_MAX_WAIT_SECONDS)
+                .clamp(0, KUBECTL_ROLLOUT_STATUS_MAX_WAIT_SECONDS) as u64;
+            wait + 20 // client init + final poll margin
+        }
+        _ => KUBECTL_EXEC_TIMEOUT_SECONDS,
     }
 }
 
@@ -8758,6 +8840,7 @@ Verifie que '{}' peut demarrer et exposer l'API Kubernetes.",
     let trace_for_task = trace_id.clone();
     let instance_for_task = instance.to_string();
     let api_endpoint_for_task = api_endpoint.clone();
+    let exec_timeout_secs = command_exec_timeout_secs(&command);
     let mut operation = tauri::async_runtime::spawn(async move {
         ensure_rustls_crypto_provider(&trace_for_task, &instance_for_task)?;
         info!(
@@ -8806,7 +8889,7 @@ Verifie que '{}' peut demarrer et exposer l'API Kubernetes.",
     });
 
     let outcome = tokio::time::timeout(
-        Duration::from_secs(KUBECTL_EXEC_TIMEOUT_SECONDS),
+        Duration::from_secs(exec_timeout_secs),
         &mut operation,
     )
     .await;
@@ -8896,19 +8979,19 @@ Verifie que '{}' peut demarrer et exposer l'API Kubernetes.",
             let message = format!(
                 "Timeout apres {}s lors de l'execution Kubernetes. \
 Verifie que k3s est demarre dans '{}' et que l'API est joignable depuis Windows.",
-                KUBECTL_EXEC_TIMEOUT_SECONDS, instance
+                exec_timeout_secs, instance
             );
             warn!(
                 target: "wsl",
                 trace_id = %trace_id,
                 instance = %instance,
                 command = %command_line,
-                timeout_seconds = KUBECTL_EXEC_TIMEOUT_SECONDS,
+                timeout_seconds = exec_timeout_secs,
                 "Commande kubectl en timeout via API Kubernetes"
             );
             log_wsl_event(format!(
                 "[{trace_id}] Commande kubectl en timeout pour {}: status=1 timeout={}s",
-                instance_log, KUBECTL_EXEC_TIMEOUT_SECONDS
+                instance_log, exec_timeout_secs
             ));
             Ok(kubectl_error_result(
                 instance,
