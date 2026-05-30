@@ -6176,6 +6176,9 @@ fn upsert_ini_value(lines: &mut Vec<String>, section: &str, key: &str, value: &s
 pub fn ensure_wslconfig_idle_settings() -> Result<bool> {
     let path = wslconfig_path()?;
     let original = fs::read_to_string(&path).unwrap_or_default();
+    // Strip a UTF-8 BOM if present, otherwise the first section header reads as
+    // "\u{feff}[wsl2]", fails the header match, and we append a duplicate section.
+    let original = original.strip_prefix('\u{feff}').unwrap_or(&original);
     let mut lines: Vec<String> = original.lines().map(str::to_string).collect();
 
     let mut changed = false;
@@ -6222,13 +6225,17 @@ fn instance_is_managed_by_homelab(instance: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Ensure a keepalive client is attached to every running, Home Lab-managed WSL
-/// instance. Instances already holding a live keepalive are skipped cheaply.
-fn ensure_keepalive_for_managed_instances() {
+/// For every running, Home Lab-managed WSL instance: keep a session attached so
+/// the VM never idle-stops, and make sure k3s is actually running.
+///
+/// With `vmIdleTimeout=-1` the VM no longer reboots, so the `[boot]` command no
+/// longer re-runs k3s-init.sh: if k3s dies we must relaunch its supervisor
+/// ourselves (the keepalive only holds the VM, it does not start k3s).
+fn ensure_runtime_for_managed_instances() {
     let instances = match collect_wsl_instances() {
         Ok(instances) => instances,
         Err(err) => {
-            warn!(target: "wsl", error = %err, "Superviseur keepalive: listing WSL impossible");
+            warn!(target: "wsl", error = %err, "Superviseur WSL: listing impossible");
             return;
         }
     };
@@ -6237,9 +6244,12 @@ fn ensure_keepalive_for_managed_instances() {
         if !wsl_state_is_running(&instance.state) {
             continue;
         }
+        if !instance_is_managed_by_homelab(&instance.name) {
+            continue;
+        }
 
-        // Skip if a live keepalive is already tracked for this instance.
-        let already_alive = keepalive_children()
+        // 1) Keepalive: re-attach only if no live keepalive is tracked yet.
+        let keepalive_alive = keepalive_children()
             .lock()
             .ok()
             .and_then(|mut guard| {
@@ -6248,28 +6258,58 @@ fn ensure_keepalive_for_managed_instances() {
                     .map(|child| matches!(child.try_wait(), Ok(None)))
             })
             .unwrap_or(false);
-        if already_alive {
-            continue;
+        if !keepalive_alive {
+            if let Err(err) = run_keepalive_launcher(&instance.name) {
+                warn!(
+                    target: "wsl",
+                    instance = %instance.name,
+                    error = %err,
+                    "Superviseur WSL: keepalive impossible"
+                );
+            }
         }
 
-        if !instance_is_managed_by_homelab(&instance.name) {
-            continue;
-        }
-
-        if let Err(err) = run_keepalive_launcher(&instance.name) {
-            warn!(
-                target: "wsl",
-                instance = %instance.name,
-                error = %err,
-                "Superviseur keepalive: lancement impossible"
-            );
+        // 2) k3s runtime: relaunch k3s-init.sh only when the server is down.
+        // run_k3s_runtime_launcher is idempotent (skips if its tracked child is
+        // still alive) and k3s-init.sh clears its own stale lock on start.
+        match instance_has_running_k3s_server(&instance.name) {
+            Ok(true) => {}
+            Ok(false) => {
+                if let Err(err) = run_k3s_runtime_launcher(&instance.name) {
+                    warn!(
+                        target: "wsl",
+                        instance = %instance.name,
+                        error = %err,
+                        "Superviseur WSL: relance k3s-init impossible"
+                    );
+                } else {
+                    info!(
+                        target: "wsl",
+                        instance = %instance.name,
+                        "Superviseur WSL: runtime k3s relancé (serveur absent)"
+                    );
+                    log_wsl_event(format!(
+                        "Superviseur WSL: runtime k3s relancé pour {} (serveur absent)",
+                        escape_for_log(&instance.name)
+                    ));
+                }
+            }
+            Err(err) => {
+                warn!(
+                    target: "wsl",
+                    instance = %instance.name,
+                    error = %err,
+                    "Superviseur WSL: vérification du runtime k3s impossible"
+                );
+            }
         }
     }
 }
 
 /// Background maintenance owned by the tray app (which runs in the user's WSL
 /// context): write the anti-idle `.wslconfig` once, then keep every managed
-/// instance attached so the VM never idle-stops. Safe to call once at startup.
+/// instance alive *and* supervised so the VM never idle-stops and k3s stays up.
+/// Safe to call once at startup.
 pub fn start_wsl_maintenance() {
     std::thread::spawn(|| {
         match ensure_wslconfig_idle_settings() {
@@ -6288,7 +6328,7 @@ pub fn start_wsl_maintenance() {
         }
 
         loop {
-            ensure_keepalive_for_managed_instances();
+            ensure_runtime_for_managed_instances();
             std::thread::sleep(std::time::Duration::from_secs(30));
         }
     });
