@@ -320,6 +320,18 @@ const HOME_LAB_TRAEFIK_TLS_RESTART_MAX_ATTEMPTS: usize = 2;
 const HOME_LAB_WSL_INSTANCE_PREFIX: &str = "home-lab-k3s";
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
+/// Build a `Command` that never flashes a console window on Windows.
+///
+/// Every external process we spawn here (`wsl.exe`, `powershell.exe`, `netsh`)
+/// is a console program; without `CREATE_NO_WINDOW` Windows pops a console for
+/// each one, which is very visible when the maintenance supervisor polls every
+/// 30s. Always construct console commands through this helper.
+fn silent_command<S: AsRef<std::ffi::OsStr>>(program: S) -> Command {
+    let mut cmd = Command::new(program);
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    cmd
+}
+
 #[derive(Clone, Debug)]
 struct WslExecutionPaths {
     resource_root: PathBuf,
@@ -1044,7 +1056,7 @@ async fn resolve_wsl_instance_host_ipv4(instance: &str, trace_id: &str) -> Resul
         "ip -o -4 route show default 2>/dev/null || true; printf '{SPLIT_MARKER}\\n'; ip -o -4 addr show scope global 2>/dev/null || true"
     );
     let output = tauri::async_runtime::spawn_blocking(move || {
-        Command::new("wsl.exe")
+        silent_command("wsl.exe")
             .args(["-d", &instance_owned, "--", "sh", "-lc", &script])
             .output()
     })
@@ -1172,7 +1184,7 @@ $a = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
      Select-Object -First 1 -ExpandProperty IPAddress
 if ($a) { Write-Output $a }
 "#;
-    let out = Command::new("powershell.exe")
+    let out = silent_command("powershell.exe")
         .args(["-NoProfile", "-Command", script])
         .output()
         .ok()?;
@@ -1186,14 +1198,14 @@ if ($a) { Write-Output $a }
 /// not reachable from LAN or WAN — so this is equivalent in security to binding on loopback.
 fn upsert_s3_portproxy_rule(hyperv_ip: &str) -> bool {
     // Delete any existing rule for this port on any address first (idempotent cleanup).
-    let _ = Command::new("netsh")
+    let _ = silent_command("netsh")
         .args([
             "interface", "portproxy", "delete", "v4tov4",
             &format!("listenport={WSL_S3_PORT}"),
             &format!("listenaddress={hyperv_ip}"),
         ])
         .status();
-    let status = Command::new("netsh")
+    let status = silent_command("netsh")
         .args([
             "interface", "portproxy", "add", "v4tov4",
             &format!("listenport={WSL_S3_PORT}"),
@@ -1207,7 +1219,7 @@ fn upsert_s3_portproxy_rule(hyperv_ip: &str) -> bool {
 
 /// Remove the s3 portproxy rule when the Hyper-V IP is no longer valid.
 fn remove_s3_portproxy_rule(hyperv_ip: &str) {
-    let _ = Command::new("netsh")
+    let _ = silent_command("netsh")
         .args([
             "interface", "portproxy", "delete", "v4tov4",
             &format!("listenport={WSL_S3_PORT}"),
@@ -1374,7 +1386,7 @@ async fn start_service_if_needed(service_name: &str) {
     let name = service_name.to_string();
     let name_log = escape_for_log(&name);
     let result = tauri::async_runtime::spawn_blocking(move || {
-        Command::new("powershell.exe")
+        silent_command("powershell.exe")
             .arg("-NoProfile")
             .arg("-Command")
             .arg(format!(
@@ -2042,7 +2054,7 @@ fn read_instance_kubectl_config_view_once(instance: &str) -> Result<KubectlConfi
         ],
     );
 
-    let output = Command::new("wsl.exe")
+    let output = silent_command("wsl.exe")
         .args([
             "-d",
             instance,
@@ -2109,7 +2121,7 @@ fn run_wsl_shell_script_via_stdin(
     description: &str,
 ) -> Result<(String, String)> {
     let command_line = format_cli_command("wsl.exe", &["-d", instance, "--", "sh", "-s"]);
-    let mut child = Command::new("wsl.exe")
+    let mut child = silent_command("wsl.exe")
         .creation_flags(CREATE_NO_WINDOW)
         .args(["-d", instance, "--", "sh", "-s"])
         .stdin(Stdio::piped())
@@ -2238,7 +2250,7 @@ if ($gpus.Count -eq 0) {
 }
 "#;
 
-    let output = Command::new("powershell.exe")
+    let output = silent_command("powershell.exe")
         .arg("-NoProfile")
         .arg("-Command")
         .arg(detection_script)
@@ -2363,7 +2375,7 @@ fn bootstrap_k3s_for_instance_if_available(instance: &str) -> Result<()> {
     );
     let command_line = format_cli_command("wsl.exe", &["-d", instance, "--", "sh", "-lc", &script]);
 
-    let output = Command::new("wsl.exe")
+    let output = silent_command("wsl.exe")
         .args(["-d", instance, "--", "sh", "-lc", &script])
         .output()
         .with_context(|| format!("Impossible d'executer k3s-init.sh pour {}", instance))?;
@@ -2412,7 +2424,7 @@ fn instance_has_running_k3s_server(instance: &str) -> Result<bool> {
     let script = "set -eu; if pgrep -f '^/usr/local/bin/k3s server( |$)' >/dev/null 2>&1; then printf '%s\\n' yes; fi";
     let command_line = format_cli_command("wsl.exe", &["-d", instance, "--", "sh", "-lc", script]);
 
-    let output = Command::new("wsl.exe")
+    let output = silent_command("wsl.exe")
         .args(["-d", instance, "--", "sh", "-lc", script])
         .output()
         .with_context(|| format!("Impossible de verifier le runtime k3s pour {}", instance))?;
@@ -2448,7 +2460,7 @@ async fn enforce_instance_api_port_range(instance: &str, _api_port: u16) -> Resu
     let command_line = format_cli_command("wsl.exe", &["-d", instance, "--", "sh", "-c", &script]);
 
     let output = tauri::async_runtime::spawn_blocking(move || {
-        Command::new("wsl.exe")
+        silent_command("wsl.exe")
             .args(["-d", &instance_owned, "--", "sh", "-c", &script])
             .output()
     })
@@ -3281,7 +3293,7 @@ fn run_wsl_setup_with_paths(
         nodeport_range_end
     ));
 
-    let mut command = Command::new("powershell.exe");
+    let mut command = silent_command("powershell.exe");
     command
         .arg("-NoProfile")
         .arg("-ExecutionPolicy")
@@ -3490,7 +3502,7 @@ fn collect_wsl_instances() -> Result<Vec<WslInstance>> {
     let command_line = format_cli_command("wsl.exe", &args);
 
     log_wsl_event(format!("Execution commande WSL (list): {command_line}"));
-    let output = Command::new("wsl.exe")
+    let output = silent_command("wsl.exe")
         .args(args)
         .output()
         .context("Impossible d'executer wsl.exe --list --verbose --all")?;
@@ -3600,7 +3612,7 @@ fn run_wsl_unregister(name: &str) -> Result<WslOperationResult> {
         instance_debug, command_line
     ));
 
-    let output = Command::new("wsl.exe")
+    let output = silent_command("wsl.exe")
         .args(["--unregister", name])
         .output()
         .with_context(|| format!("Impossible de supprimer l'instance WSL {name}"))?;
@@ -6013,7 +6025,7 @@ fn run_keepalive_launcher(instance: &str) -> Result<()> {
     }
 
     // Keep one Windows-side wsl.exe client attached so the distro does not idle-stop.
-    let child = Command::new("wsl.exe")
+    let child = silent_command("wsl.exe")
         .args([
             "-d",
             instance_trimmed,
@@ -6057,7 +6069,7 @@ fn run_k3s_runtime_launcher(instance: &str) -> Result<()> {
         }
     }
 
-    let child = Command::new("wsl.exe")
+    let child = silent_command("wsl.exe")
         .args([
             "-d",
             instance_trimmed,
@@ -6207,7 +6219,7 @@ fn instance_is_managed_by_homelab(instance: &str) -> bool {
     if is_home_lab_wsl_instance(instance) {
         return true;
     }
-    Command::new("wsl.exe")
+    silent_command("wsl.exe")
         .args([
             "-d",
             instance,
@@ -6384,7 +6396,7 @@ async fn ensure_wsl_instance_running(instance: &str, trace_id: &str) -> Result<(
 
     let instance_owned = instance.to_string();
     let output = tauri::async_runtime::spawn_blocking(move || {
-        Command::new("wsl.exe")
+        silent_command("wsl.exe")
             .args(["-d", &instance_owned, "--", "sh", "-lc", "true"])
             .output()
     })
@@ -6569,7 +6581,7 @@ printf 'launch-k3s-init port=%s repair=%s\n' '{api_port}' '{repair_flag}'
     );
     let command_line = format_cli_command("wsl.exe", &["-d", instance, "--", "sh", "-lc", &script]);
     let output = tauri::async_runtime::spawn_blocking(move || {
-        Command::new("wsl.exe")
+        silent_command("wsl.exe")
             .args(["-d", &instance_owned, "--", "sh", "-lc", &script])
             .output()
     })
@@ -6650,7 +6662,7 @@ done
 ps -ef | grep -E 'k3s-init|/usr/local/bin/k3s server|containerd' | grep -v grep | tail -n 3 || true
 "#;
     let output = tauri::async_runtime::spawn_blocking(move || {
-        Command::new("wsl.exe")
+        silent_command("wsl.exe")
             .args(["-d", &instance_owned, "--", "sh", "-lc", script])
             .output()
     })
@@ -6695,7 +6707,7 @@ async fn resolve_kube_api_port_for_instance(instance: &str, trace_id: &str) -> u
         let instance_owned = instance.to_string();
         let script = "set -eu; if [ -f /etc/k3s-env ]; then line=$(grep '^K3S_API_PORT=' /etc/k3s-env | head -n1 || true); if [ -n \"$line\" ]; then port=${line#K3S_API_PORT=}; printf '%s\\n' \"$port\"; exit 0; fi; line=$(grep '^PORT_RANGE=' /etc/k3s-env | head -n1 || true); if [ -n \"$line\" ]; then range=${line#PORT_RANGE=}; port=${range%%-*}; printf '%s\\n' \"$port\"; exit 0; fi; fi; if [ -f /etc/rancher/k3s/k3s.yaml ]; then line=$(grep -E '^[[:space:]]*server:[[:space:]]*https?://' /etc/rancher/k3s/k3s.yaml | head -n1 || true); if [ -n \"$line\" ]; then port=$(printf '%s\\n' \"$line\" | sed -n 's#.*://[^:]*:\\([0-9][0-9]*\\).*#\\1#p' | head -n1); if [ -n \"$port\" ]; then printf '%s\\n' \"$port\"; exit 0; fi; fi; fi; exit 0";
         let detected = tauri::async_runtime::spawn_blocking(move || {
-            Command::new("wsl.exe")
+            silent_command("wsl.exe")
                 .args(["-d", &instance_owned, "--", "sh", "-lc", script])
                 .output()
         })
@@ -9418,7 +9430,7 @@ async fn download_and_install_k3s_with_paths(
         command_line
     ));
 
-    let output = Command::new("wsl.exe")
+    let output = silent_command("wsl.exe")
         .args(["-d", instance_name, "chmod", "+x", "/usr/local/bin/k3s"])
         .output()
         .context("Impossible de rendre K3S executable dans WSL")?;

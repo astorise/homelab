@@ -142,7 +142,10 @@ fn ensure_service_running(service_name: &'static str) {
             let cmd = format!(
                 "Try {{ $svc = Get-Service -Name '{escaped}' -ErrorAction Stop; if ($svc.Status -ne 'Running') {{ Start-Service -Name '{escaped}' -ErrorAction Stop; Write-Output 'started' }} else {{ Write-Output 'already-running' }} }} Catch {{ Write-Output ('error: ' + $_.Exception.Message) }}"
             );
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
             std::process::Command::new("powershell.exe")
+                .creation_flags(CREATE_NO_WINDOW)
                 .arg("-NoProfile")
                 .arg("-Command")
                 .arg(cmd)
