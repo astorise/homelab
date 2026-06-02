@@ -2215,16 +2215,50 @@ fn render_k3s_env_file_for_instance(instance: &str) -> Result<String> {
 }
 
 fn render_k3s_env_rewrite_script(env_file: &str) -> String {
+    // Reconciliation rewrites /etc/k3s-env from the deterministic plan, but must NOT
+    // clobber operator/provisioning topology choices. Preserve ENABLE_NVIDIA_TOOLKIT
+    // (as before) and the multi-node topology vars (NODE_COUNT + bridge layout) the
+    // same way, so an existing multi-node cluster is not silently reset to single-node.
     format!(
         r#"PRESERVE_ENABLE_NVIDIA_TOOLKIT=0
+PRESERVE_NODE_COUNT=
+PRESERVE_CLUSTER_BRIDGE=
+PRESERVE_CLUSTER_BRIDGE_CIDR=
+PRESERVE_CLUSTER_BRIDGE_GW=
+PRESERVE_NODE_IP_BASE=
+PRESERVE_NODE_NAME_PREFIX=
 if [ -f /etc/k3s-env ]; then
     . /etc/k3s-env || true
     PRESERVE_ENABLE_NVIDIA_TOOLKIT=${{ENABLE_NVIDIA_TOOLKIT:-0}}
+    PRESERVE_NODE_COUNT=${{NODE_COUNT:-}}
+    PRESERVE_CLUSTER_BRIDGE=${{CLUSTER_BRIDGE:-}}
+    PRESERVE_CLUSTER_BRIDGE_CIDR=${{CLUSTER_BRIDGE_CIDR:-}}
+    PRESERVE_CLUSTER_BRIDGE_GW=${{CLUSTER_BRIDGE_GW:-}}
+    PRESERVE_NODE_IP_BASE=${{NODE_IP_BASE:-}}
+    PRESERVE_NODE_NAME_PREFIX=${{NODE_NAME_PREFIX:-}}
 fi
 cat > /etc/k3s-env <<'EOF'
 {env_file}EOF
 if [ "$PRESERVE_ENABLE_NVIDIA_TOOLKIT" = "1" ]; then
     printf '%s\n' 'ENABLE_NVIDIA_TOOLKIT=1' >> /etc/k3s-env
+fi
+if [ -n "$PRESERVE_NODE_COUNT" ]; then
+    printf 'NODE_COUNT=%s\n' "$PRESERVE_NODE_COUNT" >> /etc/k3s-env
+fi
+if [ -n "$PRESERVE_CLUSTER_BRIDGE" ]; then
+    printf 'CLUSTER_BRIDGE=%s\n' "$PRESERVE_CLUSTER_BRIDGE" >> /etc/k3s-env
+fi
+if [ -n "$PRESERVE_CLUSTER_BRIDGE_CIDR" ]; then
+    printf 'CLUSTER_BRIDGE_CIDR=%s\n' "$PRESERVE_CLUSTER_BRIDGE_CIDR" >> /etc/k3s-env
+fi
+if [ -n "$PRESERVE_CLUSTER_BRIDGE_GW" ]; then
+    printf 'CLUSTER_BRIDGE_GW=%s\n' "$PRESERVE_CLUSTER_BRIDGE_GW" >> /etc/k3s-env
+fi
+if [ -n "$PRESERVE_NODE_IP_BASE" ]; then
+    printf 'NODE_IP_BASE=%s\n' "$PRESERVE_NODE_IP_BASE" >> /etc/k3s-env
+fi
+if [ -n "$PRESERVE_NODE_NAME_PREFIX" ]; then
+    printf 'NODE_NAME_PREFIX=%s\n' "$PRESERVE_NODE_NAME_PREFIX" >> /etc/k3s-env
 fi
 "#
     )
@@ -2878,9 +2912,12 @@ async fn wsl_import_instance_with_paths(
     force: Option<bool>,
     name: Option<String>,
     enable_nvidia: Option<bool>,
+    node_count: Option<u32>,
 ) -> Result<ProvisionResult, String> {
     let force_import = force.unwrap_or(false);
     let enable_nvidia = enable_nvidia.unwrap_or(false);
+    // Multi-node is experimental and capped to keep a single WSL VM healthy.
+    let node_count = node_count.unwrap_or(1).clamp(1, 5);
     let provided_name = name.unwrap_or_else(|| "home-lab-k3s".to_string());
     let sanitized_name = sanitize_wsl_instance_name(&provided_name).map_err(|e| {
         error!(target: "wsl", error = %e, "Nom d'instance WSL invalide");
@@ -2891,20 +2928,21 @@ async fn wsl_import_instance_with_paths(
     let instance_name = sanitized_name.clone();
 
     log_wsl_event(format!(
-        "Demande d'import WSL (force={}, instance={}, enable_nvidia={})",
-        force_import, sanitized_debug, enable_nvidia
+        "Demande d'import WSL (force={}, instance={}, enable_nvidia={}, node_count={})",
+        force_import, sanitized_debug, enable_nvidia, node_count
     ));
     info!(
         target: "wsl",
         force = force_import,
         enable_nvidia,
+        node_count,
         instance = %sanitized_name,
         instance_debug = %sanitized_debug,
         "Demande d'import WSL recue"
     );
 
     let setup_result = tauri::async_runtime::spawn_blocking(move || {
-        run_wsl_setup_with_paths(&setup_paths, force_import, &instance_name, enable_nvidia)
+        run_wsl_setup_with_paths(&setup_paths, force_import, &instance_name, enable_nvidia, node_count)
     })
     .await
     .map_err(|e| {
@@ -3220,24 +3258,26 @@ pub async fn wsl_import_instance(
     force: Option<bool>,
     name: Option<String>,
     enable_nvidia: Option<bool>,
+    node_count: Option<u32>,
 ) -> Result<ProvisionResult, String> {
     let paths = wsl_execution_paths_from_app(&app).map_err(|e| {
         error!(target: "wsl", error = %e, "Impossible de determiner les chemins WSL");
         e.to_string()
     })?;
-    wsl_import_instance_with_paths(paths, force, name, enable_nvidia).await
+    wsl_import_instance_with_paths(paths, force, name, enable_nvidia, node_count).await
 }
 
 pub async fn wsl_import_instance_headless(
     force: Option<bool>,
     name: Option<String>,
     enable_nvidia: Option<bool>,
+    node_count: Option<u32>,
 ) -> Result<ProvisionResult, String> {
     let paths = wsl_execution_paths_headless().map_err(|e| {
         error!(target: "wsl", error = %e, "Impossible de determiner les chemins WSL headless");
         e.to_string()
     })?;
-    wsl_import_instance_with_paths(paths, force, name, enable_nvidia).await
+    wsl_import_instance_with_paths(paths, force, name, enable_nvidia, node_count).await
 }
 
 fn run_wsl_setup_with_paths(
@@ -3245,6 +3285,7 @@ fn run_wsl_setup_with_paths(
     force_import: bool,
     instance_name: &str,
     enable_nvidia: bool,
+    node_count: u32,
 ) -> Result<ProvisionResult> {
     let script_path = paths.resource_root.join("setup-wsl.ps1");
     if !script_path.exists() {
@@ -3315,6 +3356,11 @@ fn run_wsl_setup_with_paths(
     if enable_nvidia {
         command.arg("-EnableNvidia");
     }
+    // Only pass -NodeCount for the experimental multi-node case so the single-node
+    // command line stays byte-identical to the legacy behavior.
+    if node_count > 1 {
+        command.arg("-NodeCount").arg(node_count.to_string());
+    }
 
     let mut command_preview = format!(
         "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"{}\" -InstallDir \"{}\" -Rootfs \"{}\" -DistroName \"{}\" -ApiPort {}",
@@ -3329,6 +3375,9 @@ fn run_wsl_setup_with_paths(
     }
     if enable_nvidia {
         command_preview.push_str(" -EnableNvidia");
+    }
+    if node_count > 1 {
+        command_preview.push_str(&format!(" -NodeCount {node_count}"));
     }
 
     info!(
