@@ -12,7 +12,8 @@ use aws_sdk_s3::{
     types::{Delete, ObjectIdentifier},
     Client,
 };
-use log::{debug, error, info, warn};
+use flexi_logger::{Age, Cleanup, Criterion, Duplicate, FileSpec, Logger, Naming};
+use log::{debug, error, info, warn, LevelFilter};
 use pin_project::pin_project;
 use serde::{Deserialize, Serialize};
 use std::ffi::{c_void, OsString};
@@ -26,7 +27,7 @@ use std::sync::{
 };
 use std::task::{Context as TaskContext, Poll};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::fs;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
@@ -248,6 +249,90 @@ fn default_level_str() -> &'static str {
     } else {
         "info"
     }
+}
+
+fn build_label() -> String {
+    let raw = if BUILD_GIT_TAG.trim().is_empty() || BUILD_GIT_TAG == "unknown" {
+        BUILD_GIT_SHA
+    } else {
+        BUILD_GIT_TAG
+    };
+    let sanitized: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if sanitized.trim_matches('_').is_empty() {
+        "unknown".to_string()
+    } else {
+        sanitized
+    }
+}
+
+fn build_log_basename(prefix: &str) -> String {
+    format!("{prefix}_{}", build_label())
+}
+
+fn level_from_cfg(cfg: &ServiceConfig) -> LevelFilter {
+    match cfg
+        .log_level
+        .as_deref()
+        .unwrap_or(default_level_str())
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "trace" => LevelFilter::Trace,
+        "debug" => LevelFilter::Debug,
+        "warn" => LevelFilter::Warn,
+        "error" => LevelFilter::Error,
+        "off" => LevelFilter::Off,
+        _ => LevelFilter::Info,
+    }
+}
+
+fn log_level_filter(level: LevelFilter) -> &'static str {
+    match level {
+        LevelFilter::Off => "off",
+        LevelFilter::Error => "error",
+        LevelFilter::Warn => "warn",
+        LevelFilter::Info => "info",
+        LevelFilter::Debug => "debug",
+        LevelFilter::Trace => "trace",
+    }
+}
+
+fn init_logger(level: LevelFilter) -> Result<()> {
+    let dir = logs_dir();
+    std_fs::create_dir_all(&dir).map_err(|e| {
+        eprintln!("cannot create log directory {}: {e}", dir.display());
+        e
+    })?;
+    let logger = Logger::try_with_env_or_str(log_level_filter(level))?
+        .log_to_file(
+            FileSpec::default()
+                .directory(&dir)
+                .basename(build_log_basename("home-s3"))
+                .suffix("log"),
+        )
+        .duplicate_to_stderr(if cfg!(debug_assertions) {
+            Duplicate::Debug
+        } else {
+            Duplicate::Error
+        })
+        .rotate(
+            Criterion::AgeOrSize(Age::Day, 5_000_000),
+            Naming::Timestamps,
+            Cleanup::KeepLogFiles(14),
+        );
+    if let Err(err) = logger.start() {
+        eprintln!("failed to start logger (continuing): {err}");
+    }
+    Ok(())
 }
 
 fn is_endpoint_unreachable(message: &str) -> bool {
@@ -663,6 +748,115 @@ async fn create_bucket_and_import(
         0
     };
     Ok((!existed, imported))
+}
+
+async fn validate_s3_roundtrip(cfg: &ServiceConfig) -> Result<String> {
+    let client = make_s3_client(cfg).await?;
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let bucket = format!("home-s3-validate-{}-{suffix}", std::process::id());
+    let key = "diagnostic/write-read-delete.txt";
+    let payload = format!(
+        "home-s3 validation\nendpoint={}\nbucket={bucket}\nkey={key}\n",
+        cfg.endpoint
+    )
+    .into_bytes();
+
+    info!(
+        "validating home-s3 roundtrip endpoint={} bucket={} key={}",
+        cfg.endpoint, bucket, key
+    );
+    debug!(
+        "validation config: region={} access_key_id={} force_path_style={} data_dir={}",
+        cfg.region, cfg.access_key_id, cfg.force_path_style, cfg.data_dir
+    );
+
+    client
+        .list_buckets()
+        .send()
+        .await
+        .with_context(|| format!("list buckets via {}", cfg.endpoint))?;
+    debug!("validation step list_buckets succeeded");
+
+    let mut bucket_created = false;
+    let validation = async {
+        client
+            .create_bucket()
+            .bucket(&bucket)
+            .send()
+            .await
+            .with_context(|| format!("create validation bucket {bucket}"))?;
+        bucket_created = true;
+        debug!("validation step create_bucket succeeded");
+
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from(payload.clone()))
+            .send()
+            .await
+            .with_context(|| format!("put validation object s3://{bucket}/{key}"))?;
+        debug!("validation step put_object succeeded");
+
+        let object = client
+            .get_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .with_context(|| format!("get validation object s3://{bucket}/{key}"))?;
+        let downloaded = object
+            .body
+            .collect()
+            .await
+            .with_context(|| format!("read validation object body s3://{bucket}/{key}"))?
+            .into_bytes()
+            .to_vec();
+        if downloaded != payload {
+            bail!(
+                "validation object content mismatch: wrote {} byte(s), read {} byte(s)",
+                payload.len(),
+                downloaded.len()
+            );
+        }
+        debug!("validation step get_object/content check succeeded");
+
+        client
+            .delete_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .with_context(|| format!("delete validation object s3://{bucket}/{key}"))?;
+        debug!("validation step delete_object succeeded");
+
+        client
+            .delete_bucket()
+            .bucket(&bucket)
+            .send()
+            .await
+            .with_context(|| format!("delete validation bucket {bucket}"))?;
+        bucket_created = false;
+        debug!("validation step delete_bucket succeeded");
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+
+    if bucket_created {
+        warn!("validation cleanup needed for bucket {bucket}");
+        if let Err(err) = delete_bucket(&client, &bucket, true).await {
+            warn!("validation cleanup failed for bucket {bucket}: {err:#}");
+        }
+    }
+
+    validation?;
+    Ok(format!(
+        "home-s3 validation succeeded against {} using bucket {bucket}",
+        cfg.endpoint
+    ))
 }
 
 #[derive(Debug, Default)]
@@ -1158,6 +1352,7 @@ fn run_service() -> Result<()> {
 
     set_status(ServiceState::StartPending);
     let cfg = load_config_or_init()?;
+    init_logger(level_from_cfg(&cfg))?;
     info!(
         "home-s3 service starting build_tag={} sha={} at {}",
         BUILD_GIT_TAG, BUILD_GIT_SHA, BUILD_TIME
@@ -1266,7 +1461,7 @@ fn uninstall_service() -> Result<()> {
 }
 
 fn usage() {
-    eprintln!("Usage: home-s3 [run|install|uninstall|console]");
+    eprintln!("Usage: home-s3 [run|install|uninstall|console|validate]");
 }
 
 fn main() -> Result<()> {
@@ -1306,6 +1501,7 @@ fn main() -> Result<()> {
         }
         "console" => {
             let cfg = load_config_or_init()?;
+            init_logger(level_from_cfg(&cfg))?;
             let shared = SharedState {
                 cfg: Arc::new(Mutex::new(cfg)),
                 embedded: Arc::new(Mutex::new(EmbeddedRustfsRuntime::default())),
@@ -1323,6 +1519,15 @@ fn main() -> Result<()> {
                 shared.stopping.store(true, Ordering::SeqCst);
                 stop_embedded_rustfs(&shared).await
             })?;
+            Ok(())
+        }
+        "validate" => {
+            let cfg = load_config_or_init()?;
+            init_logger(level_from_cfg(&cfg))?;
+            let rt = Runtime::new()?;
+            let message = rt.block_on(validate_s3_roundtrip(&cfg))?;
+            println!("{message}");
+            println!("Logs: {}", logs_dir().display());
             Ok(())
         }
         _ => {
