@@ -335,6 +335,18 @@ fn init_logger(level: LevelFilter) -> Result<()> {
     Ok(())
 }
 
+fn configure_rustfs_logging(cfg: &ServiceConfig) {
+    let level = log_level_filter(level_from_cfg(cfg));
+    std::env::set_var("RUSTFS_OBS_LOG_DIRECTORY", logs_dir());
+    std::env::set_var("RUSTFS_OBS_LOGGER_LEVEL", level);
+    std::env::set_var("RUSTFS_OBS_LOG_FILENAME", "rustfs.log");
+    std::env::set_var("RUSTFS_OBS_SERVICE_NAME", "home-s3-rustfs");
+    std::env::set_var("RUSTFS_OBS_LOG_KEEP_FILES", "14");
+    if cfg!(debug_assertions) {
+        std::env::set_var("RUSTFS_OBS_LOG_STDOUT_ENABLED", "true");
+    }
+}
+
 fn is_endpoint_unreachable(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
     lower.contains("dispatch failure")
@@ -538,6 +550,7 @@ async fn start_embedded_rustfs(shared: &SharedState) -> Result<()> {
     let data_dir = PathBuf::from(&cfg.data_dir);
     ensure_data_dir(&data_dir)?;
     let address = rustfs_address_from_endpoint(&cfg.endpoint)?;
+    configure_rustfs_logging(&cfg);
 
     // RustFS initializes the process-global tracing/log subscriber during build.
     let server = rustfs::embedded::RustFSServerBuilder::new()
@@ -1352,7 +1365,6 @@ fn run_service() -> Result<()> {
 
     set_status(ServiceState::StartPending);
     let cfg = load_config_or_init()?;
-    init_logger(level_from_cfg(&cfg))?;
     info!(
         "home-s3 service starting build_tag={} sha={} at {}",
         BUILD_GIT_TAG, BUILD_GIT_SHA, BUILD_TIME
@@ -1501,7 +1513,6 @@ fn main() -> Result<()> {
         }
         "console" => {
             let cfg = load_config_or_init()?;
-            init_logger(level_from_cfg(&cfg))?;
             let shared = SharedState {
                 cfg: Arc::new(Mutex::new(cfg)),
                 embedded: Arc::new(Mutex::new(EmbeddedRustfsRuntime::default())),
