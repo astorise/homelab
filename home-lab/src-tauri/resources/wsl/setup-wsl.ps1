@@ -5,6 +5,7 @@ param(
     [string]$Rootfs     = '',
     [int]$ApiPort       = 0,
     [int]$NodePortSpan  = 57,
+    [int]$NodeCount     = 1,
     [switch]$ForceImport,
     [switch]$EnableNvidia
 )
@@ -437,6 +438,7 @@ function Configure-K3sEnv {
         [int]$NodePortSpan,
         [int]$StreamPort,
         [psobject]$LocalPorts,
+        [int]$NodeCount = 1,
         [switch]$EnableNvidia
     )
 
@@ -445,6 +447,12 @@ function Configure-K3sEnv {
     }
     if ($NodePortSpan -lt 0) {
         throw "NodePortSpan invalide ($NodePortSpan). Valeur attendue >= 0."
+    }
+    # Multi-node (experimental) is opt-in and capped to keep one WSL VM sane.
+    if ($NodeCount -lt 1) { $NodeCount = 1 }
+    if ($NodeCount -gt 5) {
+        Write-Info "NodeCount $NodeCount au-dela du plafond experimental; ramene a 5."
+        $NodeCount = 5
     }
 
     $nodePortRange = Get-K3sNodePortRangeForInstance -Name $Distro -NodePortSpan $NodePortSpan
@@ -468,6 +476,12 @@ K3S_INGRESS_HTTP_PORT=$($ingressPorts.HttpPort)
 K3S_INGRESS_HTTPS_PORT=$($ingressPorts.HttpsPort)
 K3S_GIT_SSH_PORT=$sshPort
 K3S_TLS_SANS=$tlsSans
+NODE_COUNT=$NodeCount
+CLUSTER_BRIDGE=k3s-br0
+CLUSTER_BRIDGE_CIDR=10.50.0.0/24
+CLUSTER_BRIDGE_GW=10.50.0.1
+NODE_IP_BASE=10.50.0.10
+NODE_NAME_PREFIX=$Distro
 "@.Replace("`r`n", "`n").Replace("`r", "`n")
 
     if ($EnableNvidia.IsPresent) {
@@ -759,7 +773,7 @@ try {
     }
 
     Install-K3sInitScript -Distro $DistroName
-    Configure-K3sEnv -Distro $DistroName -ApiPort $ApiPort -NodePortSpan $NodePortSpan -StreamPort $streamPort -LocalPorts $localPorts -EnableNvidia:$EnableNvidia
+    Configure-K3sEnv -Distro $DistroName -ApiPort $ApiPort -NodePortSpan $NodePortSpan -StreamPort $streamPort -LocalPorts $localPorts -NodeCount $NodeCount -EnableNvidia:$EnableNvidia
     Configure-K3sAutostart -Distro $DistroName
     Clear-K3sLocks -Distro $DistroName
     Invoke-K3sBootstrap -Distro $DistroName

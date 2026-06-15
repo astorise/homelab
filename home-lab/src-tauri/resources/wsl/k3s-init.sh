@@ -50,6 +50,22 @@ ENABLE_NVIDIA_TOOLKIT=${ENABLE_NVIDIA_TOOLKIT:-0}
 # home-s3 on Windows binds on the Hyper-V interface IP, not 0.0.0.0, keeping LAN/WAN unexposed.
 WSL_S3_LOOPBACK_IP=${WSL_S3_LOOPBACK_IP:-10.255.255.254}
 WSL_S3_PORT=${WSL_S3_PORT:-9000}
+# Multi-node (EXPERIMENTAL). NODE_COUNT=1 keeps the legacy single-node path verbatim.
+# When NODE_COUNT>1: node 0 is the k3s server running in the host network namespace
+# (so the API stays reachable on host loopback exactly like single-node); nodes 1..N-1
+# are k3s agents, each in its own network namespace attached to a private bridge.
+# Agents join the server over the bridge at https://<bridge-gw>:API_PORT.
+NODE_COUNT=${NODE_COUNT:-1}
+CLUSTER_BRIDGE=${CLUSTER_BRIDGE:-k3s-br0}
+CLUSTER_BRIDGE_CIDR=${CLUSTER_BRIDGE_CIDR:-10.50.0.0/24}
+CLUSTER_BRIDGE_GW=${CLUSTER_BRIDGE_GW:-10.50.0.1}
+NODE_IP_BASE=${NODE_IP_BASE:-10.50.0.10}
+NODE_NAME_PREFIX=${NODE_NAME_PREFIX:-$(hostname 2>/dev/null || echo node)}
+CLUSTER_BRIDGE_PLEN=$(printf '%s' "$CLUSTER_BRIDGE_CIDR" | cut -d/ -f2)
+[ -n "$CLUSTER_BRIDGE_PLEN" ] || CLUSTER_BRIDGE_PLEN=24
+NODE_IP_PREFIX=$(printf '%s' "$NODE_IP_BASE" | cut -d. -f1-3)
+NODE_IP_BASE_OCTET=$(printf '%s' "$NODE_IP_BASE" | cut -d. -f4)
+NODE_TOKEN=
 K3S_RUNTIME_BIN_DIR=${K3S_RUNTIME_BIN_DIR:-/var/lib/rancher/k3s/data/current/bin}
 K3S_RUNTIME_AUX_BIN_DIR=${K3S_RUNTIME_AUX_BIN_DIR:-$K3S_RUNTIME_BIN_DIR/aux}
 CONTAINERD_STREAM_PATCH_PID=
@@ -123,6 +139,16 @@ acquire_lock_or_exit() {
 
 ensure_server_config() {
     mkdir -p /etc/rancher/k3s
+    # Agents join the server at https://<bridge-gw>:API_PORT, so the server cert must
+    # be valid for the bridge gateway IP in multi-node mode.
+    effective_tls_sans="$K3S_TLS_SANS"
+    if [ "$NODE_COUNT" -gt 1 ]; then
+        if [ -n "$effective_tls_sans" ]; then
+            effective_tls_sans="$effective_tls_sans,$CLUSTER_BRIDGE_GW"
+        else
+            effective_tls_sans="$CLUSTER_BRIDGE_GW"
+        fi
+    fi
     desired_config=$(mktemp)
     {
     cat <<EOF
@@ -130,11 +156,11 @@ write-kubeconfig-mode: "0644"
 https-listen-port: $API_PORT
 service-node-port-range: $PORT_RANGE
 EOF
-    if [ -n "$K3S_TLS_SANS" ]; then
+    if [ -n "$effective_tls_sans" ]; then
         printf '%s\n' "tls-san:"
         old_ifs=$IFS
         IFS=','
-        set -- $K3S_TLS_SANS
+        set -- $effective_tls_sans
         IFS=$old_ifs
         for san in "$@"; do
             san_trimmed=$(printf '%s' "$san" | tr -d '[:space:]')
@@ -220,7 +246,7 @@ while true; do
         sleep 1
         continue
     fi
-    KUBECONFIG=/etc/rancher/k3s/k3s.yaml /usr/local/bin/k3s kubectl -n kube-system port-forward --address 127.0.0.1 service/traefik $listen_port:$service_port &
+    KUBECONFIG=/etc/rancher/k3s/k3s.yaml /usr/local/bin/k3s kubectl -n kube-system port-forward --address 0.0.0.0 service/traefik $listen_port:$service_port &
     child_pid=\$!
     wait "\$child_pid" || true
     child_pid=
@@ -242,12 +268,20 @@ start_traefik_loopback_listener() {
     wrapper=$(write_traefik_loopback_forwarder "$listen_port" "$service_port")
     log_file="/var/log/traefik-loopback-$listen_port.log"
     cmd="sh $wrapper"
+    old_forward="kubectl -n kube-system port-forward --address 127.0.0.1 service/traefik $listen_port:$service_port"
+    new_forward="kubectl -n kube-system port-forward --address 0.0.0.0 service/traefik $listen_port:$service_port"
+
+    if pgrep -f "$old_forward" >/dev/null 2>&1; then
+        pkill -f "$old_forward" 2>/dev/null || true
+        pkill -f "$cmd" 2>/dev/null || true
+    fi
 
     if pgrep -f "$cmd" >/dev/null 2>&1; then
         return 0
     fi
 
-    pkill -f "kubectl -n kube-system port-forward --address 127.0.0.1 service/traefik $listen_port:$service_port" 2>/dev/null || true
+    pkill -f "$old_forward" 2>/dev/null || true
+    pkill -f "$new_forward" 2>/dev/null || true
     pkill -f "nc -lk .* -p $listen_port " 2>/dev/null || true
     pkill -f "$cmd" 2>/dev/null || true
     nohup sh -c "exec $cmd" >> "$log_file" 2>&1 &
@@ -492,6 +526,15 @@ run_k3s_server() {
         set -- "$@" --kube-scheduler-arg "secure-port=$K3S_KUBE_SCHEDULER_SECURE_PORT"
     fi
 
+    # Multi-node: the server advertises the bridge gateway IP and binds flannel to the
+    # private bridge so host-gw routes reach the agent namespaces over the shared L2.
+    if [ "$NODE_COUNT" -gt 1 ]; then
+        set -- "$@" --flannel-backend=host-gw \
+            --flannel-iface="$CLUSTER_BRIDGE" \
+            --node-ip="$CLUSTER_BRIDGE_GW" \
+            --node-name="${NODE_NAME_PREFIX}-0"
+    fi
+
     if [ "$ENABLE_TRAEFIK" = "1" ]; then
         log_info "Starting k3s with packaged Traefik (v3 on recent K3s)."
     else
@@ -540,12 +583,166 @@ run_k3s_server_supervised() {
     done
 }
 
+teardown_node_namespaces() {
+    for ns in $(ip netns list 2>/dev/null | awk '{print $1}' | grep '^k3s-node-' || true); do
+        ip netns del "$ns" 2>/dev/null || true
+    done
+    for link in $(ip -o link show 2>/dev/null | sed 's/^[0-9]*: //' | cut -d'@' -f1 | grep -E '^v[0-9]+h$' || true); do
+        ip link del "$link" 2>/dev/null || true
+    done
+}
+
+ensure_cluster_bridge() {
+    if ! ip link show "$CLUSTER_BRIDGE" >/dev/null 2>&1; then
+        ip link add name "$CLUSTER_BRIDGE" type bridge
+    fi
+    if ! ip -4 addr show dev "$CLUSTER_BRIDGE" 2>/dev/null | grep -q "inet ${CLUSTER_BRIDGE_GW}/"; then
+        ip addr flush dev "$CLUSTER_BRIDGE" 2>/dev/null || true
+        ip addr add "${CLUSTER_BRIDGE_GW}/${CLUSTER_BRIDGE_PLEN}" dev "$CLUSTER_BRIDGE"
+    fi
+    ip link set "$CLUSTER_BRIDGE" up
+    log_info "Cluster bridge $CLUSTER_BRIDGE up at ${CLUSTER_BRIDGE_GW}/${CLUSTER_BRIDGE_PLEN}"
+}
+
+ensure_host_netns_forwarding() {
+    echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null || sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
+    IPT=$(find_iptables) || { log_info "Forwarding: iptables not found, skipping NAT/forward rules"; return 0; }
+    out_if=$(ip -4 route show default 2>/dev/null | awk '{print $5}' | head -1)
+    if [ -z "$out_if" ]; then
+        log_info "Forwarding: no default interface, skipping MASQUERADE"
+    else
+        for src in "$CLUSTER_BRIDGE_CIDR" "10.42.0.0/16"; do
+            "$IPT" -t nat -D POSTROUTING -s "$src" -o "$out_if" -j MASQUERADE 2>/dev/null || true
+            "$IPT" -t nat -A POSTROUTING -s "$src" -o "$out_if" -j MASQUERADE
+        done
+    fi
+    "$IPT" -D FORWARD -i "$CLUSTER_BRIDGE" -j ACCEPT 2>/dev/null || true
+    "$IPT" -A FORWARD -i "$CLUSTER_BRIDGE" -j ACCEPT
+    "$IPT" -D FORWARD -o "$CLUSTER_BRIDGE" -j ACCEPT 2>/dev/null || true
+    "$IPT" -A FORWARD -o "$CLUSTER_BRIDGE" -j ACCEPT
+    log_info "Host netns forwarding enabled (out_if=${out_if:-none})"
+}
+
+ensure_node_namespace() {
+    node_index="$1"
+    ns="k3s-node-$node_index"
+    hveth="v${node_index}h"
+    nveth="v${node_index}n"
+    node_ip="${NODE_IP_PREFIX}.$((NODE_IP_BASE_OCTET + node_index))"
+    ip netns add "$ns" 2>/dev/null || true
+    ip link del "$hveth" 2>/dev/null || true
+    ip link add "$hveth" type veth peer name "$nveth"
+    ip link set "$hveth" master "$CLUSTER_BRIDGE"
+    ip link set "$hveth" up
+    ip link set "$nveth" netns "$ns"
+    ip netns exec "$ns" ip link set lo up
+    ip netns exec "$ns" ip addr add "${node_ip}/${CLUSTER_BRIDGE_PLEN}" dev "$nveth"
+    ip netns exec "$ns" ip link set "$nveth" up
+    ip netns exec "$ns" ip route replace default via "$CLUSTER_BRIDGE_GW"
+    log_info "Node namespace $ns ready (ip=$node_ip iface=$nveth)"
+}
+
+wait_for_node_token() {
+    elapsed=0
+    while [ "$elapsed" -lt "$BOOTSTRAP_TIMEOUT" ]; do
+        if [ -s /var/lib/rancher/k3s/server/node-token ]; then
+            NODE_TOKEN=$(cat /var/lib/rancher/k3s/server/node-token)
+            return 0
+        fi
+        sleep "$BOOTSTRAP_INTERVAL"
+        elapsed=$((elapsed + BOOTSTRAP_INTERVAL))
+    done
+    return 1
+}
+
+run_k3s_agent_node() {
+    node_index="$1"
+    ns="k3s-node-$node_index"
+    nveth="v${node_index}n"
+    node_ip="${NODE_IP_PREFIX}.$((NODE_IP_BASE_OCTET + node_index))"
+    data_dir="/var/lib/rancher/k3s-node-$node_index"
+    node_name="${NODE_NAME_PREFIX}-${node_index}"
+    mkdir -p "$data_dir"
+    set -- ip netns exec "$ns" /usr/local/bin/k3s agent \
+        --server "https://${CLUSTER_BRIDGE_GW}:${API_PORT}" \
+        --token "$NODE_TOKEN" \
+        --node-ip "$node_ip" \
+        --node-name "$node_name" \
+        --data-dir "$data_dir" \
+        --flannel-iface "$nveth" \
+        --prefer-bundled-bin
+    set +e
+    "$@"
+    rc=$?
+    set -e
+    return "$rc"
+}
+
+run_k3s_agent_supervised() {
+    node_index="$1"
+    delay=$K3S_RESTART_BASE_DELAY
+    while true; do
+        started_at=$(date +%s)
+        set +e
+        run_k3s_agent_node "$node_index"
+        rc=$?
+        set -e
+        ended_at=$(date +%s)
+        uptime=$((ended_at - started_at))
+
+        if [ "$rc" -eq 0 ] || [ "$rc" -eq 130 ] || [ "$rc" -eq 143 ]; then
+            log_info "k3s agent node $node_index exited with code $rc, stopping supervisor."
+            return "$rc"
+        fi
+
+        if [ "$uptime" -ge "$K3S_MIN_UPTIME" ]; then
+            delay=$K3S_RESTART_BASE_DELAY
+        else
+            delay=$((delay * 2))
+            if [ "$delay" -gt "$K3S_RESTART_MAX_DELAY" ]; then
+                delay=$K3S_RESTART_MAX_DELAY
+            fi
+        fi
+
+        log_error "k3s agent node $node_index exited with code $rc after ${uptime}s, restarting in ${delay}s."
+        sleep "$delay"
+    done
+}
+
+start_multi_node_cluster() {
+    log_info "Starting multi-node cluster: 1 server (host netns) + $((NODE_COUNT - 1)) agent(s)"
+    teardown_node_namespaces
+
+    run_k3s_server_supervised &
+    SERVER_SUP_PID=$!
+
+    if ! wait_for_node_token; then
+        log_error "node-token not available after ${BOOTSTRAP_TIMEOUT}s; agents cannot join"
+        kill "$SERVER_SUP_PID" 2>/dev/null || true
+        wait "$SERVER_SUP_PID" 2>/dev/null || true
+        return 1
+    fi
+
+    node_index=1
+    while [ "$node_index" -lt "$NODE_COUNT" ]; do
+        ensure_node_namespace "$node_index"
+        run_k3s_agent_supervised "$node_index" &
+        node_index=$((node_index + 1))
+    done
+
+    wait "$SERVER_SUP_PID"
+}
+
 if [ "$ROLE" = "server" ]; then
     acquire_lock_or_exit
     ensure_server_config
     ensure_traefik_config
     ensure_traefik_loopback_proxy
     ensure_s3_iptables_dnat
+    if [ "$NODE_COUNT" -gt 1 ]; then
+        ensure_cluster_bridge
+        ensure_host_netns_forwarding
+    fi
     rewrite_internal_server_kubeconfigs
     sync_kubeconfig || true
 
@@ -598,6 +795,11 @@ if [ "$ROLE" = "server" ]; then
         wait "$K3S_PID" || true
         trap - INT TERM EXIT
         exit 0
+    fi
+
+    if [ "$NODE_COUNT" -gt 1 ]; then
+        start_multi_node_cluster
+        exit $?
     fi
 
     log_info "Starting supervised k3s server on port $API_PORT"

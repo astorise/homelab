@@ -27,6 +27,11 @@ struct WslImportRequest {
     name: Option<String>,
     #[serde(default)]
     enable_nvidia: Option<bool>,
+    /// EXPERIMENTAL: number of k3s nodes in this cluster (1 = single-node, the default).
+    /// Values >1 provision a multi-node cluster (one server + agents) in this single WSL
+    /// instance, each node in its own network namespace on a private bridge. Capped at 5.
+    #[serde(default)]
+    node_count: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -186,8 +191,13 @@ impl HomeLabMcpServer {
         Parameters(request): Parameters<WslImportRequest>,
     ) -> Result<CallToolResult, McpError> {
         json_tool_result(
-            wsl::wsl_import_instance_headless(request.force, request.name, request.enable_nvidia)
-                .await,
+            wsl::wsl_import_instance_headless(
+                request.force,
+                request.name,
+                request.enable_nvidia,
+                request.node_count,
+            )
+            .await,
         )
     }
 

@@ -31,6 +31,30 @@ A Windows-native desktop application for managing local network services — DNS
 
 Each service exposes a gRPC API over a Windows Named Pipe, consumed by the Tauri app and the MCP server.
 
+### home-s3 validation and debug logs
+
+`home-s3 validate` checks the configured S3 endpoint end to end. It loads
+`C:\ProgramData\home-s3\s3-config.json`, lists buckets, creates a temporary
+validation bucket, writes an object, reads it back, deletes the object, then
+removes the bucket.
+
+Enable debug logging by setting `log_level` in
+`C:\ProgramData\home-s3\s3-config.json`:
+
+```json
+{
+  "endpoint": "http://127.0.0.1:9000",
+  "region": "us-east-1",
+  "access_key_id": "rustfsadmin",
+  "secret_access_key": "rustfssecret",
+  "force_path_style": true,
+  "data_dir": "C:\\ProgramData\\home-s3\\data",
+  "log_level": "debug"
+}
+```
+
+Logs are written under `C:\ProgramData\home-s3\logs`.
+
 ## WSL2 / k3s
 
 Each WSL instance is a single-node k3s cluster. The homelab app handles the full lifecycle:

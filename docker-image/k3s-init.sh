@@ -176,7 +176,7 @@ while true; do
         sleep 1
         continue
     fi
-    KUBECONFIG=/etc/rancher/k3s/k3s.yaml /usr/local/bin/k3s kubectl -n kube-system port-forward --address 127.0.0.1 service/traefik $listen_port:$service_port &
+    KUBECONFIG=/etc/rancher/k3s/k3s.yaml /usr/local/bin/k3s kubectl -n kube-system port-forward --address 0.0.0.0 service/traefik $listen_port:$service_port &
     child_pid=\$!
     wait "\$child_pid" || true
     child_pid=
@@ -198,12 +198,20 @@ start_traefik_loopback_listener() {
     wrapper=$(write_traefik_loopback_forwarder "$listen_port" "$service_port")
     log_file="/var/log/traefik-loopback-$listen_port.log"
     cmd="sh $wrapper"
+    old_forward="kubectl -n kube-system port-forward --address 127.0.0.1 service/traefik $listen_port:$service_port"
+    new_forward="kubectl -n kube-system port-forward --address 0.0.0.0 service/traefik $listen_port:$service_port"
+
+    if pgrep -f "$old_forward" >/dev/null 2>&1; then
+        pkill -f "$old_forward" 2>/dev/null || true
+        pkill -f "$cmd" 2>/dev/null || true
+    fi
 
     if pgrep -f "$cmd" >/dev/null 2>&1; then
         return 0
     fi
 
-    pkill -f "kubectl -n kube-system port-forward --address 127.0.0.1 service/traefik $listen_port:$service_port" 2>/dev/null || true
+    pkill -f "$old_forward" 2>/dev/null || true
+    pkill -f "$new_forward" 2>/dev/null || true
     pkill -f "nc -lk .* -p $listen_port " 2>/dev/null || true
     pkill -f "$cmd" 2>/dev/null || true
     nohup sh -c "exec $cmd" >> "$log_file" 2>&1 &
