@@ -7,7 +7,7 @@ use anyhow::{Context, Result, anyhow};
 use base64::Engine;
 use base64::engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD};
 use flexi_logger::{Age, Cleanup, Criterion, Duplicate, FileSpec, Logger, Naming};
-use hickory_proto::op::{Message, MessageType, ResponseCode};
+use hickory_proto::op::{Message, ResponseCode};
 use hickory_proto::rr::rdata::{A as RDataA, AAAA as RDataAAAA};
 use hickory_proto::rr::{DNSClass, RData, Record as DnsRecord, RecordType};
 use hickory_proto::serialize::binary::{BinEncodable, BinEncoder};
@@ -939,16 +939,13 @@ fn find_record_entry<'a>(
 
 fn build_local_dns_response(cfg: &DnsConfig, wire_query: &[u8]) -> Result<Option<Vec<u8>>> {
     let request = Message::from_vec(wire_query).context("parse DNS message")?;
-    let mut response = Message::new();
-    response.set_id(request.id());
-    response.set_message_type(MessageType::Response);
-    response.set_op_code(request.op_code());
-    response.set_recursion_desired(request.recursion_desired());
-    response.set_recursion_available(true);
-    response.set_response_code(ResponseCode::NoError);
+    let mut response = Message::response(request.metadata.id, request.metadata.op_code);
+    response.metadata.recursion_desired = request.metadata.recursion_desired;
+    response.metadata.recursion_available = true;
+    response.metadata.response_code = ResponseCode::NoError;
 
     let mut local_hit = false;
-    for query in request.queries().iter().cloned() {
+    for query in request.queries.iter().cloned() {
         response.add_query(query.clone());
         if query.query_class() != DNSClass::IN {
             continue;
@@ -1060,14 +1057,11 @@ fn dns_message_response(status: StatusCode, body: Vec<u8>) -> HttpResponse {
 
 fn build_error_dns_response(wire_query: &[u8], code: ResponseCode) -> Option<Vec<u8>> {
     let request = Message::from_vec(wire_query).ok()?;
-    let mut response = Message::new();
-    response.set_id(request.id());
-    response.set_message_type(MessageType::Response);
-    response.set_op_code(request.op_code());
-    response.set_recursion_desired(request.recursion_desired());
-    response.set_recursion_available(true);
-    response.set_response_code(code);
-    for query in request.queries().iter().cloned() {
+    let mut response = Message::response(request.metadata.id, request.metadata.op_code);
+    response.metadata.recursion_desired = request.metadata.recursion_desired;
+    response.metadata.recursion_available = true;
+    response.metadata.response_code = code;
+    for query in request.queries.iter().cloned() {
         response.add_query(query);
     }
     let mut bytes = Vec::with_capacity(512);
