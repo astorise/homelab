@@ -1192,29 +1192,64 @@ if ($a) { Write-Output $a }
     if ip.is_empty() { None } else { Some(ip) }
 }
 
+fn s3_portproxy_listener_active(hyperv_ip: &str) -> bool {
+    let script = format!(
+        r#"$listener = Get-NetTCPConnection -LocalAddress '{hyperv_ip}' -LocalPort {WSL_S3_PORT} -State Listen -ErrorAction SilentlyContinue
+if ($listener) {{ exit 0 }} else {{ exit 1 }}"#
+    );
+    matches!(
+        silent_command("powershell.exe")
+            .args(["-NoProfile", "-Command", &script])
+            .status(),
+        Ok(status) if status.success()
+    )
+}
+
 /// Manage a portproxy rule that exposes home-s3 (loopback) on the Hyper-V WSL interface.
 /// home-s3 binds on 127.0.0.1:WSL_S3_PORT; the portproxy accepts on <hyper-v-ip>:WSL_S3_PORT
 /// and forwards to loopback. The Hyper-V vEthernet(WSL) adapter is a private virtual switch —
 /// not reachable from LAN or WAN — so this is equivalent in security to binding on loopback.
 fn upsert_s3_portproxy_rule(hyperv_ip: &str) -> bool {
-    // Delete any existing rule for this port on any address first (idempotent cleanup).
-    let _ = silent_command("netsh")
-        .args([
-            "interface", "portproxy", "delete", "v4tov4",
-            &format!("listenport={WSL_S3_PORT}"),
-            &format!("listenaddress={hyperv_ip}"),
-        ])
-        .status();
-    let status = silent_command("netsh")
-        .args([
-            "interface", "portproxy", "add", "v4tov4",
-            &format!("listenport={WSL_S3_PORT}"),
-            &format!("listenaddress={hyperv_ip}"),
-            &format!("connectport={WSL_S3_PORT}"),
-            "connectaddress=127.0.0.1",
-        ])
-        .status();
-    matches!(status, Ok(s) if s.success())
+    let delete_rule = || {
+        let _ = silent_command("netsh")
+            .args([
+                "interface",
+                "portproxy",
+                "delete",
+                "v4tov4",
+                &format!("listenport={WSL_S3_PORT}"),
+                &format!("listenaddress={hyperv_ip}"),
+            ])
+            .status();
+    };
+    let add_rule = || {
+        silent_command("netsh")
+            .args([
+                "interface",
+                "portproxy",
+                "add",
+                "v4tov4",
+                &format!("listenport={WSL_S3_PORT}"),
+                &format!("listenaddress={hyperv_ip}"),
+                &format!("connectport={WSL_S3_PORT}"),
+                "connectaddress=127.0.0.1",
+            ])
+            .status()
+    };
+
+    delete_rule();
+    if !matches!(add_rule(), Ok(status) if status.success()) {
+        return false;
+    }
+    std::thread::sleep(Duration::from_millis(500));
+    if s3_portproxy_listener_active(hyperv_ip) {
+        return true;
+    }
+
+    delete_rule();
+    let status = add_rule();
+    std::thread::sleep(Duration::from_millis(500));
+    matches!(status, Ok(status) if status.success()) && s3_portproxy_listener_active(hyperv_ip)
 }
 
 /// Remove the s3 portproxy rule when the Hyper-V IP is no longer valid.
