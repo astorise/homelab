@@ -289,7 +289,12 @@ start_traefik_loopback_listener() {
 
 find_iptables() {
     # Prefer the real iptables from the k3s runtime bundle over the busybox stub.
-    _ipt=$(find /var/lib/rancher/k3s/data -name "iptables" -not -type l 2>/dev/null | head -1)
+    _ipt=$(find /var/lib/rancher/k3s/data -path "*/bin/aux/iptables" 2>/dev/null | head -1)
+    if [ -n "$_ipt" ] && "$_ipt" --version >/dev/null 2>&1; then
+        echo "$_ipt"
+        return 0
+    fi
+    _ipt=$(find /var/lib/rancher/k3s/data -name "iptables" 2>/dev/null | head -1)
     if [ -n "$_ipt" ] && "$_ipt" --version >/dev/null 2>&1; then
         echo "$_ipt"
         return 0
