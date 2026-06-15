@@ -136,7 +136,7 @@ RUN set -eux; \
     done
 
 # ---- CA bundle stage ----
-FROM alpine:3.23 AS ca-certs
+FROM alpine:3.24 AS ca-certs
 RUN apk add --no-cache ca-certificates
 
 # ---- BusyBox final rootfs ----
