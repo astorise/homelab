@@ -29,7 +29,7 @@ windows-service = { workspace = true }
 sysinfo = "0.39"
 tonic = { version = "0.14", features = ["transport"] }
 tonic-prost = "0.14"
-tower-http = { version = "0.6.0", features = ["cors"] }
+tower-http = { version = "0.7.0", features = ["cors"] }
 tokio-stream = "0.1.15"
 futures-util = "0.3.30"
 pin-project = "1.1.5"
