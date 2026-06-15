@@ -4986,7 +4986,7 @@ dependencies = [
  "opentelemetry_sdk 0.31.0",
  "percent-encoding",
  "pin-project",
- "prost 0.14.3",
+ "prost 0.14.4",
  "prost-types 0.14.3",
  "reqwest",
  "rustc_version",
@@ -5093,7 +5093,7 @@ dependencies = [
  "md5",
  "percent-encoding",
  "pin-project",
- "prost 0.14.3",
+ "prost 0.14.4",
  "prost-types 0.14.3",
  "serde",
  "serde_json",
@@ -5530,7 +5530,7 @@ dependencies = [
  "log",
  "parking_lot 0.12.5",
  "pin-project",
- "prost 0.14.3",
+ "prost 0.14.4",
  "prost-build 0.14.3",
  "protoc-bin-vendored",
  "rcgen",
@@ -5570,7 +5570,7 @@ dependencies = [
  "log",
  "parking_lot 0.12.5",
  "pin-project",
- "prost 0.14.3",
+ "prost 0.14.4",
  "prost-build 0.14.3",
  "protoc-bin-vendored",
  "serde",
@@ -5601,7 +5601,7 @@ dependencies = [
  "log",
  "pin-project",
  "png 0.18.1",
- "prost 0.14.3",
+ "prost 0.14.4",
  "protoc-bin-vendored",
  "regex",
  "reqwest",
@@ -5648,7 +5648,7 @@ dependencies = [
  "log",
  "once_cell",
  "pin-project",
- "prost 0.14.3",
+ "prost 0.14.4",
  "protoc-bin-vendored",
  "rand 0.10.1",
  "rcgen",
@@ -5694,7 +5694,7 @@ dependencies = [
  "flexi_logger",
  "log",
  "pin-project",
- "prost 0.14.3",
+ "prost 0.14.4",
  "protoc-bin-vendored",
  "rustfs",
  "serde",
@@ -8266,7 +8266,7 @@ dependencies = [
  "opentelemetry-http",
  "opentelemetry-proto",
  "opentelemetry_sdk 0.32.0",
- "prost 0.14.3",
+ "prost 0.14.4",
  "reqwest",
  "thiserror 2.0.18",
 ]
@@ -8279,7 +8279,7 @@ checksum = "56d658ba1faf63f7b9c492cfbe6e0ec365440a16132d3270c1065f7b33f1b638"
 dependencies = [
  "opentelemetry 0.32.0",
  "opentelemetry_sdk 0.32.0",
- "prost 0.14.3",
+ "prost 0.14.4",
 ]
 
 [[package]]
@@ -9140,7 +9140,7 @@ dependencies = [
  "inferno 0.12.6",
  "num",
  "paste",
- "prost 0.14.3",
+ "prost 0.14.4",
 ]
 
 [[package]]
@@ -9325,12 +9325,12 @@ dependencies = [
 
 [[package]]
 name = "prost"
-version = "0.14.3"
+version = "0.14.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d2ea70524a2f82d518bce41317d0fae74151505651af45faf1ffbd6fd33f0568"
+checksum = "528ac67416ff8646872a3c02cad9cc4ee5dc9f9540c9b10771855c95cb2e5ae1"
 dependencies = [
  "bytes",
- "prost-derive 0.14.3",
+ "prost-derive 0.14.4",
 ]
 
 [[package]]
@@ -9340,7 +9340,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "be769465445e8c1474e9c5dac2018218498557af32d9ed057325ec9a41ae81bf"
 dependencies = [
  "heck 0.4.1",
- "itertools 0.14.0",
+ "itertools 0.10.5",
  "log",
  "multimap",
  "once_cell",
@@ -9360,12 +9360,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "343d3bd7056eda839b03204e68deff7d1b13aba7af2b2fd16890697274262ee7"
 dependencies = [
  "heck 0.4.1",
- "itertools 0.14.0",
+ "itertools 0.10.5",
  "log",
  "multimap",
  "petgraph 0.8.3",
  "prettyplease",
- "prost 0.14.3",
+ "prost 0.14.4",
  "prost-types 0.14.3",
  "pulldown-cmark",
  "pulldown-cmark-to-cmark",
@@ -9381,7 +9381,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a56d757972c98b346a9b766e3f02746cde6dd1cd1d1d563472929fdd74bec4d"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.10.5",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -9389,12 +9389,12 @@ dependencies = [
 
 [[package]]
 name = "prost-derive"
-version = "0.14.3"
+version = "0.14.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "27c6023962132f4b30eb4c172c91ce92d933da334c59c23cddee82358ddafb0b"
+checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.10.5",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -9415,7 +9415,7 @@ version = "0.14.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8991c4cbdb8bc5b11f0b074ffe286c30e523de90fee5ba8132f1399f23cb3dd7"
 dependencies = [
- "prost 0.14.3",
+ "prost 0.14.4",
 ]
 
 [[package]]
@@ -9635,7 +9635,7 @@ dependencies = [
  "libflate",
  "log",
  "pprof-pyroscope-fork",
- "prost 0.14.3",
+ "prost 0.14.4",
  "reqwest",
  "serde_json",
  "thiserror 2.0.18",
@@ -11239,7 +11239,7 @@ version = "1.0.0-beta.4"
 source = "git+https://github.com/astorise/rustfs?rev=2786a4734afa14659f142c87d0e9ec1c5670d92b#2786a4734afa14659f142c87d0e9ec1c5670d92b"
 dependencies = [
  "flatbuffers",
- "prost 0.14.3",
+ "prost 0.14.4",
  "rustfs-common",
  "rustfs-config",
  "rustfs-io-metrics",
@@ -13874,7 +13874,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "50849f68853be452acf590cde0b146665b8d507b3b8af17261df47e02c209ea0"
 dependencies = [
  "bytes",
- "prost 0.14.3",
+ "prost 0.14.4",
  "tonic",
 ]
 
