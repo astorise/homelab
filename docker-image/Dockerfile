@@ -140,7 +140,7 @@ FROM alpine:3.24 AS ca-certs
 RUN apk add --no-cache ca-certificates
 
 # ---- BusyBox final rootfs ----
-FROM busybox:1.37.0-musl
+FROM busybox:1.38.0-musl
 
 ENV WSL_ROLE=server
 ENV WSL_PORT_RANGE=6443-6550
