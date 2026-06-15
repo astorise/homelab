@@ -5541,7 +5541,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
- "sysinfo 0.38.4",
+ "sysinfo",
  "tokio",
  "tokio-rustls 0.26.4",
  "tokio-stream",
@@ -5575,7 +5575,7 @@ dependencies = [
  "protoc-bin-vendored",
  "serde",
  "serde_yaml",
- "sysinfo 0.38.4",
+ "sysinfo",
  "tokio",
  "tokio-stream",
  "tonic",
@@ -10609,7 +10609,7 @@ dependencies = [
  "shadow-rs",
  "socket2 0.6.3",
  "subtle",
- "sysinfo 0.39.2",
+ "sysinfo",
  "tempfile",
  "thiserror 2.0.18",
  "tikv-jemalloc-ctl",
@@ -10943,7 +10943,7 @@ dependencies = [
  "metrics",
  "num_cpus",
  "rustfs-s3-ops",
- "sysinfo 0.39.2",
+ "sysinfo",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -11163,7 +11163,7 @@ dependencies = [
  "rustfs-notify",
  "rustfs-utils",
  "serde",
- "sysinfo 0.39.2",
+ "sysinfo",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
@@ -11418,7 +11418,7 @@ dependencies = [
  "serde",
  "serde_json",
  "snap",
- "sysinfo 0.39.2",
+ "sysinfo",
  "thiserror 2.0.18",
  "tokio",
  "tokio-postgres",
@@ -12899,20 +12899,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
-]
-
-[[package]]
-name = "sysinfo"
-version = "0.38.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "92ab6a2f8bfe508deb3c6406578252e491d299cbbf3bc0529ecc3313aee4a52f"
-dependencies = [
- "libc",
- "memchr",
- "ntapi",
- "objc2-core-foundation",
- "objc2-io-kit",
- "windows 0.62.2",
 ]
 
 [[package]]
