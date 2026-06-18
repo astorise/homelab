@@ -23,7 +23,7 @@ jobs:
   build-docker-image:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
         with:
@@ -42,7 +42,7 @@ jobs:
   build-services:
     runs-on: windows-2025-vs2026
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Setup protoc
         shell: pwsh
@@ -92,7 +92,7 @@ jobs:
     runs-on: windows-2025-vs2026
     needs: [build-services, build-docker-image]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Setup protoc
         shell: pwsh
